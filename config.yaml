@@ -1,0 +1,24 @@
+# Hospital Agent System 配置文件
+# 优先级: CLI参数 > 环境变量 > 此文件 > 代码默认值
+
+# LLM配置
+llm:
+  backend: deepseek        # LLM后端: mock 或 deepseek
+  enable_reports: false    # 是否使用LLM增强检查报告叙述
+
+# 智能体配置
+agent:
+  max_questions: 15        # 医生最多问几个问题
+  dataset_id: 61           # 数据集索引
+  use_hf_data: true        # 是否从HuggingFace加载数据
+
+# RAG配置
+rag:
+  persist_dir: .chroma           # Chroma向量数据库目录
+  collection_name: hospital_kb   # 知识库集合名称
+
+# 系统配置
+system:
+  seed: 42                       # 随机种子
+  save_trace: agent_trace.json  # 追踪日志保存路径
+  enable_trace: false            # 是否自动保存追踪日志
