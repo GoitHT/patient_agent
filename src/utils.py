@@ -186,24 +186,40 @@ class ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 
-def get_logger(name: str = "hospital_agent") -> logging.Logger:
-    """获取配置好的logger实例"""
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
+def setup_dual_logging(log_file: str = "hospital_agent.log", console_level: int = logging.WARNING) -> None:
+    """设置双通道日志系统：详细日志到文件，简洁日志到终端"""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.handlers.clear()
     
-    handler = logging.StreamHandler(sys.stdout)
-    
-    # 使用更详细的格式
-    fmt = ColoredFormatter(
+    # 文件处理器 - 记录所有详细信息
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
-    handler.setFormatter(fmt)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False  # 避免重复输出
+    file_handler.setFormatter(file_formatter)
     
+    # 终端处理器 - 只显示重要信息
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(console_level)
+    console_formatter = ColoredFormatter(
+        "%(message)s",  # 简洁格式，不显示时间和日志级别
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    console_handler.setFormatter(console_formatter)
+    
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+
+def get_logger(name: str = "hospital_agent") -> logging.Logger:
+    """获取配置好的logger实例"""
+    logger = logging.getLogger(name)
+    logger.propagate = True  # 使用根logger的配置
     return logger
 
 

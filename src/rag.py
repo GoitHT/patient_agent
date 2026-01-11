@@ -247,6 +247,20 @@ class ChromaRetriever:
         return [c.as_dict() for c in chunks]
 
 
+class DummyRetriever:
+    """虚拟检索器 - 用于测试或不需要RAG功能时"""
+    
+    def retrieve(
+        self,
+        query: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        k: int = 4,
+    ) -> list[dict[str, Any]]:
+        """返回空检索结果"""
+        return []
+
+
 # ============================================================================
 # 索引构建 (原 rag/index.py)
 # ============================================================================

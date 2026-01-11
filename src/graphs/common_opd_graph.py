@@ -1121,7 +1121,7 @@ class CommonOPDGraph:
                 logger.info(f"  ✓ 证据引用: {len(evidence_list)}条" if evidence_list else "  ⚠️  缺少证据引用")
                 
                 if state.escalations:
-                    logger.warning(f"  ⚠️  升级建议: {', '.join(state.escalations)}")
+                    logger.debug(f"  ⚠️  升级建议: {', '.join(state.escalations)}")
 
             else:
                 # 无LLM时使用fallback
@@ -1440,7 +1440,7 @@ class CommonOPDGraph:
             logger.info(f"  📋 检查结果: {len(state.test_results)}")
             logger.info(f"  🩺 最终诊断: {state.diagnosis.get('name', 'N/A')}")
             if state.escalations:
-                logger.info(f"  ⚠️  升级建议: {', '.join(state.escalations)}")
+                logger.debug(f"  ⚠️  升级建议: {', '.join(state.escalations)}")
             
             # 评估诊断准确性
             if state.ground_truth:
@@ -1507,19 +1507,19 @@ class CommonOPDGraph:
                 
                 state.agent_interactions["evaluation"] = evaluation
                 
-                # 显示评估结果
+                # 显示评估结果（仅记录到日志文件）
                 accuracy_pct = accuracy * 100
                 if accuracy_pct >= 80:
-                    logger.info(f"  ✅ 诊断准确性评级: 优秀 ({accuracy_pct:.0f}分)")
+                    logger.debug(f"  ✅ 诊断准确性评级: 优秀 ({accuracy_pct:.0f}分)")
                 elif accuracy_pct >= 60:
-                    logger.warning(f"  ⚠️  诊断准确性评级: 良好 ({accuracy_pct:.0f}分)")
+                    logger.debug(f"  ⚠️  诊断准确性评级: 良好 ({accuracy_pct:.0f}分)")
                 elif accuracy_pct > 0:
-                    logger.warning(f"  ⚠️  诊断准确性评级: 需改进 ({accuracy_pct:.0f}分)")
+                    logger.debug(f"  ⚠️  诊断准确性评级: 需改进 ({accuracy_pct:.0f}分)")
                 else:
-                    logger.error(f"  ❌ 未能完成评估")
+                    logger.debug(f"  ❌ 未能完成评估")
                 
-                logger.info(f"  💬 问诊轮数: {evaluation['questions_asked']}")
-                logger.info(f"  🧪 开单数量: {evaluation['tests_ordered']}")
+                logger.debug(f"  💬 问诊轮数: {evaluation['questions_asked']}")
+                logger.debug(f"  🧪 开单数量: {evaluation['tests_ordered']}")
 
 
             
