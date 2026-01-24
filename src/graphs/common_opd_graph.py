@@ -77,7 +77,9 @@ class CommonOPDGraph:
         patient_agent: Any | None = None,
         doctor_agent: Any | None = None,
         nurse_agent: Any | None = None,
+        lab_agent: Any | None = None,
         max_questions: int = 3,
+        world: Any | None = None,
     ) -> None:
         self.retriever = retriever
         self.dept_subgraphs = dept_subgraphs
@@ -89,7 +91,9 @@ class CommonOPDGraph:
         self.patient_agent = patient_agent
         self.doctor_agent = doctor_agent
         self.nurse_agent = nurse_agent
+        self.lab_agent = lab_agent
         self.max_questions = max_questions
+        self.world = world
 
     def build(self):
         graph = StateGraph(BaseState)
@@ -114,26 +118,64 @@ class CommonOPDGraph:
             
             logger.info(f"✓ 状态验证通过")
             
-            # 2. 记录流程开始时间
+            # 2. 记录流程开始时间（使用物理世界时间，保证一致性）
             import datetime
-            start_timestamp = datetime.datetime.now().isoformat()
+            if self.world:
+                # 使用物理世界的时间系统
+                start_timestamp = self.world.current_time.isoformat()
+            else:
+                # 如果没有启用物理世界，使用系统时间
+                start_timestamp = datetime.datetime.now().isoformat()
             state.appointment["visit_start_time"] = start_timestamp
             
-            # 3. 显示患者就诊概览
+            # 3. 科室显示名称映射（与C4节点保持一致）
+            dept_display_names = {
+                "internal_medicine": "内科",
+                "surgery": "外科",
+                "gastro": "消化内科",
+                "neuro": "神经内科",
+                "emergency": "急诊科",
+                "orthopedics": "骨科",
+                "urology": "泌尿外科",
+                "obstetrics_gynecology": "妇产科",
+                "pediatrics": "儿科",
+                "neurology": "神经医学科",
+                "oncology": "肿瘤科",
+                "infectious_disease": "感染科",
+                "dermatology_std": "皮肤性病科",
+                "ent_ophthalmology_stomatology": "五官科",
+                "psychiatry": "精神心理科",
+                "rehabilitation_pain": "康复疼痛科",
+                "traditional_chinese_medicine": "中医科",
+            }
+            dept_display_name = dept_display_names.get(state.dept, state.dept)
+            
+            # 4. 显示患者就诊概览
             logger.info("\n📋 患者就诊信息:")
-            logger.info(f"  🏥 就诊科室: {state.dept}")
+            logger.info(f"  🏥 就诊科室: {dept_display_name}")
             logger.info(f"  🏷️  流程ID: {state.run_id}")
             logger.info(f"  🗣️  主诉: {state.chief_complaint}")
             logger.info(f"  🕐 开始时间: {start_timestamp}")
             
-            # 4. 初始化流程追踪
+            # 5. 显示物理世界信息（如果启用）
+            if self.world and state.patient_id:
+                # 同步物理状态
+                state.sync_physical_state()
+                current_location = state.current_location or "未知位置"
+                logger.info(f"  📍 当前位置: {current_location}")
+                logger.info(f"  🆔 患者ID: {state.patient_id}")
+            
+            # 6. 初始化流程追踪
             if "nurse_triage" in state.agent_interactions:
                 triage_info = state.agent_interactions["nurse_triage"]
-                logger.info(f"  💉 分诊结果: {triage_info.get('triaged_dept', 'N/A')}")
+                triaged_dept_code = triage_info.get('triaged_dept', 'N/A')
+                # 将分诊科室代码映射为中文显示名称
+                triaged_dept_display = dept_display_names.get(triaged_dept_code, triaged_dept_code) if triaged_dept_code != 'N/A' else 'N/A'
+                logger.info(f"  💉 分诊结果: {triaged_dept_display}")
                 if triage_info.get("reasoning"):
                     logger.info(f"     理由: {triage_info['reasoning'][:60]}...")
             
-            # 5. 设置流程状态标记
+            # 7. 设置流程状态标记
             state.appointment["status"] = "visit_started"
             state.appointment["current_stage"] = "C1_start"
             
@@ -142,15 +184,18 @@ class CommonOPDGraph:
                     node_name="C1 Start Visit",
                     inputs_summary={
                         "dept": state.dept,
+                        "dept_display_name": dept_display_name,
                         "chief_complaint": state.chief_complaint[:40],
                         "triage_completed": "nurse_triage" in state.agent_interactions,
+                        "physical_world_enabled": bool(self.world and state.patient_id),
                     },
                     outputs_summary={
                         "run_id": state.run_id,
                         "start_time": start_timestamp,
                         "status": "visit_started",
+                        "current_location": state.current_location if self.world else "N/A",
                     },
-                    decision="验证状态完整性，记录流程开始，初始化就诊追踪",
+                    decision="验证状态完整性，记录流程开始，初始化就诊追踪，同步物理世界状态",
                     chunks=[],
                     flags=["VISIT_START"],
                 )
@@ -163,6 +208,21 @@ class CommonOPDGraph:
             logger.info("📝 C2: 预约挂号")
             logger.info("="*60)
             
+            # 显示物理环境状态
+            if self.world and state.patient_id:
+                current_time = self.world.current_time.strftime('%H:%M')
+                current_loc = state.current_location or self.world.get_agent_location(state.patient_id)
+                loc_name = self.world.get_location_name(current_loc) if current_loc else "未知"
+                logger.info(f"\n🏥 物理环境状态:")
+                logger.info(f"  🕐 时间: {current_time}")
+                logger.info(f"  📍 位置: {loc_name}")
+                
+                # 患者状态
+                if state.patient_id in self.world.physical_states:
+                    ps = self.world.physical_states[state.patient_id]
+                    logger.info(f"  👤 患者: 体力{ps.energy_level:.1f}/10 | 疼痛{ps.pain_level:.1f}/10")
+                logger.info("")
+            
             channel = state.appointment.get("channel") or _default_channel(self.rng)
             timeslot = state.appointment.get("timeslot") or "上午"
             logger.info(f"📱 预约渠道: {channel}")
@@ -172,6 +232,11 @@ class CommonOPDGraph:
                 channel=channel, dept=state.dept, timeslot=timeslot
             )
             state.appointment = appt
+            
+            # 推进时间（挂号约需3分钟）
+            if self.world:
+                self.world.advance_time(minutes=3)
+                state.sync_physical_state()
             
             logger.info(f"✅ 挂号成功 - 预约ID: {appt.get('appointment_id')}")
             
@@ -192,9 +257,38 @@ class CommonOPDGraph:
             logger.info("✍️ C3: 签到候诊")
             logger.info("="*60)
             
+            # 物理环境：移动到候诊区
+            if self.world and state.patient_id:
+                current_time_before = self.world.current_time.strftime('%H:%M')
+                logger.info(f"\n🏥 物理环境状态:")
+                logger.info(f"  🕐 时间: {current_time_before}")
+                
+                # 移动到候诊区
+                success, msg = self.world.move_agent(state.patient_id, "waiting_area")
+                if success:
+                    logger.info(f"  🚶 移动: 门诊大厅 → 候诊区")
+                    state.current_location = "waiting_area"
+                    state.sync_physical_state()
+                    self.world.advance_time(minutes=2)
+                
+                # 显示患者状态
+                if state.patient_id in self.world.physical_states:
+                    ps = self.world.physical_states[state.patient_id]
+                    logger.info(f"  👤 患者: 体力{ps.energy_level:.1f}/10 | 疼痛{ps.pain_level:.1f}/10")
+                logger.info("")
+            
             state.appointment = self.services.appointment.checkin(state.appointment)
             
             logger.info(f"✅ 签到成功 - 状态: {state.appointment.get('status')}")
+            
+            # 候诊等待（5-10分钟）
+            if self.world and state.patient_id:
+                wait_time = self.rng.randint(5, 10)
+                success, msg = self.world.wait(state.patient_id, wait_time)
+                if success:
+                    logger.info(f"  ⏳ 候诊等待: {wait_time}分钟")
+                    state.sync_physical_state()
+                    logger.info(f"  🕐 当前时间: {self.world.current_time.strftime('%H:%M')}")
             
             state.add_audit(
                 make_audit_entry(
@@ -217,6 +311,72 @@ class CommonOPDGraph:
             
             logger.info(f"✅ 叫号成功 - 状态: {state.appointment.get('status')}")
             
+            # 【物理环境】将患者从候诊区移动到对应科室诊室
+            if self.world and state.patient_id:
+                # 科室到诊室位置的映射
+                dept_location_map = {
+                    "internal_medicine": "internal_medicine",
+                    "surgery": "surgery", 
+                    "gastro": "gastro",
+                    "neuro": "neuro",
+                    "emergency": "emergency",
+                    "orthopedics": "surgery",
+                    "urology": "surgery",
+                    "obstetrics_gynecology": "internal_medicine",
+                    "pediatrics": "internal_medicine",
+                    "neurology": "neuro",
+                    "oncology": "internal_medicine",
+                    "infectious_disease": "internal_medicine",
+                    "dermatology_std": "internal_medicine",
+                    "ent_ophthalmology_stomatology": "internal_medicine",
+                    "psychiatry": "internal_medicine",
+                    "rehabilitation_pain": "internal_medicine",
+                    "traditional_chinese_medicine": "internal_medicine",
+                }
+                
+                # 科室中文名称映射
+                dept_display_names = {
+                    "internal_medicine": "内科诊室",
+                    "surgery": "外科诊室",
+                    "gastro": "消化内科诊室",
+                    "neuro": "神经内科诊室",
+                    "emergency": "急诊科",
+                    "orthopedics": "骨科诊室",
+                    "urology": "泌尿外科诊室",
+                    "obstetrics_gynecology": "妇产科诊室",
+                    "pediatrics": "儿科诊室",
+                    "neurology": "神经医学诊室",
+                    "oncology": "肿瘤科诊室",
+                    "infectious_disease": "感染科诊室",
+                    "dermatology_std": "皮肤性病科诊室",
+                    "ent_ophthalmology_stomatology": "五官科诊室",
+                    "psychiatry": "精神心理科诊室",
+                    "rehabilitation_pain": "康复疼痛科诊室",
+                    "traditional_chinese_medicine": "中医科诊室",
+                }
+                
+                # 获取目标诊室位置和显示名称
+                target_clinic = dept_location_map.get(state.dept, "internal_medicine")
+                dept_display_name = dept_display_names.get(state.dept, "内科诊室")
+                
+                # 在state中存储科室显示名称，供后续节点使用
+                state.dept_display_name = dept_display_name
+                
+                # 移动患者到诊室
+                success, msg = self.world.move_agent(state.patient_id, target_clinic)
+                if success:
+                    # 使用科室的真实名称而不是物理位置的名称
+                    logger.info(f"  🚶 已从候诊区移动到{dept_display_name}")
+                    
+                    # 更新状态中的位置信息
+                    state.current_location = target_clinic
+                    state.sync_physical_state()
+                    
+                    # 推进时间（叫号和入诊大约2分钟）
+                    self.world.advance_time(minutes=2)
+                else:
+                    logger.warning(f"  ⚠️  患者移动失败: {msg}")
+            
             state.add_audit(
                 make_audit_entry(
                     node_name="C4 Call In",
@@ -234,6 +394,27 @@ class CommonOPDGraph:
             logger.info("\n" + "="*60)
             logger.info("🩺 C5: 问诊准备")
             logger.info("="*60)
+            
+            # 显示物理环境状态
+            if self.world and state.patient_id:
+                current_time = self.world.current_time.strftime('%H:%M')
+                dept_display_name = state.dept_display_name if hasattr(state, 'dept_display_name') else "诊室"
+                logger.info(f"\n🏥 物理环境状态:")
+                logger.info(f"  🕐 时间: {current_time}")
+                logger.info(f"  📍 位置: {dept_display_name}")
+                
+                # 患者状态
+                if state.patient_id in self.world.physical_states:
+                    ps = self.world.physical_states[state.patient_id]
+                    logger.info(f"  👤 患者: 体力{ps.energy_level:.1f}/10 | 疼痛{ps.pain_level:.1f}/10")
+                
+                # 医生状态
+                if "doctor_001" in self.world.physical_states:
+                    ds = self.world.physical_states["doctor_001"]
+                    efficiency = ds.get_work_efficiency() * 100
+                    eff_icon = "🟢" if efficiency > 80 else ("🟡" if efficiency > 60 else "🔴")
+                    logger.info(f"  👨‍⚕️ 医生: 体力{ds.energy_level:.1f}/10 | 负荷{ds.work_load:.1f}/10 | 效率{efficiency:.0f}% {eff_icon}")
+                logger.info("")
             
             logger.info("🔍 检索医院通用SOP与免责声明...")
             chunks = self.retriever.retrieve(
@@ -328,6 +509,23 @@ class CommonOPDGraph:
             logger.info("🧪 C8: 开单与准备说明")
             logger.info("="*60)
             
+            # 显示物理环境状态
+            if self.world and state.patient_id:
+                current_time = self.world.current_time.strftime('%H:%M')
+                dept_display_name = state.dept_display_name if hasattr(state, 'dept_display_name') else "诊室"
+                logger.info(f"\n🏥 物理环境状态:")
+                logger.info(f"  🕐 时间: {current_time}")
+                logger.info(f"  📍 位置: {dept_display_name}")
+                
+                # 患者和医生状态
+                if state.patient_id in self.world.physical_states:
+                    ps = self.world.physical_states[state.patient_id]
+                    logger.info(f"  👤 患者: 体力{ps.energy_level:.1f}/10")
+                if "doctor_001" in self.world.physical_states:
+                    ds = self.world.physical_states["doctor_001"]
+                    logger.info(f"  👨‍⚕️ 医生: 体力{ds.energy_level:.1f}/10 | 负荷{ds.work_load:.1f}/10")
+                logger.info("")
+            
             # 检索医院通用流程SOP
             logger.info("🔍 检索医院通用流程...")
             hospital_chunks = self.retriever.retrieve(
@@ -406,6 +604,26 @@ class CommonOPDGraph:
             logger.info("💳 C9: 缴费与预约")
             logger.info("="*60)
             
+            # 物理环境：移动到收费处
+            if self.world and state.patient_id:
+                current_time_before = self.world.current_time.strftime('%H:%M')
+                logger.info(f"\n🏥 物理环境状态:")
+                logger.info(f"  🕐 时间: {current_time_before}")
+                
+                # 移动到收费处
+                success, msg = self.world.move_agent(state.patient_id, "cashier")
+                if success:
+                    logger.info(f"  🚶 移动: 诊室 → 收费处")
+                    state.current_location = "cashier"
+                    state.sync_physical_state()
+                    self.world.advance_time(minutes=2)
+                
+                # 患者状态
+                if state.patient_id in self.world.physical_states:
+                    ps = self.world.physical_states[state.patient_id]
+                    logger.info(f"  👤 患者: 体力{ps.energy_level:.1f}/10")
+                logger.info("")
+            
             # 1. 生成订单并缴费
             order_id = f"ORD-{state.run_id}-{len(state.ordered_tests)}"
             logger.info(f"📝 订单ID: {order_id}")
@@ -413,6 +631,16 @@ class CommonOPDGraph:
             payment = self.services.billing.pay(order_id=order_id)
             logger.info(f"✅ 缴费完成 - 金额: {payment.get('amount', 0)}元")
             state.appointment["billing"] = payment
+            
+            # 缴费等待（3-5分钟）
+            if self.world and state.patient_id:
+                wait_time = self.rng.randint(3, 5)
+                success, msg = self.world.wait(state.patient_id, wait_time)
+                if success:
+                    logger.info(f"  ⏳ 缴费等待: {wait_time}分钟")
+                    state.sync_physical_state()
+                    logger.info(f"  🕐 当前时间: {self.world.current_time.strftime('%H:%M')}")
+                logger.info("")
 
             # 2. 预约调度与准备清单生成
             logger.info("\n📅 调度检查预约...")
@@ -525,169 +753,173 @@ class CommonOPDGraph:
             logger.info("🧪 C10a: 获取检查结果")
             logger.info("="*60)
             
-            # 优先从数据集获取真实检查结果
+            # 物理环境：模拟检查过程（移动到检验科/影像科等）
+            if self.world and state.patient_id:
+                current_time_before = self.world.current_time.strftime('%H:%M')
+                logger.info(f"\n🏥 物理环境状态:")
+                logger.info(f"  🕐 时间: {current_time_before}")
+                
+                # 检查时间消耗（根据检查项目数量）
+                test_count = len(state.ordered_tests)
+                # 每项检查平均10-20分钟
+                total_test_time = test_count * self.rng.randint(10, 20)
+                
+                # 移动到检验科（简化处理，实际可能有多个地点）
+                success, msg = self.world.move_agent(state.patient_id, "lab")
+                if success:
+                    logger.info(f"  🚶 移动: 收费处 → 检验科")
+                    state.current_location = "lab"
+                    state.sync_physical_state()
+                    self.world.advance_time(minutes=2)
+                
+                # 执行检查等待
+                logger.info(f"  ⏳ 检查进行中: 预计 {total_test_time} 分钟")
+                success, msg = self.world.wait(state.patient_id, total_test_time)
+                if success:
+                    state.sync_physical_state()
+                
+                # 检验科人员状态
+                if "lab_tech_001" in self.world.physical_states:
+                    ls = self.world.physical_states["lab_tech_001"]
+                    efficiency = ls.get_work_efficiency() * 100
+                    eff_icon = "🟢" if efficiency > 80 else ("🟡" if efficiency > 60 else "🔴")
+                    logger.info(f"  🔬 检验师: 体力{ls.energy_level:.1f}/10 | 负荷{ls.work_load:.1f}/10 | 效率{efficiency:.0f}% {eff_icon}")
+                
+                logger.info(f"  🕐 检查完成时间: {self.world.current_time.strftime('%H:%M')}")
+                
+                # 患者状态
+                if state.patient_id in self.world.physical_states:
+                    ps = self.world.physical_states[state.patient_id]
+                    logger.info(f"  👤 患者: 体力{ps.energy_level:.1f}/10 | 疼痛{ps.pain_level:.1f}/10")
+                logger.info("")
+            
+            # 🔬 使用检验科Agent智能生成检查结果
+            logger.info("\n🔬 检验科Agent执行检查并生成结果...")
+            
+            # 获取数据集中的真实检查结果作为参考（如果有）
             real_diagnostic_tests = state.ground_truth.get("Diagnostic Tests", "").strip()
+            
+            # 准备检验科Agent需要的上下文信息
+            lab_context = {
+                "ordered_tests": state.ordered_tests,  # 医生开具的检查项目
+                "chief_complaint": state.chief_complaint,  # 患者主诉
+                "case_info": state.patient_profile.get("case_text", ""),  # 完整病例信息
+                "real_tests_reference": real_diagnostic_tests if real_diagnostic_tests else None,  # 真实结果作为参考
+                "dept": state.dept,  # 就诊科室
+                "patient_id": state.patient_id,
+            }
+            
+            # 显示检验科接收的检查项目
+            logger.info(f"📋 接收医生开具的检查单: {len(state.ordered_tests)} 项")
+            for idx, test in enumerate(state.ordered_tests, 1):
+                logger.info(f"  [{idx}] {test.get('name')} ({test.get('type')})")
+            
+            if real_diagnostic_tests:
+                logger.info(f"\n📚 参考数据集真实结果: {len(real_diagnostic_tests)} 字符")
+                logger.info(f"  预览: {real_diagnostic_tests[:100]}...")
+            
+            # 调用检验科Agent生成检查结果
             results: list[dict[str, Any]] = []
             used_fallback = False
             
-            if real_diagnostic_tests:
-                logger.info("📋 使用数据集中的真实检查结果")
-                logger.info(f"  原始数据: {real_diagnostic_tests[:300]}{'...' if len(real_diagnostic_tests) > 300 else ''}")
-                
-                # 使用LLM将文本结构化为检查结果列表
-                system_prompt = load_prompt("common_system.txt")
-                
-                # 构建已开检查项目列表
-                ordered_tests_str = "\n".join([
-                    f"- {t.get('name')} ({t.get('type')}, {t.get('body_part', ['未知部位'])})"
-                    for t in state.ordered_tests
-                ])
-                
-                user_prompt = (
-                    "请将以下真实检查结果文本结构化为JSON格式的检查结果列表。\n\n"
-                    + "【已开检查项目】\n"
-                    + ordered_tests_str + "\n\n"
-                    + "【真实检查结果文本】\n"
-                    + f"{real_diagnostic_tests}\n\n"
-                    + "【任务要求】\n"
-                    + "1. 从文本中提取所有检查结果，每项检查对应一个结果对象\n"
-                    + "2. 尽量匹配已开检查项目，但也要包含文本中提到的其他检查\n"
-                    + "3. 每项检查结果包含：\n"
-                    + "   - test: 检查名称（与已开项目匹配或从文本提取）\n"
-                    + "   - test_name: 同test\n"
-                    + "   - type: 检查类型（lab/imaging/endoscopy/neurophysiology）\n"
-                    + "   - body_part: 检查部位（从已开项目获取或从文本推断）\n"
-                    + "   - summary: 结果摘要（简短描述）\n"
-                    + "   - abnormal: 是否异常（true/false）\n"
-                    + "   - value: 具体数值或描述（如有）\n"
-                    + "   - reference: 参考范围（如有）\n"
-                    + "   - detail: 详细结果文本（保持原文）\n"
-                    + "4. 保持原始结果的准确性，不要修改数值或结论\n"
-                    + "5. 判断abnormal时要准确：如果结果明确提示异常/超标/阳性，则为true\n\n"
-                    + "【输出格式】\n"
-                    + "请输出JSON：{\"test_results\": [{检查结果1}, {检查结果2}, ...]}"
-                )
-                
-                obj, used_fallback, _raw = self.llm.generate_json(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    fallback=lambda: {
-                        "test_results": [{
-                            "test": "综合检查",
-                            "test_name": "综合检查",
-                            "type": "lab",
-                            "body_part": ["全身"],
-                            "summary": "见详细报告",
-                            "abnormal": False,
-                            "detail": real_diagnostic_tests[:500] + "...",  # 限制长度避免超token
-                            "source": "dataset_fallback"
-                        }]
-                    },
-                    temperature=0.1,  # 低温度保证忠实原文
-                    max_tokens=2000,
-                )
-                
-                results = list(obj.get("test_results") or [])
-                
-                # 标记数据来源
-                for r in results:
-                    r["source"] = "dataset_real"
-                    r["raw_text"] = real_diagnostic_tests
-                
-                logger.info(f"  ✅ 从真实数据提取 {len(results)} 项检查结果")
-                abnormal_count = sum(1 for r in results if r.get("abnormal"))
-                logger.info(f"  ⚠️  异常结果: {abnormal_count}/{len(results)}")
-            
+            if self.lab_agent:
+                logger.info("\n🤖 检验科Agent分析并生成检查结果...")
+                try:
+                    # 使用lab_agent生成结果
+                    lab_results = self.lab_agent.generate_test_results(lab_context)
+                    
+                    if lab_results and isinstance(lab_results, list):
+                        results = lab_results
+                        logger.info(f"  ✅ 检验科Agent成功生成 {len(results)} 项检查结果")
+                        
+                        # 统计异常结果
+                        abnormal_count = sum(1 for r in results if r.get("abnormal"))
+                        logger.info(f"  ⚠️  异常结果: {abnormal_count}/{len(results)}")
+                        
+                        # 显示每项结果概要
+                        for idx, r in enumerate(results, 1):
+                            test_name = r.get("test_name", "未知")
+                            abnormal = r.get("abnormal", False)
+                            status = "⚠️ 异常" if abnormal else "✓ 正常"
+                            logger.info(f"  [{idx}] {test_name}: {status}")
+                        
+                        # 标记数据来源
+                        for r in results:
+                            r["source"] = "lab_agent"
+                            if real_diagnostic_tests:
+                                r["reference_data"] = "dataset"
+                    else:
+                        logger.warning("  ⚠️  检验科Agent返回结果格式错误")
+                        used_fallback = True
+                        
+                except Exception as e:
+                    logger.error(f"  ❌ 检验科Agent生成失败: {e}")
+                    used_fallback = True
             else:
-                # 如果数据集没有检查结果，使用LLM基于ordered_tests生成合理的检查结果
-                logger.info("⚠️  数据集无检查结果，使用LLM生成合理的检查结果")
+                logger.warning("  ⚠️  检验科Agent未初始化")
+                used_fallback = True
+            
+            # 如果lab_agent失败，使用备用方案（简化版生成）
+            if used_fallback or not results:
+                logger.warning("\n⚠️  使用备用方案生成检查结果...")
                 
-                if self.llm is None:
-                    logger.error("❌ 无LLM配置，无法生成检查结果")
-                    results = []
-                else:
-                    # 构建已开检查项目列表
-                    ordered_tests_str = "\n".join([
-                        f"- {t.get('name')} ({t.get('type')}, {t.get('body_part', ['未知部位'])}): {t.get('reason', '诊断需要')}"
-                        for t in state.ordered_tests
-                    ])
-                    
-                    system_prompt = load_prompt("common_system.txt")
-                    user_prompt = (
-                        "请为以下检查项目生成合理的检查结果。\n\n"
-                        + "【患者信息】\n"
-                        + f"主诉：{state.chief_complaint}\n"
-                        + f"科室：{state.dept}\n"
-                        + f"专科诊断：{state.specialty_summary.get('diagnosis', 'N/A')}\n\n"
-                        + "【已开检查项目】\n"
-                        + ordered_tests_str + "\n\n"
-                        + "【任务要求】\n"
-                        + "1. 为每项检查生成临床上合理的结果\n"
-                        + "2. 结果应与患者主诉和初步诊断相关联\n"
-                        + "3. 适当设置异常结果以支持诊断（约20-40%异常率）\n"
-                        + "4. 每项检查结果包含：\n"
-                        + "   - test_name: 检查名称\n"
-                        + "   - type: 检查类型（lab/imaging/endoscopy/neurophysiology）\n"
-                        + "   - body_part: 检查部位\n"
-                        + "   - summary: 结果摘要（简短描述）\n"
-                        + "   - abnormal: 是否异常（true/false）\n"
-                        + "   - value: 具体数值或描述（如有）\n"
-                        + "   - reference: 参考范围（如有）\n"
-                        + "   - detail: 详细结果描述\n"
-                        + "5. 保持医学专业性和临床合理性\n\n"
-                        + "【输出格式】\n"
-                        + "请输出JSON：{\"test_results\": [{检查结果1}, {检查结果2}, ...]}"
-                    )
-                    
-                    obj, used_fallback, _raw = self.llm.generate_json(
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        fallback=lambda: {
-                            "test_results": [{
-                                "test_name": t.get("name"),
-                                "type": t.get("type"),
-                                "body_part": t.get("body_part", ["未知"]),
-                                "summary": "检查结果生成失败",
-                                "abnormal": False,
-                                "detail": "LLM生成失败，请人工审核",
-                                "source": "llm_fallback"
-                            } for t in state.ordered_tests]
-                        },
-                        temperature=0.3,  # 适度随机性以生成合理变化
-                        max_tokens=2000,
-                    )
-                    
-                    results = list(obj.get("test_results") or [])
-                    
-                    # 标记数据来源
-                    for r in results:
-                        r["source"] = "llm_generated"
-                    
-                    logger.info(f"\n✅ LLM生成检查结果完成，共 {len(results)} 项")
-                    abnormal_count = sum(1 for r in results if r.get("abnormal"))
-                    logger.info(f"  ⚠️  异常结果: {abnormal_count}/{len(results)}")
+                # 为每项检查生成基本结果结构
+                results = []
+                for t in state.ordered_tests:
+                    result = {
+                        "test_name": t.get("name"),
+                        "test": t.get("name"),
+                        "type": t.get("type"),
+                        "body_part": t.get("body_part", ["未知"]),
+                        "summary": "检查已完成，详见报告",
+                        "abnormal": False,  # 默认正常
+                        "detail": f"{t.get('name')}检查已完成，结果正常范围内。",
+                        "source": "fallback_simple",
+                        "reference_data": "dataset" if real_diagnostic_tests else None,
+                    }
+                    results.append(result)
+                
+                logger.info(f"  ✅ 备用方案生成 {len(results)} 项基础结果")
             
             # 保存原始检查结果（未增强）
             state.test_results = results
             state.appointment["reports_ready"] = bool(results)
             
+            # 【病例库】记录检验结果
+            if hasattr(state, 'medical_record_integration') and state.medical_record_integration:
+                state.medical_record_integration.on_lab_test_completed(state, lab_tech_id="lab_tech_001")
+                logger.info("  📋 检验结果已记录到病例库")
+            
             # 安全获取data_source（防止索引错误）
             data_source = results[0].get("source") if results else "none"
+            has_reference = bool(real_diagnostic_tests)
+            
+            logger.info(f"\n✅ 检查结果生成完成")
+            logger.info(f"  数据来源: {data_source}")
+            logger.info(f"  参考数据: {'有（数据集）' if has_reference else '无'}")
+            logger.info(f"  结果数量: {len(results)} 项")
             
             state.add_audit(
                 make_audit_entry(
                     node_name="C10a Fetch Test Results",
-                    inputs_summary={"ordered_tests_count": len(state.ordered_tests), "has_real_data": bool(real_diagnostic_tests)},
+                    inputs_summary={
+                        "ordered_tests_count": len(state.ordered_tests),
+                        "has_reference_data": has_reference,
+                        "patient_complaint": state.chief_complaint[:40],
+                        "dept": state.dept,
+                    },
                     outputs_summary={
                         "results_count": len(results), 
                         "abnormal_count": sum(1 for r in results if r.get("abnormal")),
-                        "data_source": data_source
+                        "data_source": data_source,
+                        "lab_agent_used": data_source == "lab_agent",
                     },
-                    decision="获取检查结果" + ("（使用数据集真实结果）" if real_diagnostic_tests else "（LLM生成）"),
+                    decision="检验科Agent根据医生开具的检查项目、患者主诉和病例信息智能生成检查结果",
                     chunks=[],
-                    flags=["REAL_DATA"] if real_diagnostic_tests else (["LLM_PARSE_FALLBACK"] if used_fallback else ["LLM_USED"]),
+                    flags=["LAB_AGENT"] if data_source == "lab_agent" else (["FALLBACK"] if used_fallback else ["GENERATED"]),
                 )
             )
+            
             logger.info("✅ C10a节点完成\n")
             return state
 
@@ -715,23 +947,6 @@ class CommonOPDGraph:
                 logger.info("✅ C10b节点完成\n")
                 return state
             
-            if not self.llm or not self.llm_reports:
-                logger.info("ℹ️  未启用LLM报告增强，保持原始结果")
-                state.add_audit(
-                    make_audit_entry(
-                        node_name="C10b Enhance Reports",
-                        inputs_summary={"results_count": len(results)},
-                        outputs_summary={"enhanced": False},
-                        decision="未启用LLM报告增强",
-                        chunks=[],
-                        flags=["SKIPPED"]
-                    )
-                )
-                logger.info("✅ C10b节点完成\n")
-                return state
-            
-            # 使用LLM为检查结果生成个性化报告叙述
-            logger.info(f"🤖 使用LLM为 {len(results)} 项检查结果生成报告叙述...")
             system_prompt = load_prompt("common_system.txt")
             enhanced_count = 0
             failed_count = 0
@@ -810,6 +1025,56 @@ class CommonOPDGraph:
             logger.info("🔙 C11: 报告回诊")
             logger.info("="*60)
             
+            # 物理环境：从检验科返回诊室
+            if self.world and state.patient_id:
+                current_time_before = self.world.current_time.strftime('%H:%M')
+                logger.info(f"\n🏥 物理环境状态:")
+                logger.info(f"  🕐 时间: {current_time_before}")
+                
+                # 返回诊室（使用之前保存的目标诊室位置）
+                target_clinic = state.current_location  # 从state获取之前的诊室位置
+                # 如果没有记录，根据科室重新映射
+                if target_clinic == "lab":
+                    dept_location_map = {
+                        "internal_medicine": "internal_medicine",
+                        "surgery": "surgery", 
+                        "gastro": "gastro",
+                        "neuro": "neuro",
+                        "emergency": "emergency",
+                        "orthopedics": "surgery",
+                        "urology": "surgery",
+                        "obstetrics_gynecology": "internal_medicine",
+                        "pediatrics": "internal_medicine",
+                        "neurology": "neuro",
+                        "oncology": "internal_medicine",
+                        "infectious_disease": "internal_medicine",
+                        "dermatology_std": "internal_medicine",
+                        "ent_ophthalmology_stomatology": "internal_medicine",
+                        "psychiatry": "internal_medicine",
+                        "rehabilitation_pain": "internal_medicine",
+                        "traditional_chinese_medicine": "internal_medicine",
+                    }
+                    target_clinic = dept_location_map.get(state.dept, "internal_medicine")
+                
+                success, msg = self.world.move_agent(state.patient_id, target_clinic)
+                if success:
+                    dept_display_name = state.dept_display_name if hasattr(state, 'dept_display_name') else "诊室"
+                    logger.info(f"  🚶 移动: 检验科 → {dept_display_name}")
+                    state.current_location = target_clinic
+                    state.sync_physical_state()
+                    self.world.advance_time(minutes=2)
+                
+                # 患者和医生状态
+                if state.patient_id in self.world.physical_states:
+                    ps = self.world.physical_states[state.patient_id]
+                    logger.info(f"  👤 患者: 体力{ps.energy_level:.1f}/10 | 疼痛{ps.pain_level:.1f}/10")
+                if "doctor_001" in self.world.physical_states:
+                    ds = self.world.physical_states["doctor_001"]
+                    efficiency = ds.get_work_efficiency() * 100
+                    eff_icon = "🟢" if efficiency > 80 else ("🟡" if efficiency > 60 else "🔴")
+                    logger.info(f"  👨‍⚕️ 医生: 体力{ds.energy_level:.1f}/10 | 负荷{ds.work_load:.1f}/10 | 效率{efficiency:.0f}% {eff_icon}")
+                logger.info("")
+            
             state.appointment["return_visit"] = {"status": "returned", "reports_ready": True}
             logger.info("✅ 患者携报告返回诊室")
             
@@ -861,10 +1126,24 @@ class CommonOPDGraph:
                     logger.info(f"\n💬 需要补充问诊（原因: {', '.join(followup_reason)}）")
                     logger.info(f"  📋 计划问诊轮数: 最多{max_followup_questions}轮")
                     
-                    if abnormal_results:
-                        logger.info("  ⚠️  异常项目:")
-                        for result in abnormal_results:
-                            logger.info(f"     - {result.get('test_name')}: {result.get('summary', 'N/A')}")
+                    # 显示完整检查报告（让医生判断，不预先标注正常/异常）
+                    if state.test_results:
+                        logger.info("\n" + "="*60)
+                        logger.info("📋 检验科检查报告")
+                        logger.info("="*60)
+                        for idx, result in enumerate(state.test_results, 1):
+                            test_name = result.get('test_name', '未知检查')
+                            test_type = result.get('type', 'lab')
+                            result_text = result.get('result', 'N/A')
+                            
+                            logger.info(f"\n【报告 {idx}/{len(state.test_results)}】{test_name} ({test_type})")
+                            logger.info("-" * 60)
+                            # 显示完整的检查结果内容
+                            for line in result_text.split('\n'):
+                                if line.strip():
+                                    logger.info(f"  {line}")
+                            logger.info("-" * 60)
+                        logger.info("")
                 else:
                     logger.info("\n✅ 检查结果正常且明确，无需补充问诊")
                 
@@ -1115,6 +1394,17 @@ class CommonOPDGraph:
                     state.escalations = [str(x) for x in obj.get("escalations") if str(x)]
                 
                 logger.info(f"  ✅ 最终诊断: {state.diagnosis.get('name', 'N/A')}")
+                
+                # 【病例库】记录诊断
+                if hasattr(state, 'medical_record_integration') and state.medical_record_integration:
+                    state.medical_record_integration.on_diagnosis(state, doctor_id="doctor_001")
+                    logger.info("  📋 诊断信息已记录到病例库")
+                
+                # 【病例库】记录处方（如果有药物）
+                if state.treatment_plan.get("medications"):
+                    if hasattr(state, 'medical_record_integration') and state.medical_record_integration:
+                        state.medical_record_integration.on_prescription(state, doctor_id="doctor_001")
+                        logger.info("  📋 处方已记录到病例库")
                 
                 # 显示诊断信息
                 evidence_list = state.diagnosis.get("evidence", [])
@@ -1441,6 +1731,21 @@ class CommonOPDGraph:
             logger.info(f"  🩺 最终诊断: {state.diagnosis.get('name', 'N/A')}")
             if state.escalations:
                 logger.debug(f"  ⚠️  升级建议: {', '.join(state.escalations)}")
+            
+            # 【病例库】患者出院，记录出院信息
+            if hasattr(state, 'medical_record_integration') and state.medical_record_integration:
+                state.medical_record_integration.on_discharge(state, doctor_id="doctor_001")
+                logger.info("  📋 出院信息已记录到病例库")
+                
+                # 显示病例摘要
+                summary = state.medical_record_integration.get_patient_history(state.patient_id)
+                if summary:
+                    logger.info(f"\n📋 病例摘要:")
+                    logger.info(f"  病例号: {summary['record_id']}")
+                    logger.info(f"  总记录数: {summary['total_entries']} 条")
+                    logger.info(f"  诊断次数: {summary['diagnoses_count']}")
+                    logger.info(f"  检验次数: {summary['lab_tests_count']}")
+                    logger.info(f"  处方次数: {summary['prescriptions_count']}")
             
             # 评估诊断准确性
             if state.ground_truth:

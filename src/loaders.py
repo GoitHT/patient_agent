@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+import threading
+from typing import Any, Optional
 
 from utils import get_logger
 
@@ -12,6 +13,11 @@ logger = get_logger("hospital_agent.dataset_loader")
 
 # 是否启用自动翻译（可通过环境变量控制）
 ENABLE_TRANSLATION = os.getenv("ENABLE_DATASET_TRANSLATION", "true").lower() in ("true", "1", "yes")
+
+# 全局数据集缓存（避免重复加载）
+_DATASET_CACHE: dict[str, Any] = {}
+_CACHE_ENABLED = True  # 是否启用内存缓存
+_CACHE_LOCK = threading.RLock()  # 缓存锁，防止并发加载
 
 
 def _translate_to_chinese(text: str, field_name: str = "") -> str:
@@ -125,13 +131,14 @@ def _translate_case_data(case_data: dict[str, Any]) -> dict[str, Any]:
     return translated
 
 
-def load_diagnosis_arena_case(case_id: int | None = None, use_mock: bool = False) -> dict[str, Any]:
+def load_diagnosis_arena_case(case_id: int | None = None, use_mock: bool = False, local_cache_dir: str = "./diagnosis_dataset") -> dict[str, Any]:
     """
-    从 HuggingFace 加载诊断数据集
+    从 HuggingFace 加载诊断数据集（支持本地缓存）
     
     Args:
         case_id: 病例ID，None表示随机
         use_mock: 是否直接使用Mock数据（跳过HuggingFace加载）
+        local_cache_dir: 本地缓存目录（首次从HF下载后保存到此目录）
     
     数据格式：
     {
@@ -157,17 +164,69 @@ def load_diagnosis_arena_case(case_id: int | None = None, use_mock: bool = False
     
     try:
         from datasets import load_dataset
+        from pathlib import Path
         
-        # 加载数据集（不指定split，让datasets自动判断）
-        try:
-            dataset = load_dataset("SII-SPIRAL-MED/DiagnosisArena", split="train")
-        except (ValueError, KeyError):
-            # 如果没有train split，尝试加载整个数据集
-            dataset = load_dataset("SII-SPIRAL-MED/DiagnosisArena")
-            # 取第一个split
-            if isinstance(dataset, dict):
-                split_name = list(dataset.keys())[0]
-                dataset = dataset[split_name]
+        # 检查本地缓存是否存在
+        cache_path = Path(local_cache_dir)
+        local_json = cache_path / "dataset.json"
+        
+        # 构建缓存键（基于文件路径）
+        cache_key = str(local_json.absolute())
+        
+        # 使用锁保护缓存检查和加载过程
+        with _CACHE_LOCK:
+            # 检查内存缓存
+            if _CACHE_ENABLED and cache_key in _DATASET_CACHE:
+                dataset = _DATASET_CACHE[cache_key]
+                # 静默使用缓存，不输出日志（避免重复日志）
+            else:
+                # 优先从本地加载
+                if local_json.exists():
+                    # 二次检查：可能其他线程已经加载了
+                    if _CACHE_ENABLED and cache_key in _DATASET_CACHE:
+                        dataset = _DATASET_CACHE[cache_key]
+                    else:
+                        logger.info(f"📂 从本地缓存加载数据集: {local_json}")
+                        try:
+                            dataset = load_dataset("json", data_files=str(local_json), split="train")
+                            logger.info(f"✅ 本地数据集加载成功 (共 {len(dataset)} 条)")
+                            
+                            # 存入内存缓存
+                            if _CACHE_ENABLED:
+                                _DATASET_CACHE[cache_key] = dataset
+                        except Exception as e:
+                            logger.warning(f"⚠️ 本地缓存加载失败: {e}，尝试从 HuggingFace 重新下载")
+                            dataset = None
+                else:
+                    dataset = None
+            
+            # 如果本地没有，从 HuggingFace 下载
+            if dataset is None:
+                # 三次检查：可能其他线程刚刚下载完成
+                if _CACHE_ENABLED and cache_key in _DATASET_CACHE:
+                    dataset = _DATASET_CACHE[cache_key]
+                else:
+                    logger.info("🌐 从 HuggingFace 下载数据集...")
+                    try:
+                        dataset = load_dataset("SII-SPIRAL-MED/DiagnosisArena", split="train")
+                    except (ValueError, KeyError):
+                        # 如果没有train split，尝试加载整个数据集
+                        dataset = load_dataset("SII-SPIRAL-MED/DiagnosisArena")
+                        # 取第一个split
+                        if isinstance(dataset, dict):
+                            split_name = list(dataset.keys())[0]
+                            dataset = dataset[split_name]
+                    
+                    # 保存到本地
+                    logger.info(f"💾 保存数据集到本地: {local_json}")
+                    cache_path.mkdir(parents=True, exist_ok=True)
+                    # 使用 orient='records' 格式保存，避免 Arrow 格式问题
+                    dataset.to_json(str(local_json), force_ascii=False, orient='records', lines=True)
+                    logger.info(f"✅ 数据集已保存 (共 {len(dataset)} 条)")
+                    
+                    # 存入内存缓存
+                    if _CACHE_ENABLED:
+                        _DATASET_CACHE[cache_key] = dataset
         
         # 如果指定 case_id，获取特定病例
         if case_id is not None:
@@ -218,11 +277,23 @@ def load_diagnosis_arena_case(case_id: int | None = None, use_mock: bool = False
         
     except ImportError:
         # 如果没有安装 datasets 库，返回示例数据
-        print("警告：未安装 datasets 库，使用示例数据。运行 'pip install datasets' 以从 HuggingFace 加载真实数据。")
+        warning_msg = "⚠️ 警告：未安装 datasets 库，使用Mock示例数据！真实数据请运行: pip install datasets"
+        print(f"\n{'='*80}")
+        print(f"❌ {warning_msg}")
+        print(f"{'='*80}\n")
+        logger.warning(warning_msg)
         return _get_mock_case(case_id)
     except Exception as e:
         # 如果加载失败（网络问题、数据集不存在等），返回示例数据
-        print(f"警告：无法从 HuggingFace 加载数据 ({e})，使用示例数据。")
+        error_msg = f"⚠️ 警告：无法从 HuggingFace 加载数据 ({e})，使用Mock示例数据！"
+        print(f"\n{'='*80}")
+        print(f"❌ {error_msg}")
+        print("💡 可能原因:")
+        print("   1. 网络连接问题，无法访问 HuggingFace")
+        print("   2. 数据集不存在或已移除")
+        print("   3. HuggingFace token 配置问题")
+        print(f"{'='*80}\n")
+        logger.error(f"数据加载失败: {e}")
         return _get_mock_case(case_id)
 
 
@@ -282,4 +353,70 @@ def _get_mock_case(case_id: int | None = None) -> dict[str, Any]:
     }
 
 
-__all__ = ["load_diagnosis_arena_case"]
+def clear_dataset_cache():
+    """清除内存中的数据集缓存"""
+    global _DATASET_CACHE
+    _DATASET_CACHE.clear()
+    logger.info("🗑️ 数据集内存缓存已清除")
+
+
+def get_cache_info() -> dict[str, Any]:
+    """获取缓存信息"""
+    return {
+        "enabled": _CACHE_ENABLED,
+        "cached_datasets": list(_DATASET_CACHE.keys()),
+        "cache_size": len(_DATASET_CACHE),
+    }
+
+
+def _get_dataset_size(local_cache_dir: str = "./diagnosis_dataset") -> int:
+    """
+    获取数据集大小（病例数量）
+    
+    Args:
+        local_cache_dir: 本地缓存目录
+    
+    Returns:
+        数据集中的病例数量
+    """
+    try:
+        from datasets import load_dataset
+        from pathlib import Path
+        
+        # 检查本地缓存
+        cache_path = Path(local_cache_dir)
+        local_json = cache_path / "dataset.json"
+        cache_key = str(local_json.absolute())
+        
+        with _CACHE_LOCK:
+            # 先检查内存缓存
+            if _CACHE_ENABLED and cache_key in _DATASET_CACHE:
+                return len(_DATASET_CACHE[cache_key])
+            
+            if local_json.exists():
+                # 从本地加载（使用 jsonlines 格式）
+                dataset = load_dataset("json", data_files=str(local_json), split="train")
+                # 存入缓存
+                if _CACHE_ENABLED:
+                    _DATASET_CACHE[cache_key] = dataset
+                return len(dataset)
+            else:
+                # 从 HuggingFace 加载
+                try:
+                    dataset = load_dataset("SII-SPIRAL-MED/DiagnosisArena", split="train")
+                except (ValueError, KeyError):
+                    dataset = load_dataset("SII-SPIRAL-MED/DiagnosisArena")
+                    if isinstance(dataset, dict):
+                        split_name = list(dataset.keys())[0]
+                        dataset = dataset[split_name]
+                
+                # 存入缓存
+                if _CACHE_ENABLED:
+                    _DATASET_CACHE[cache_key] = dataset
+                return len(dataset)
+    except Exception as e:
+        logger.warning(f"获取数据集大小失败: {e}")
+        return 100  # 默认值
+
+
+__all__ = ["load_diagnosis_arena_case", "clear_dataset_cache", "get_cache_info", "_get_dataset_size"]

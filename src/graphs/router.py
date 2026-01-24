@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
+
 from graphs.common_opd_graph import CommonOPDGraph, Services
 from graphs.dept_subgraphs.common_specialty_subgraph import build_common_specialty_subgraph
 from rag import ChromaRetriever
@@ -78,11 +79,13 @@ def build_common_graph(
     rng: random.Random,
     llm: LLMClient | None = None,
     llm_reports: bool = False,
-    use_agents: bool = True,  # 总是使用三智能体模式
+    use_agents: bool = True,  # 总是使用多智能体模式
     patient_agent: Any | None = None,
     doctor_agent: Any | None = None,
     nurse_agent: Any | None = None,
+    lab_agent: Any | None = None,
     max_questions: int = 3,
+    world: Any | None = None,  # 新增：HospitalWorld实例
 ):
     return CommonOPDGraph(
         retriever=retriever,
@@ -95,7 +98,9 @@ def build_common_graph(
         patient_agent=patient_agent,
         doctor_agent=doctor_agent,
         nurse_agent=nurse_agent,
+        lab_agent=lab_agent,
         max_questions=max_questions,
+        world=world,  # 传递world实例
     ).build()
 
 

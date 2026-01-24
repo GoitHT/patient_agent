@@ -21,27 +21,22 @@ class LLMConfig:
     """LLM配置"""
     backend: str = "deepseek"
     enable_reports: bool = False
-    
-    # DeepSeek配置（从环境变量读取）
-    @property
-    def deepseek_api_key(self) -> Optional[str]:
-        return os.getenv("DEEPSEEK_API_KEY")
-    
-    @property
-    def deepseek_base_url(self) -> Optional[str]:
-        return os.getenv("DEEPSEEK_BASE_URL")
-    
-    @property
-    def deepseek_model(self) -> Optional[str]:
-        return os.getenv("DEEPSEEK_MODEL")
 
 
 @dataclass
 class AgentConfig:
     """智能体配置"""
     max_questions: int = 10  # 医生最多问几个问题
+    max_triage_questions: int = 3  # 护士分诊时最多问几个问题
     dataset_id: int = 15     # 数据集索引位置（从0开始），非病例本身的ID
     use_hf_data: bool = True # 是否从HuggingFace加载数据
+
+
+@dataclass
+class DatasetConfig:
+    """数据集配置"""
+    cache_dir: Path = field(default_factory=lambda: Path("./diagnosis_dataset"))  # 本地缓存目录
+    use_local_cache: bool = True  # 是否使用本地缓存
 
 
 @dataclass
@@ -64,6 +59,7 @@ class Config:
     """主配置类"""
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
     system: SystemConfig = field(default_factory=SystemConfig)
     
@@ -83,6 +79,8 @@ class Config:
             config._load_from_yaml(config_file)
         elif Path("config.yaml").exists():
             config._load_from_yaml(Path("config.yaml"))
+        elif Path("src/config.yaml").exists():
+            config._load_from_yaml(Path("src/config.yaml"))
         
         # 2. 从环境变量加载
         config._load_from_env()
@@ -119,6 +117,14 @@ class Config:
                     self.agent.dataset_id = agent_data["dataset_id"]
                 if "use_hf_data" in agent_data:
                     self.agent.use_hf_data = agent_data["use_hf_data"]
+            
+            # Dataset配置
+            if "dataset" in data:
+                dataset_data = data["dataset"]
+                if "cache_dir" in dataset_data:
+                    self.dataset.cache_dir = Path(dataset_data["cache_dir"])
+                if "use_local_cache" in dataset_data:
+                    self.dataset.use_local_cache = dataset_data["use_local_cache"]
             
             # RAG配置
             if "rag" in data:
@@ -157,6 +163,12 @@ class Config:
             self.agent.dataset_id = int(os.getenv("HOSPITAL_DATASET_ID"))
         if os.getenv("HOSPITAL_USE_HF_DATA"):
             self.agent.use_hf_data = os.getenv("HOSPITAL_USE_HF_DATA").lower() in ("true", "1", "yes")
+        
+        # Dataset配置
+        if os.getenv("HOSPITAL_DATASET_CACHE_DIR"):
+            self.dataset.cache_dir = Path(os.getenv("HOSPITAL_DATASET_CACHE_DIR"))
+        if os.getenv("HOSPITAL_USE_LOCAL_CACHE"):
+            self.dataset.use_local_cache = os.getenv("HOSPITAL_USE_LOCAL_CACHE").lower() in ("true", "1", "yes")
         
         # RAG配置
         if os.getenv("HOSPITAL_CHROMA_DIR"):

@@ -8,9 +8,15 @@ llm:
 
 # 智能体配置
 agent:
-  max_questions: 15        # 医生最多问几个问题
-  dataset_id: 61           # 数据集索引
+  max_questions: 7         # 医生最多问几个问题（配额，医生可根据信息充分性主动提前结束）
+  max_triage_questions: 3  # 护士分诊时最多问几个问题
+  dataset_id: 68          # 数据集索引
   use_hf_data: true        # 是否从HuggingFace加载数据
+
+# 数据集配置
+dataset:
+  cache_dir: ./diagnosis_dataset  # 本地数据集缓存目录
+  use_local_cache: true            # 是否使用本地缓存（首次运行会自动下载并缓存）
 
 # RAG配置
 rag:

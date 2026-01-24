@@ -11,6 +11,7 @@ from rag import ChromaRetriever
 from services.llm_client import LLMClient
 from state.schema import BaseState, make_audit_entry
 from utils import load_prompt, contains_any_positive, get_logger
+from environment.staff_tracker import StaffTracker  # 导入医护人员状态追踪器
 
 # 初始化logger
 logger = get_logger("hospital_agent.specialty_subgraph")
@@ -316,7 +317,7 @@ def build_common_specialty_subgraph(
     llm: LLMClient | None = None,
     doctor_agent=None, 
     patient_agent=None, 
-    max_questions: int = 10  # 修改为10轮
+    max_questions: int = 3  # 使用配置文件设置的值
 ):
     """构建通用专科子图，适用于所有科室"""
     graph = StateGraph(BaseState)
@@ -340,7 +341,8 @@ def build_common_specialty_subgraph(
             logger.info(f"  👨‍⚕️ 设置医生为{dept_name}专科医生")
         
         # 检索该科室的专科知识
-        query = f"{dept} {dept_name} 红旗 检查建议 鉴别诊断 {state.chief_complaint}"
+        # 注意：此时chief_complaint还未设置（医生尚未从患者处获得），使用科室信息检索
+        query = f"{dept} {dept_name} 红旗 检查建议 鉴别诊断"
         logger.info(f"🔍 检索{dept_name}知识...")
         chunks = retriever.retrieve(query, filters={"dept": dept}, k=4)
         state.add_retrieved_chunks(chunks)
@@ -357,7 +359,45 @@ def build_common_specialty_subgraph(
         
         # Agent模式：逐步一问一答，然后从doctor_agent收集结构化信息
         if use_agents:
+            # 获取最大问诊轮数
+            max_questions = state.agent_config.get("max_questions", 3)
+            
             logger.info(f"\n💬 开始{dept_name}专科问诊（逐步一问一答）...")
+            
+            # ===== 物理环境集成：问诊前检查患者状态 =====
+            if state.world_context:
+                impact = state.get_physical_impact_on_diagnosis()
+                if impact.get("has_impact"):
+                    logger.info("\n" + "="*60)
+                    logger.info("⚠️  物理状态影响诊断")
+                    logger.info("="*60)
+                    
+                    # 显示严重警告
+                    warnings = impact.get("warnings", [])
+                    if warnings:
+                        for warning in warnings:
+                            logger.warning(warning)
+                    
+                    # 显示建议
+                    for suggestion in impact.get("suggestions", []):
+                        logger.info(f"  💡 {suggestion}")
+                    
+                    logger.info("="*60)
+                    
+                    # 根据体力限制问诊轮数
+                    physical_max_questions = impact.get("max_questions", max_questions)
+                    if physical_max_questions < max_questions:
+                        logger.info(f"  ⚙️  根据患者状态，问诊轮数调整为 {physical_max_questions}")
+                        max_questions = physical_max_questions
+                    
+                    # 如果患者意识异常，标记为紧急
+                    if impact.get("emergency"):
+                        logger.error("  🚨🚨 紧急情况：患者意识异常，建议立即转急诊！")
+                        state.escalations.append("患者意识异常，建议急诊评估")
+                        # 不应继续常规问诊
+                        if max_questions > 0:
+                            logger.warning("  ⚠️  由于紧急情况，跳过常规问诊")
+                            max_questions = 0
             
             # 使用全局共享计数器
             global_qa_count = state.node_qa_counts.get("global_total", 0)
@@ -376,11 +416,18 @@ def build_common_specialty_subgraph(
                 if alarm_keywords:
                     context_desc += f"，警报症状：{', '.join(alarm_keywords)}"
                 
-                question = doctor_agent.generate_one_question(
-                    chief_complaint=state.chief_complaint,
-                    context=context_desc,
-                    rag_chunks=chunks
-                )
+                # 第一个问题：如果chief_complaint为空，先问患者主诉是什么
+                if i == 0 and not state.chief_complaint and not doctor_agent.questions_asked:
+                    question = "您好，请问您哪里不舒服？主要是什么症状？"
+                    logger.info(f"    🧑‍⚕️  医生问（开场询问主诉）: {question}")
+                else:
+                    # 使用收集到的信息（如果有的话）或者患者的描述生成问题
+                    # 注意：不使用state.chief_complaint，因为它还未确定
+                    question = doctor_agent.generate_one_question(
+                        chief_complaint=doctor_agent.collected_info.get("chief_complaint", ""),
+                        context=context_desc,
+                        rag_chunks=chunks
+                    )
                 
                 if not question:
                     logger.info("    ℹ️  医生判断信息已充足，提前结束问诊")
@@ -388,8 +435,9 @@ def build_common_specialty_subgraph(
                 
                 logger.info(f"    🧑‍⚕️  医生问: {question}")
                 
-                # 患者回答
-                answer = patient_agent.respond_to_doctor(question)
+                # 患者回答（传入物理状态）
+                physical_state = state.physical_state_snapshot if state.world_context else None
+                answer = patient_agent.respond_to_doctor(question, physical_state=physical_state)
                 logger.info(f"    👤 患者答: {answer[:100]}{'...' if len(answer) > 100 else ''}")
                 
                 # 医生处理回答
@@ -408,12 +456,99 @@ def build_common_specialty_subgraph(
             
             state.agent_interactions["doctor_patient_qa"] = qa_list
             
+            # ===== StaffTracker集成：区生专科问诊工作 =====
+            if state.world_context:
+                actual_questions = state.node_qa_counts.get(node_key, 0) - questions_asked_this_node
+                if actual_questions > 0:
+                    # 每轮问诊约2-3分钟
+                    consultation_time = actual_questions * 2.5
+                    StaffTracker.update_doctor_consultation(
+                        world=state.world_context,
+                        duration_minutes=int(consultation_time),
+                        complexity=0.6  # 专科问诊复杂度中等偏上
+                    )
+                    logger.info(f"  👨‍⚕️  医生完成{dept_name}专科问诊（{actual_questions}轮，耗时{int(consultation_time)}分钟）")
+            
+            # ===== 物理环境集成：问诊后更新物理状态 =====
+            if state.world_context:
+                qa_count = len([qa for qa in qa_list if qa.get('stage') == f"{dept}_specialty"])
+                if qa_count > 0:
+                    duration = qa_count * 3  # 每轮约3分钟
+                    energy_cost = 0.5 * qa_count  # 每轮消耗0.5体力
+                    
+                    logger.info(f"\n{'─'*60}")
+                    logger.info(f"🌍 物理环境模拟 - 问诊过程")
+                    logger.info(f"{'─'*60}")
+                    start_time = state.world_context.current_time.strftime('%H:%M')
+                    
+                    result = state.update_physical_world(
+                        action="consult",
+                        duration_minutes=duration,
+                        energy_cost=energy_cost
+                    )
+                    end_time = state.world_context.current_time.strftime('%H:%M')
+                    
+                    logger.info(f"💬 问诊轮数: {qa_count}轮")
+                    logger.info(f"⏱️  总耗时: {duration}分钟")
+                    logger.info(f"🕐 时间: {start_time} → {end_time}")
+                    logger.info(f"💪 体力: {result['physical_state']['energy_level']:.1f}/10 {'🟢' if result['physical_state']['energy_level'] > 7 else '🟡' if result['physical_state']['energy_level'] > 4 else '🔴'}")
+                    logger.info(f"😣 疼痛: {result['physical_state']['pain_level']:.1f}/10 {'🟢' if result['physical_state']['pain_level'] < 3 else '🟡' if result['physical_state']['pain_level'] < 6 else '🔴'}")
+                    logger.info(f"{'─'*60}")
+                    
+                    # 如果出现危急警报
+                    if result.get("critical_warning"):
+                        logger.warning(f"🚨 警告：患者出现危急状态 (意识: {result.get('consciousness')})")
+            
             # 从医生收集的信息更新state
             state.history.update(doctor_agent.collected_info.get("history", {}))
             
             final_qa_count = state.node_qa_counts.get(node_key, 0)
             final_global_count = state.node_qa_counts.get("global_total", 0)
             logger.info(f"  ✅ {dept_name}专科问诊完成，本节点 {final_qa_count} 轮，全局总计 {final_global_count} 轮")
+            
+            # ===== 新增：医生总结患者主诉 =====
+            if not state.chief_complaint:  # 如果主诉还未设置
+                summarized_cc = doctor_agent.summarize_chief_complaint()
+                state.chief_complaint = summarized_cc
+                logger.info(f"\n  📋 医生总结主诉: {summarized_cc}")
+            
+            # ===== 新增：问诊质量评估 =====
+            logger.info(f"\n{'━'*60}")
+            logger.info("📊 问诊质量评估")
+            logger.info(f"{'━'*60}")
+            
+            quality_report = doctor_agent.assess_interview_quality()
+            
+            # 显示评估结果
+            logger.info(f"  📈 综合评分: {quality_report['overall_score']}/100")
+            logger.info(f"     • 完整性: {quality_report['completeness_score']:.0f}/100")
+            logger.info(f"     • 深度: {quality_report['depth_score']:.0f}/100")
+            logger.info(f"     • 效率: {quality_report['efficiency_score']:.0f}/100")
+            
+            if quality_report['warning']:
+                if quality_report['overall_score'] < 50:
+                    logger.warning(f"  {quality_report['warning']}")
+                elif quality_report['overall_score'] < 70:
+                    logger.info(f"  {quality_report['warning']}")
+                else:
+                    logger.info(f"  {quality_report['warning']}")
+            
+            # 显示缺失信息
+            if quality_report['missing_areas']:
+                logger.info(f"\n  ❌ 缺失关键信息 ({len(quality_report['missing_areas'])}项):")
+                for area in quality_report['missing_areas']:
+                    logger.info(f"     • {area}")
+            
+            # 显示改进建议
+            if quality_report['suggestions']:
+                logger.info(f"\n  💡 改进建议:")
+                for suggestion in quality_report['suggestions'][:3]:  # 最多显示3条
+                    logger.info(f"     • {suggestion}")
+            
+            logger.info(f"{'━'*60}\n")
+            
+            # 保存评估结果到state
+            state.agent_interactions["interview_quality"] = quality_report
             
             # Agent模式：直接从医生智能体获取结构化信息，不再用LLM重复提取
             interview = doctor_agent.collected_info.get(f"{dept}_interview", {})

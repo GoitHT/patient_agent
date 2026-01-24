@@ -72,6 +72,36 @@ python scripts/build_index.py
 
 生成的索引存储在 `.chroma/` 目录中。
 
+5. **下载数据集（推荐）**
+
+```bash
+# 下载 DiagnosisArena 数据集到本地（首次运行推荐）
+python download_dataset.py
+
+# 或指定自定义目录
+python download_dataset.py --output ./my_dataset
+```
+
+> 💡 **提示**：下载后系统会自动使用本地数据集，无需联网。如果跳过此步骤，首次运行时会自动从 HuggingFace 下载并缓存。
+
+### 运行系统
+
+#### 单患者模式
+
+```bash
+# 使用默认配置
+python src/main.py
+
+# 指定病例ID
+python src/main.py --dataset-id 15
+```
+
+#### 多患者模式
+
+```bash
+# 运行多患者测试
+python test_shared_environment.py
+```
 
 #### DeepSeek 配置
 
