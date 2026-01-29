@@ -89,7 +89,8 @@ class DeepSeekLLMClient:
         retry_delay = float(os.getenv("DEEPSEEK_RETRY_DELAY", "2.0"))
         
         # 输出实际使用的配置（用于调试）
-        logger.info(f"🔧 LLM配置: URL={base_url}, Model={model}, Key={api_key[:12]}...")
+        # 改为debug级别，避免终端重复输出
+        # logger.debug(f"🔧 LLM配置: URL={base_url}, Model={model}, Key={api_key[:12]}...")
         
         return DeepSeekLLMClient(
             DeepSeekConfig(

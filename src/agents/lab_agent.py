@@ -19,7 +19,12 @@ class LabAgent:
         self._processed_tests: list[dict[str, Any]] = []
     
     def reset(self) -> None:
-        """重置检验科状态（用于处理新患者）"""
+        """重置检验科状态（用于处理新患者）
+        
+        清空已处理的检查项目列表，确保每个新患者的检查结果独立生成。
+        
+        多患者处理时会自动调用此方法确保状态隔离。
+        """
         self._processed_tests = []
     
     def generate_test_results(
@@ -124,9 +129,15 @@ class LabAgent:
                     )
                     results.append(generated_result)
                 else:
-                    # 3. 规则模式：返回正常结果
-                    fallback_result = self._generate_fallback_result(test_name, test_type)
-                    results.append(fallback_result)
+                    # 没有现成结果，生成一个空结果
+                    self.logger.warning(f"⚠️  {test_name} 无法生成结果")
+                    results.append({
+                        "test_name": test_name,
+                        "type": test_type,
+                        "result": "检查未完成",
+                        "abnormal": False,
+                        "summary": "检查未完成"
+                    })
         
         # 记录处理的检查
         self._processed_tests.extend(results)
@@ -392,92 +403,15 @@ class LabAgent:
             return result
             
         except Exception as e:
-            # LLM失败时使用fallback
-            return self._generate_fallback_result(test_name, test_type)
-    
-    def _generate_fallback_result(self, test_name: str, test_type: str) -> dict[str, Any]:
-        """
-        生成fallback检查结果（规则模式）- 使用真实的医学报告格式
-        
-        Args:
-            test_name: 检查名称
-            test_type: 检查类型
-            
-        Returns:
-            默认的检查结果字典
-        """
-        # 更真实的正常结果（按照医学报告格式）
-        normal_results = {
-            "血常规": """白细胞计数(WBC) 6.5×10⁹/L (参考范围: 4.0-10.0)
-红细胞计数(RBC) 4.8×10¹²/L (参考范围: 4.0-5.5)
-血红蛋白(Hb) 145 g/L (参考范围: 120-160)
-血小板计数(PLT) 220×10⁹/L (参考范围: 100-300)
-中性粒细胞百分比(NEUT%) 60% (参考范围: 50-70)
-淋巴细胞百分比(LYMPH%) 30% (参考范围: 20-40)""",
-            
-            "肝功能": """丙氨酸氨基转移酶(ALT) 25 U/L (参考范围: 0-40)
-天门冬氨酸氨基转移酶(AST) 28 U/L (参考范围: 0-40)
-总蛋白(TP) 70 g/L (参考范围: 60-80)
-白蛋白(ALB) 45 g/L (参考范围: 35-55)
-总胆红素(TBIL) 15 μmol/L (参考范围: 5-21)
-直接胆红素(DBIL) 5 μmol/L (参考范围: 0-7)""",
-            
-            "肾功能": """尿素氮(BUN) 5.5 mmol/L (参考范围: 2.9-8.2)
-肌酐(Cr) 85 μmol/L (参考范围: 53-106)
-尿酸(UA) 320 μmol/L (参考范围: 208-428)
-肾小球滤过率(eGFR) 95 mL/min/1.73m² (参考范围: >90)""",
-            
-            "凝血功能": """凝血酶原时间(PT) 12.0秒 (参考范围: 11-13)
-国际标准化比值(INR) 1.0 (参考范围: 0.8-1.2)
-活化部分凝血活酶时间(APTT) 35秒 (参考范围: 28-43)
-纤维蛋白原(FIB) 3.0 g/L (参考范围: 2.0-4.0)
-D-二聚体(D-Dimer) 0.3 mg/L (参考范围: <0.5)""",
-            
-            "心电图": """窦性心律，心率 72次/分 (正常: 60-100)
-PR间期 0.16秒，QRS时限 0.09秒
-QT/QTc 0.38/0.41秒
-各导联ST-T未见异常
-诊断：窦性心律，心电图正常""",
-            
-            "胸部CT": """检查技术：平扫
-检查所见：双肺纹理清晰，未见实质性病灶。双肺门影不大，纵隔内未见肿大淋巴结。气管及主支气管通畅。心影大小正常。双侧胸腔未见积液。
-印象：双肺未见明显异常。""",
-            
-            "腹部超声": """肝脏：大小正常，包膜光整，实质回声均匀，肝内血管走行正常。
-胆囊：大小形态正常，壁不厚，腔内未见异常回声。
-胰腺：显示清晰，回声均匀，胰管不扩张。
-脾脏：大小形态正常，实质回声均匀。
-双肾：大小形态正常，皮髓质分界清，集合系统未见分离。
-超声提示：肝、胆、胰、脾、双肾未见异常。""",
-        }
-        
-        # 尝试匹配检查名称
-        for key, value in normal_results.items():
-            if key in test_name or test_name in key:
-                return {
-                    "test_name": test_name,
-                    "test": test_name,
-                    "type": test_type,
-                    "result": value,
-                    "abnormal": False,
-                    "summary": "检查结果正常，未见异常",
-                    "source": "fallback",
-                    "timestamp": None,
-                }
-        
-        # 默认通用结果
-        result_text = f"{test_name}检查完成，各项指标均在正常范围内，未见明显异常。"
-        
-        return {
-            "test_name": test_name,
-            "test": test_name,
-            "type": test_type,
-            "result": result_text,
-            "abnormal": False,
-            "summary": "未见异常",
-            "source": "fallback",
-            "timestamp": None,
-        }
+            self.logger.error(f"❌ LLM生成检查结果失败: {e}")
+            return {
+                "test_name": test_name,
+                "type": test_type,
+                "result": "检查结果生成失败",
+                "abnormal": False,
+                "summary": "检查结果生成失败",
+                "source": "error"
+            }
     
     def _extract_case_summary(self, case_data: dict[str, Any]) -> str:
         """

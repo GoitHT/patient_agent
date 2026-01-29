@@ -7,12 +7,9 @@ from services.llm_client import LLMClient
 class NurseAgent:
     """护士智能体：根据患者主诉进行分诊"""
     
-    # 15个标准科室代码
+    # 只保留神经内科
     VALID_DEPTS = [
-        "internal_medicine", "surgery", "orthopedics", "urology",
-        "obstetrics_gynecology", "pediatrics", "neurology", "oncology",
-        "infectious_disease", "dermatology_std", "ent_ophthalmology_stomatology",
-        "psychiatry", "emergency", "rehabilitation_pain", "traditional_chinese_medicine"
+        "neurology"
     ]
     
     def __init__(self, llm: LLMClient, max_triage_questions: int = 3):
@@ -23,108 +20,41 @@ class NurseAgent:
         """
         self._llm = llm
         self._max_triage_questions = max_triage_questions
-        self._triage_history: list[dict[str, str]] = []
-        self._triage_qa: list[dict[str, str]] = []  # 分诊对话记录
     
     def reset(self) -> None:
-        """重置分诊历史（用于处理新的就诊流程）"""
-        self._triage_history = []
-        self._triage_qa = []
+        """重置分诊历史（用于处理新患者）
+        
+        NurseAgent目前为无状态设计，每次分诊独立处理，不保存历史记录。
+        提供此方法是为了保持接口一致性，未来如果需要添加状态管理时方便扩展。
+        
+        多患者处理时会自动调用此方法确保状态隔离。
+        """
+        pass
     
     def triage(self, patient_description: str) -> str:
         """
-        根据患者描述进行分诊到15个标准科室之一
+        根据患者描述进行分诊（当前系统只有神经医学科一个科室）
         
         Args:
             patient_description: 患者描述的症状（来自患者智能体）
             
         Returns:
-            科室代码（internal_medicine, surgery, orthopedics等）
+            科室代码（neurology）
         """
         # 参数验证
         if not patient_description or not patient_description.strip():
             raise ValueError("患者描述不能为空")
         
-        patient_description = patient_description.strip()
-        
-        # 使用LLM进行智能分诊
-        system_prompt = """你是一名经验丰富的分诊护士。
-
-【可选科室】（必须从以下15个科室中选择）
-1. internal_medicine（内科）：发热、咳嗽、胸闷、高血压、糖尿病、消化道症状等
-2. surgery（外科）：外伤、肿块、阑尾炎、疝气、体表手术等
-3. orthopedics（骨科）：骨折、关节疼痛、扭伤、腰腿痛、骨关节疾病等
-4. urology（泌尿外科）：泌尿系统结石、血尿、排尿困难、前列腺疾病等
-5. obstetrics_gynecology（妇产科）：妇科疾病、孕产检查、月经异常、妇科肿瘤等
-6. pediatrics（儿科）：儿童疾病、生长发育问题、小儿感染等
-7. neurology（神经医学）：头痛、头晕、肢体无力、癫痫、帕金森、脑血管病等
-8. oncology（肿瘤科）：恶性肿瘤诊治、化疗、放疗等
-9. infectious_disease（感染性疾病科）：发热待查、传染病、寄生虫病、HIV等
-10. dermatology_std（皮肤性病科）：皮疹、瘙痒、性传播疾病等
-11. ent_ophthalmology_stomatology（眼耳鼻喉口腔科）：视力下降、耳鸣、鼻塞、咽喉痛、牙痛等
-12. psychiatry（精神心理科）：抑郁、焦虑、精神分裂、失眠、心理障碍等
-13. emergency（急诊医学科）：急性危重症、创伤、中毒、休克等
-14. rehabilitation_pain（康复疼痛科）：慢性疼痛、康复治疗、运动损伤康复等
-15. traditional_chinese_medicine（中医科）：中医诊疗、针灸、推拿、中药调理等
-
-【任务】
-根据患者主诉，判断应该挂哪个科室。优先考虑最相关和最紧急的科室。
-"""
-        
-        user_prompt = f"""患者描述：{patient_description}
-
-请判断应该挂哪个科室，输出JSON格式：
-{{
-  "dept": "科室代码（如internal_medicine）",
-  "reason": "分诊理由"
-}}"""
-        
-        try:
-            obj, _, _ = self._llm.generate_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                fallback=lambda: {
-                    "dept": "internal_medicine",  # LLM失败时默认内科
-                    "reason": "LLM解析失败，默认分诊至内科"
-                },
-                temperature=0.1  # 低温度保证一致性
-            )
-            
-            dept = obj.get("dept", "internal_medicine")  # 默认内科
-            reason = obj.get("reason", "")
-            
-            # 验证结果（确保在15个科室范围内）
-            if dept not in self.VALID_DEPTS:
-                print(f"⚠️  警告：LLM返回的科室'{dept}'不在标准列表中，默认分诊至内科")
-                dept = "internal_medicine"
-                reason = "LLM返回无效科室，默认分诊至内科"
-            
-            # 记录分诊
-            self._triage_history.append({
-                "patient_description": patient_description,
-                "dept": dept,
-                "reason": reason
-            })
-            
-            return dept
-            
-        except Exception as e:
-            print(f"⚠️  分诊异常: {str(e)}，默认分诊至内科")
-            dept = "internal_medicine"
-            self._triage_history.append({
-                "patient_description": patient_description,
-                "dept": dept,
-                "reason": f"异常回退：{str(e)}，默认内科"
-            })
-            return dept
+        # 系统当前只有神经医学科，直接返回
+        return "neurology"
     
     def get_triage_summary(self) -> dict[str, int | list[dict[str, str]]]:
         """获取分诊摘要"""
         return {
-            "total_triages": len(self._triage_history),
-            "history": self._triage_history,
-            "triage_qa": self._triage_qa,  # 包含分诊对话记录
-            "questions_asked": len(self._triage_qa),
+            "total_triages": 1,
+            "history": [],
+            "triage_qa": [],
+            "questions_asked": 0,
         }
     
     def needs_more_info(self, patient_description: str, conversation_history: list[dict[str, str]] | None = None) -> dict[str, bool | str]:
@@ -137,16 +67,6 @@ class NurseAgent:
         Returns:
             dict: {"needs_more": bool, "question": str, "reason": str}
         """
-        if not self._llm:
-            # 无LLM时，简单规则判断
-            if len(patient_description) < 10:
-                return {
-                    "needs_more": True,
-                    "question": "能详细说说您哪里不舒服吗？",
-                    "reason": "描述过于简短"
-                }
-            return {"needs_more": False, "question": "", "reason": "信息充足"}
-        
         # 使用LLM判断
         system_prompt = """你是一名经验丰富的分诊护士。你需要判断患者的描述是否足够进行科室分诊。
 
@@ -207,68 +127,18 @@ class NurseAgent:
     def triage_with_conversation(self, patient_agent, initial_description: str) -> str:
         """通过多轮对话进行分诊
         
+        由于系统当前只有神经医学科一个科室，此方法直接返回neurology，
+        保留方法接口是为了保持与系统其他部分的兼容性。
+        
         Args:
             patient_agent: 患者智能体（用于获取更多信息）
             initial_description: 患者初始描述
             
         Returns:
-            科室代码
+            科室代码（neurology）
         """
-        # 初始化对话历史
-        self._triage_qa = []
-        current_info = initial_description
-        
-        # 首次评估：判断初始描述是否已足够
-        initial_assessment = self.needs_more_info(current_info, conversation_history=self._triage_qa)
-        if not initial_assessment["needs_more"]:
-            # 初始信息已充足，无需提问，直接分诊
-            print(f"  ✅ 初始描述已充分，无需追问（理由：{initial_assessment['reason']}）")
-            return self.triage(current_info)
-        
-        # 最多问max_triage_questions个问题
-        for i in range(self._max_triage_questions):
-            # 判断是否需要更多信息（传入对话历史以避免重复提问）
-            assessment = self.needs_more_info(current_info, conversation_history=self._triage_qa)
-            
-            if not assessment["needs_more"]:
-                # 信息充足，提前结束对话
-                print(f"  ✅ 信息已充分，结束追问（理由：{assessment['reason']}）")
-                break
-            
-            # 需要更多信息，向患者提问
-            question = assessment["question"]
-            if not question:
-                # LLM判断需要更多信息但未生成问题，结束对话
-                print(f"  ⚠️  未能生成有效问题，结束追问")
-                break
-            
-            # 检查是否与之前的问题过于相似（额外保护机制）
-            if self._is_duplicate_question(question, self._triage_qa):
-                print(f"  ⚠️  检测到重复问题，结束追问")
-                break
-            
-            # 记录问题
-            print(f"  👩‍⚕️ 护士问（第{i+1}轮）: {question}")
-            
-            # 患者回答
-            answer = patient_agent.respond_to_doctor(question)
-            print(f"  👤 患者答: {answer}")
-            
-            # 记录对话
-            self._triage_qa.append({
-                "question": question,
-                "answer": answer,
-                "round": i + 1
-            })
-            
-            # 更新当前信息（合并之前的描述和新回答）
-            current_info = f"{current_info}\n补充信息：{answer}"
-            
-            # 每轮问答后立即重新评估信息充足性
-            # 这样可以在获得关键信息后立即结束，而不是机械地问满所有轮次
-        
-        # 基于所有收集的信息进行分诊
-        return self.triage(current_info)
+        # 系统当前只有神经医学科，直接返回
+        return "neurology"
 
     def _is_duplicate_question(self, new_question: str, conversation_history: list[dict[str, str]]) -> bool:
         """检查新问题是否与之前的问题重复（简单的字符串相似度检查）

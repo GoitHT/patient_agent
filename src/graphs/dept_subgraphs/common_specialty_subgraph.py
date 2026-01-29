@@ -12,9 +12,14 @@ from services.llm_client import LLMClient
 from state.schema import BaseState, make_audit_entry
 from utils import load_prompt, contains_any_positive, get_logger
 from environment.staff_tracker import StaffTracker  # 导入医护人员状态追踪器
+from output_config import should_log, OutputFilter, SUPPRESS_UNCHECKED_LOGS  # 导入输出配置
 
 # 初始化logger
 logger = get_logger("hospital_agent.specialty_subgraph")
+
+# 应用输出过滤器来抑制未被should_log包装的日志
+if SUPPRESS_UNCHECKED_LOGS:
+    logger.addFilter(OutputFilter("specialty_subgraph"))
 
 
 # Type标准化映射常量（将各种变体映射到标准type）
@@ -312,14 +317,17 @@ DEPT_CONFIG = {
 
 def build_common_specialty_subgraph(
     *, 
-    retriever: ChromaRetriever, 
-    rng: random.Random, 
+    retriever: ChromaRetriever,
     llm: LLMClient | None = None,
     doctor_agent=None, 
     patient_agent=None, 
-    max_questions: int = 3  # 使用配置文件设置的值
+    max_questions: int = 3  # 最底层默认值，通常从config.yaml传入
 ):
-    """构建通用专科子图，适用于所有科室"""
+    """构建通用专科子图，适用于所有科室
+    
+    Args:
+        max_questions: 医生最多问诊次数（从config.agent.max_questions传入）
+    """
     graph = StateGraph(BaseState)
     
     # 判断是否启用Agent模式
@@ -331,9 +339,14 @@ def build_common_specialty_subgraph(
         dept_config = DEPT_CONFIG.get(dept, DEPT_CONFIG.get("internal_medicine", {}))
         dept_name = dept_config.get("name", "通用科室")
         
-        logger.info("\n" + "="*60)
-        logger.info(f"🏥 S4: {dept_name}专科问诊")
-        logger.info("="*60)
+        # 终端简洁输出
+        if should_log(1, "specialty_subgraph", "S4"):
+            logger.info(f"🏫 S4: {dept_name}专科问诊")
+        
+        # 详细日志记录
+        detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
+        if detail_logger:
+            detail_logger.section(f"{dept_name}专科问诊")
         
         # 如果是Agent模式，确保医生智能体的科室设置正确
         if use_agents and doctor_agent:
@@ -359,10 +372,18 @@ def build_common_specialty_subgraph(
         
         # Agent模式：逐步一问一答，然后从doctor_agent收集结构化信息
         if use_agents:
-            # 获取最大问诊轮数
-            max_questions = state.agent_config.get("max_questions", 3)
+            # 获取最大问诊轮数（优先使用state.agent_config，其次使用函数参数）
+            # 确保使用配置文件设置的值，而不是硬编码的默认值
+            if state.agent_config and "max_questions" in state.agent_config:
+                max_qs = state.agent_config["max_questions"]
+            else:
+                max_qs = max_questions  # 使用函数参数（来自配置文件）
             
-            logger.info(f"\n💬 开始{dept_name}专科问诊（逐步一问一答）...")
+            # 开始问诊
+            logger.info(f"  💬 问诊开始")
+            
+            if detail_logger:
+                detail_logger.subsection("医生问诊")
             
             # ===== 物理环境集成：问诊前检查患者状态 =====
             if state.world_context:
@@ -385,31 +406,41 @@ def build_common_specialty_subgraph(
                     logger.info("="*60)
                     
                     # 根据体力限制问诊轮数
-                    physical_max_questions = impact.get("max_questions", max_questions)
-                    if physical_max_questions < max_questions:
+                    physical_max_questions = impact.get("max_questions", max_qs)
+                    if physical_max_questions < max_qs:
                         logger.info(f"  ⚙️  根据患者状态，问诊轮数调整为 {physical_max_questions}")
-                        max_questions = physical_max_questions
+                        max_qs = physical_max_questions
                     
                     # 如果患者意识异常，标记为紧急
                     if impact.get("emergency"):
                         logger.error("  🚨🚨 紧急情况：患者意识异常，建议立即转急诊！")
                         state.escalations.append("患者意识异常，建议急诊评估")
                         # 不应继续常规问诊
-                        if max_questions > 0:
+                        if max_qs > 0:
                             logger.warning("  ⚠️  由于紧急情况，跳过常规问诊")
-                            max_questions = 0
+                            max_qs = 0
             
             # 使用全局共享计数器
             global_qa_count = state.node_qa_counts.get("global_total", 0)
             questions_asked_this_node = state.node_qa_counts.get(node_key, 0)
-            remaining_questions = max(0, max_questions - global_qa_count)
-            logger.info(f"  全局已问 {global_qa_count} 个，本节点 {questions_asked_this_node} 个，剩余 {remaining_questions} 个")
+            
+            # 计算本节点剩余问题数：本节点配额 - 本节点已问数
+            # 不使用全局计数器限制，因为每个专科节点应该有独立的问诊机会
+            remaining_questions = max(0, max_qs - questions_asked_this_node)
+            
+            if detail_logger:
+                detail_logger.info(f"全局已问 {global_qa_count} 个，本节点已问 {questions_asked_this_node} 个，本节点剩余 {remaining_questions} 个")
             
             # 逐个生成问题并获取回答
             qa_list = state.agent_interactions.get("doctor_patient_qa", [])
             
+            # 获取患者详细日志记录器（如果存在）
+            detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
+            
             for i in range(remaining_questions):
-                logger.info(f"\n  📝 第 {questions_asked_this_node + i + 1} 轮问诊:")
+                # 终端只显示简洁信息
+                if should_log(1, "specialty_subgraph", "S4"):
+                    logger.info(f"  💬 问诊第 {questions_asked_this_node + i + 1} 轮")
                 
                 # 医生基于当前信息生成一个问题
                 context_desc = f"{dept_name}专科问诊，关注：{', '.join(interview_keys)}"
@@ -419,7 +450,6 @@ def build_common_specialty_subgraph(
                 # 第一个问题：如果chief_complaint为空，先问患者主诉是什么
                 if i == 0 and not state.chief_complaint and not doctor_agent.questions_asked:
                     question = "您好，请问您哪里不舒服？主要是什么症状？"
-                    logger.info(f"    🧑‍⚕️  医生问（开场询问主诉）: {question}")
                 else:
                     # 使用收集到的信息（如果有的话）或者患者的描述生成问题
                     # 注意：不使用state.chief_complaint，因为它还未确定
@@ -430,20 +460,31 @@ def build_common_specialty_subgraph(
                     )
                 
                 if not question:
-                    logger.info("    ℹ️  医生判断信息已充足，提前结束问诊")
+                    if should_log(1, "specialty_subgraph", "S4"):
+                        logger.info("  ℹ️  医生提前结束问诊")
+                    if detail_logger:
+                        detail_logger.info("医生判断信息已充足，提前结束问诊")
                     break
-                
-                logger.info(f"    🧑‍⚕️  医生问: {question}")
                 
                 # 患者回答（传入物理状态）
                 physical_state = state.physical_state_snapshot if state.world_context else None
                 answer = patient_agent.respond_to_doctor(question, physical_state=physical_state)
-                logger.info(f"    👤 患者答: {answer[:100]}{'...' if len(answer) > 100 else ''}")
+                
+                # 详细日志：记录完整的问诊对话
+                if detail_logger:
+                    detail_logger.qa_round(questions_asked_this_node + i + 1, question, answer)
                 
                 # 医生处理回答
                 doctor_agent.process_patient_answer(question, answer)
                 
-                # 记录对话
+                # 【重要】同步更新医生的对话历史记录（用于下次生成问题时参考）
+                doctor_agent.collected_info.setdefault("conversation_history", [])
+                doctor_agent.collected_info["conversation_history"].append({
+                    "question": question,
+                    "answer": answer
+                })
+                
+                # 记录对话到state
                 qa_list.append({
                     "question": question, 
                     "answer": answer, 
@@ -506,49 +547,56 @@ def build_common_specialty_subgraph(
             final_global_count = state.node_qa_counts.get("global_total", 0)
             logger.info(f"  ✅ {dept_name}专科问诊完成，本节点 {final_qa_count} 轮，全局总计 {final_global_count} 轮")
             
-            # ===== 新增：医生总结患者主诉 =====
-            if not state.chief_complaint:  # 如果主诉还未设置
-                summarized_cc = doctor_agent.summarize_chief_complaint()
+            # ===== 医生总结专业主诉 =====
+            # 总是让医生基于问诊总结专业主诉，覆盖患者向护士说的口语化描述
+            summarized_cc = doctor_agent.summarize_chief_complaint()
+            if summarized_cc:
+                # 保存原始主诉（患者向护士说的）供参考
+                if state.chief_complaint and state.chief_complaint != summarized_cc:
+                    state.original_chief_complaint = state.chief_complaint
+                # 更新为医生总结的专业主诉
                 state.chief_complaint = summarized_cc
-                logger.info(f"\n  📋 医生总结主诉: {summarized_cc}")
+                logger.info(f"\n  📋 医生总结主诉（专业版）: {summarized_cc}")
             
             # ===== 新增：问诊质量评估 =====
-            logger.info(f"\n{'━'*60}")
-            logger.info("📊 问诊质量评估")
-            logger.info(f"{'━'*60}")
-            
-            quality_report = doctor_agent.assess_interview_quality()
-            
-            # 显示评估结果
-            logger.info(f"  📈 综合评分: {quality_report['overall_score']}/100")
-            logger.info(f"     • 完整性: {quality_report['completeness_score']:.0f}/100")
-            logger.info(f"     • 深度: {quality_report['depth_score']:.0f}/100")
-            logger.info(f"     • 效率: {quality_report['efficiency_score']:.0f}/100")
-            
-            if quality_report['warning']:
-                if quality_report['overall_score'] < 50:
-                    logger.warning(f"  {quality_report['warning']}")
-                elif quality_report['overall_score'] < 70:
-                    logger.info(f"  {quality_report['warning']}")
-                else:
-                    logger.info(f"  {quality_report['warning']}")
-            
-            # 显示缺失信息
-            if quality_report['missing_areas']:
-                logger.info(f"\n  ❌ 缺失关键信息 ({len(quality_report['missing_areas'])}项):")
-                for area in quality_report['missing_areas']:
-                    logger.info(f"     • {area}")
-            
-            # 显示改进建议
-            if quality_report['suggestions']:
-                logger.info(f"\n  💡 改进建议:")
-                for suggestion in quality_report['suggestions'][:3]:  # 最多显示3条
-                    logger.info(f"     • {suggestion}")
-            
-            logger.info(f"{'━'*60}\n")
-            
-            # 保存评估结果到state
-            state.agent_interactions["interview_quality"] = quality_report
+            # 只有在实际问了问题时才显示评估
+            if len(doctor_agent.questions_asked) > 0:
+                logger.info(f"\n{'━'*60}")
+                logger.info("📊 问诊质量评估")
+                logger.info(f"{'━'*60}")
+                
+                quality_report = doctor_agent.assess_interview_quality()
+                
+                # 显示评估结果
+                logger.info(f"  📈 综合评分: {quality_report['overall_score']}/100")
+                logger.info(f"     • 完整性: {quality_report['completeness_score']:.0f}/100")
+                logger.info(f"     • 深度: {quality_report['depth_score']:.0f}/100")
+                logger.info(f"     • 效率: {quality_report['efficiency_score']:.0f}/100")
+                
+                if quality_report['warning']:
+                    if quality_report['overall_score'] < 50:
+                        logger.warning(f"  {quality_report['warning']}")
+                    elif quality_report['overall_score'] < 70:
+                        logger.info(f"  {quality_report['warning']}")
+                    else:
+                        logger.info(f"  {quality_report['warning']}")
+                
+                # 显示缺失信息
+                if quality_report['missing_areas']:
+                    logger.info(f"\n  ❌ 缺失关键信息 ({len(quality_report['missing_areas'])}项):")
+                    for area in quality_report['missing_areas']:
+                        logger.info(f"     • {area}")
+                
+                # 显示改进建议
+                if quality_report['suggestions']:
+                    logger.info(f"\n  💡 改进建议:")
+                    for suggestion in quality_report['suggestions'][:3]:  # 最多显示3条
+                        logger.info(f"     • {suggestion}")
+                
+                logger.info(f"{'━'*60}\n")
+                
+                # 保存评估结果到state
+                state.agent_interactions["interview_quality"] = quality_report
             
             # Agent模式：直接从医生智能体获取结构化信息，不再用LLM重复提取
             interview = doctor_agent.collected_info.get(f"{dept}_interview", {})
@@ -558,13 +606,20 @@ def build_common_specialty_subgraph(
                     "collected_from_agent": True,
                     "alarm_symptoms": [],  # Agent会在对话中处理警报症状
                 }
-                interview.update({key: doctor_agent.collected_info.get("history", {}).get(key, "不详") for key in interview_keys})
+                # 只更新非警报症状相关的字段（避免将"不详"字符串赋值给警报症状字段）
+                for key in interview_keys:
+                    if key not in ["alarm_symptoms", "red_flags"]:
+                        interview[key] = doctor_agent.collected_info.get("history", {}).get(key, "不详")
             
-            logger.info("  ✅ 从Agent收集的专科信息已整合")
+            # 从 Agent 收集信息
+            if detail_logger:
+                detail_logger.info("\n从 Agent收集的专科信息已整合")
         
         # 非Agent模式：使用LLM提取专科信息
         else:
-            logger.info("\n🤖 使用LLM提取专科信息...")
+            # 使用LLM提取
+            if detail_logger:
+                detail_logger.subsection("使用LLM提取专科信息")
             system_prompt = load_prompt("common_system.txt")
             
             # 根据科室选择不同的prompt
@@ -592,15 +647,28 @@ def build_common_specialty_subgraph(
                 temperature=0.2,
             )
             interview = dict(obj.get(f"{dept}_interview") or {})
-            logger.info("  ✅ 专科信息提取完成")
+            # 提取完成
+            if detail_logger:
+                detail_logger.info("专科信息提取完成")
 
         state.dept_payload.setdefault(dept, {})
         state.dept_payload[dept]["interview"] = interview
 
         # 统一警报症状检测（从LLM返回的interview中获取）
-        alarm_list = list(interview.get("alarm_symptoms") or interview.get("red_flags") or [])
+        # 安全地提取警报症状，检查类型避免将字符串拆分成字符列表
+        raw_alarms = interview.get("alarm_symptoms") or interview.get("red_flags") or []
+        if isinstance(raw_alarms, list):
+            alarm_list = [str(a) for a in raw_alarms if a]  # 过滤空值
+        elif isinstance(raw_alarms, str) and raw_alarms not in ["不详", "无", ""]:
+            alarm_list = [raw_alarms]  # 单个字符串转为列表
+        else:
+            alarm_list = []  # 忽略其他无效值
+        
         if alarm_list:
-            logger.warning(f"  ⚠️  发现警报症状: {', '.join(str(a) for a in alarm_list)}")
+            detail_logger.warning(f"⚠️  发现警报症状: {', '.join(str(a) for a in alarm_list)}")
+            # 终端输出（需要output level >= 2）
+            if should_log(2, "specialty_subgraph", "S4"):
+                logger.warning(f"  ⚠️  发现警报症状: {', '.join(str(a) for a in alarm_list)}")
 
         # 记录节点问答轮数
         node_qa_turns = state.node_qa_counts.get(node_key, 0)
@@ -615,7 +683,8 @@ def build_common_specialty_subgraph(
                 flags=["AGENT_MODE"] if use_agents else (["LLM_PARSE_FALLBACK"] if used_fallback else ["LLM_USED"]),
             )
         )
-        logger.info("✅ S4节点完成\n")
+        if should_log(1, "specialty_subgraph", "S4"):
+            logger.info(f"  ✅ S4完成\n")
         return state
 
     def s5_physical_exam(state: BaseState) -> BaseState:
@@ -626,43 +695,29 @@ def build_common_specialty_subgraph(
         exam_area = dept_config.get("exam_area", "general")
         alarm_keywords = dept_config.get("alarm_keywords", [])
         
-        logger.info("\n" + "="*60)
-        logger.info(f"🔍 S5: {dept_name}体格检查")
-        logger.info("="*60)
+        # 获取详细日志记录器
+        detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
         
-        # 判断数据源
-        real_physical_exam = state.ground_truth.get("Physical Examination", "").strip()
-        data_source = "dataset_real" if real_physical_exam else "llm_generated"
+        if should_log(1, "specialty_subgraph", "S5"):
+            logger.info(f"🔍 S5: {dept_name}体格检查")
         
-        logger.info(f"📋 {'使用数据集真实数据' if real_physical_exam else '使用LLM生成体检结果'}")
-        if real_physical_exam:
-            logger.info(f"  原始数据: {real_physical_exam[:200]}{'...' if len(real_physical_exam) > 200 else ''}")
+        if detail_logger:
+            detail_logger.section(f"{dept_name}体格检查")
+        
+        # 当前数据源只有case_character，使用LLM生成体检结果
+        data_source = "llm_generated"
+        real_physical_exam = None  # 数据集中没有体格检查数据
+        
+        logger.info(f"📋 使用LLM生成体检结果")
         
         # 统一结构化处理流程
         system_prompt = load_prompt("common_system.txt")
         
-        if real_physical_exam:
-            # 真实数据：结构化提取
-            user_prompt = (
-                f"将以下体格检查文本结构化为JSON。\n\n"
-                + f"【原始数据】{real_physical_exam}\n\n"
-                + "【输出】JSON格式：{\"exam\": {\"vital_signs\": {...}, \"general\": \"...\", ...}}\n"
-                + "保持原始准确性，不要添加或修改内容。"
-            )
-            fallback_data = {
-                "exam": {
-                    "vital_signs": {"体格检查": "见原始记录"},
-                    "general": real_physical_exam[:200],
-                    "raw_text": real_physical_exam
-                }
-            }
-            temp = 0.1  # 低温度保证忠实原文
-        else:
-            # LLM生成：基于主诉和专科信息
-            interview_info = state.dept_payload.get(dept, {}).get("interview", {})
-            interview_str = json.dumps(interview_info, ensure_ascii=False) if interview_info else "无"
-            
-            user_prompt = (
+        # LLM生成：基于主诉和专科信息
+        interview_info = state.dept_payload.get(dept, {}).get("interview", {})
+        interview_str = json.dumps(interview_info, ensure_ascii=False) if interview_info else "无"
+        
+        user_prompt = (
                 f"根据{dept_name}科室特点，生成合理的体格检查结果。\n\n"
                 + f"【主诉】{state.chief_complaint}\n"
                 + f"【专科问诊】{interview_str}\n\n"
@@ -671,15 +726,15 @@ def build_common_specialty_subgraph(
                 + f"2. 根据{exam_area}添加专科体检项目\n"
                 + f"3. 结果应与主诉相符，考虑警报症状：{', '.join(alarm_keywords)}\n\n"
                 + "【输出】JSON格式：{\"exam\": {...}}"
-            )
-            fallback_data = {
-                "exam": {
-                    "vital_signs": {"temperature": "正常", "pulse": "正常", "blood_pressure": "正常"},
-                    "general": "一般情况可",
-                    "note": f"{dept_name}体格检查"
-                }
+        )
+        fallback_data = {
+            "exam": {
+                "vital_signs": {"temperature": "正常", "pulse": "正常", "blood_pressure": "正常"},
+                "general": "一般情况可",
+                "note": f"{dept_name}体格检查"
             }
-            temp = 0.2
+        }
+        temp = 0.2
         
         # 检查LLM是否可用
         if llm is None:
@@ -690,14 +745,14 @@ def build_common_specialty_subgraph(
         else:
             # 执行LLM调用
             obj, used_fallback, _raw = llm.generate_json(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            fallback=lambda: fallback_data,
-            temperature=temp,
-        )
-        exam = dict(obj.get("exam") or {})
-        exam["source"] = data_source
-        logger.info("  ✅ 体格检查处理完成")
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                fallback=lambda: fallback_data,
+                temperature=temp,
+            )
+            exam = dict(obj.get("exam") or {})
+            exam["source"] = data_source
+            logger.info("  ✅ 体格检查处理完成")
         
         state.exam_findings.setdefault(exam_area, {})
         state.exam_findings[exam_area] = exam

@@ -1,5 +1,15 @@
 # Hospital Agent System 配置文件
-# 优先级: CLI参数 > 环境变量 > 此文件 > 代码默认值
+# 
+# 配置优先级（从高到低）:
+#   1. CLI参数（命令行传入）
+#   2. 环境变量（AGENT_MAX_QUESTIONS等）
+#   3. 此配置文件（config.yaml）
+#   4. 代码默认值（config.py中的dataclass默认值）
+#
+# 使用说明：
+#   - 修改此文件后，重新运行程序即可生效
+#   - 所有配置项都会传递到整个系统的各个模块
+#   - 如需临时覆盖，使用CLI参数或环境变量
 
 # LLM配置
 llm:
@@ -8,23 +18,46 @@ llm:
 
 # 智能体配置
 agent:
-  max_questions: 7         # 医生最多问几个问题（配额，医生可根据信息充分性主动提前结束）
+  max_questions: 3         # 医生最多问几个问题（配额，医生可根据信息充分性主动提前结束）
+                           # 影响范围：DoctorAgent、专科子图、问诊流程
+                           # 修改此值将全局生效
   max_triage_questions: 3  # 护士分诊时最多问几个问题
-  dataset_id: 68          # 数据集索引
-  use_hf_data: true        # 是否从HuggingFace加载数据
 
 # 数据集配置
 dataset:
-  cache_dir: ./diagnosis_dataset  # 本地数据集缓存目录
-  use_local_cache: true            # 是否使用本地缓存（首次运行会自动下载并缓存）
+  dataset_id: 68                      # 病例ID
+  cache_dir: ./diagnosis_dataset      # 本地数据集缓存目录
+  use_local_cache: true               # 是否使用本地缓存
+  use_hf_data: false                  # 是否从HuggingFace加载数据
 
 # RAG配置
 rag:
   persist_dir: .chroma           # Chroma向量数据库目录
   collection_name: hospital_kb   # 知识库集合名称
+  skip_rag: false                # 跳过RAG系统初始化（用于测试物理环境）
+
+# 运行模式配置
+mode:
+  multi_patient: false           # 多患者多医生模式（推荐）
+  num_patients: 1                # 多患者模式下的患者数量
+  patient_interval: 60           # 患者进入间隔时间（秒）
+
+# 物理环境配置
+physical:
+  enable_simulation: true        # 启用物理环境模拟
+  interactive: false             # 启用交互式命令模式
+
+# 数据库配置
+database:
+  enabled: false                                      # 是否启用数据库（false则使用文件存储）
+  connection_string: "mysql+pymysql://root:password@localhost:3306/hospital_db?charset=utf8mb4"
+  backup_to_file: true                                # 数据库模式下是否同时备份到文件
+  echo: false                                         # 是否打印SQL语句（调试用）
 
 # 系统配置
 system:
   seed: 42                       # 随机种子
+  verbose: false                 # 终端显示详细日志
+  log_file: null                 # 详细日志文件路径（null表示自动生成）
   save_trace: agent_trace.json  # 追踪日志保存路径
   enable_trace: false            # 是否自动保存追踪日志

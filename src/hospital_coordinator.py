@@ -65,14 +65,14 @@ class DoctorResource:
         self.status = ResourceStatus.BUSY
         self.current_patient = patient_id
         self.total_patients_today += 1
-        logger.info(f"医生 {self.name} 开始接诊患者 {patient_id}")
+        logger.debug(f"医生 {self.name} 开始接诊患者 {patient_id}")
     
     def end_consultation(self):
         """结束接诊"""
         patient_id = self.current_patient
         self.current_patient = None
         self.status = ResourceStatus.AVAILABLE
-        logger.info(f"医生 {self.name} 结束接诊患者 {patient_id}")
+        logger.debug(f"医生 {self.name} 结束接诊患者 {patient_id}")
     
     def join_consultation(self, patient_id: str):
         """参与会诊"""
@@ -171,7 +171,7 @@ class HospitalCoordinator:
                 name=name,
                 dept=dept
             )
-            logger.info(f"✅ 医生已注册: {name} ({dept}科, ID: {doctor_id})")
+            logger.debug(f"✅ 医生已注册: {name} ({dept}科, ID: {doctor_id})")
     
     def get_doctor(self, doctor_id: str) -> Optional[DoctorResource]:
         """获取医生信息"""
@@ -228,13 +228,13 @@ class HospitalCoordinator:
             )
             self.patients[patient_id] = session
             
-            # 创建病例
+            # 创建病例（注意：此时dept是挂号科室，真实科室需等护士分诊后确定）
             patient_profile = {
                 "name": patient_data.get("name", "患者"),
                 "age": patient_data.get("age", 0),
                 "gender": patient_data.get("gender", "未知"),
                 "dataset_id": patient_data.get("dataset_id"),
-                "dept": dept,
+                # 注意：不在此处设置dept，等护士分诊后再更新
             }
             record = self.medical_record_service.create_record(patient_id, patient_profile)
             
@@ -279,14 +279,12 @@ class HospitalCoordinator:
             self.waiting_queues[dept].put(session)
             
             queue_size = self.waiting_queues[dept].qsize()
-            # 显示资源竞争状态
+            # 只在资源紧张时显示警告
             available_doctors = len([d for d in self.doctors.values() if d.dept == dept and d.is_available()])
-            logger.info(f"📋 患者 {patient_id} 加入 {dept}科等候队列")
-            logger.info(f"   🏥 资源状态: 队列长度={queue_size}, 可用医生={available_doctors}")
             if queue_size > available_doctors:
-                logger.warning(f"   ⚠️ 资源竞争: {queue_size}名患者竞争{available_doctors}名医生")
+                logger.warning(f"⚠️  {dept}科资源紧张: {queue_size}名患者竞争{available_doctors}名医生")
         
-        # 尝试自动分配医生
+        # 尝试自动分配医生（如果有空闲医生，立即分配）
         self._try_assign_doctor(dept)
     
     def get_queue_size(self, dept: str) -> int:
@@ -295,52 +293,69 @@ class HospitalCoordinator:
     
     # ========== 医生-患者匹配调度 ==========
     
-    def _try_assign_doctor(self, dept: str):
+    def _try_assign_doctor(self, dept: str) -> bool:
         """
         尝试为等候患者分配医生（自动调度）
+        优化：循环分配直到队列为空或无可用医生
         
         Args:
             dept: 科室
+            
+        Returns:
+            bool: 是否成功分配至少一个
         """
-        with self._lock:
-            # 查找空闲医生
-            available_doctors = [
-                d for d in self.doctors.values()
-                if d.dept == dept and d.is_available()
-            ]
-            
-            if not available_doctors:
-                waiting_count = self.waiting_queues[dept].qsize() if dept in self.waiting_queues else 0
-                if waiting_count > 0:
-                    logger.debug(f"⏳ {dept}科暂无空闲医生，{waiting_count}名患者等候中")
-                return False
-            
-            # 从队列取患者
-            if dept not in self.waiting_queues or self.waiting_queues[dept].empty():
-                return False
-            
-            try:
-                session = self.waiting_queues[dept].get_nowait()
-            except Empty:
-                return False
-            
-            patient_id = session.patient_id
-            
-            # 选择负载最轻的医生
-            doctor = min(available_doctors, key=lambda d: d.total_patients_today)
-            
-            # 建立分配关系
-            session.assigned_doctor = doctor.doctor_id
-            session.status = PatientStatus.CONSULTING
-            session.consultation_start_time = now_iso()
-            
-            doctor.start_consultation(patient_id)
-            
-            remaining_queue = self.waiting_queues[dept].qsize()
-            logger.info(f"✅ 分配成功: 患者 {patient_id} -> 医生 {doctor.name}")
-            logger.info(f"   📊 资源使用: {doctor.name}负载={doctor.current_patients}/{doctor.total_patients_today}, 队列剩余={remaining_queue}")
-            
-            return True
+        assigned_count = 0
+        
+        while True:
+            with self._lock:
+                # 查找空闲医生
+                available_doctors = [
+                    d for d in self.doctors.values()
+                    if d.dept == dept and d.is_available()
+                ]
+                
+                if not available_doctors:
+                    waiting_count = self.waiting_queues[dept].qsize() if dept in self.waiting_queues else 0
+                    if waiting_count > 0 and assigned_count == 0:
+                        logger.debug(f"⏳ {dept}科暂无空闲医生，{waiting_count}名患者等候中")
+                    break
+                
+                # 从队列取患者
+                if dept not in self.waiting_queues:
+                    break
+                    
+                queue = self.waiting_queues[dept]
+                if queue.empty():
+                    break
+                
+                # 使用 try-except 处理并发竞争
+                try:
+                    session = queue.get_nowait()
+                except Empty:
+                    logger.debug(f"⏳ {dept}科队列为空（并发竞争）")
+                    break
+                
+                patient_id = session.patient_id
+                
+                # 选择负载最轻的医生
+                doctor = min(available_doctors, key=lambda d: d.total_patients_today)
+                
+                # 建立分配关系
+                session.assigned_doctor = doctor.doctor_id
+                session.status = PatientStatus.CONSULTING
+                session.consultation_start_time = now_iso()
+                
+                doctor.start_consultation(patient_id)
+                
+                # 详细日志改为debug级别
+                remaining_queue = self.waiting_queues[dept].qsize()
+                logger.debug(f"✅ 分配成功: 患者 {patient_id} -> 医生 {doctor.name}")
+                current_count = 1 if doctor.current_patient else 0
+                logger.debug(f"   📊 资源使用: {doctor.name}当前患者={current_count}, 今日总计={doctor.total_patients_today}, 队列剩余={remaining_queue}")
+                
+                assigned_count += 1
+        
+        return assigned_count > 0
     
     def assign_doctor_manually(self, patient_id: str, doctor_id: str) -> bool:
         """

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -18,22 +17,18 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _rng_for(seed: int, label: str) -> random.Random:
-    h = hashlib.sha1(f"{seed}:{label}".encode("utf-8")).hexdigest()
-    return random.Random(int(h[:8], 16))
-
-
-def build_services(*, seed: int) -> Services:
+def build_services() -> Services:
     """构建必要的服务（预约和计费）"""
     return Services(
-        appointment=AppointmentService(rng=_rng_for(seed, "appointment")),
-        billing=BillingService(rng=_rng_for(seed, "billing")),
+        appointment=AppointmentService(),
+        billing=BillingService(),
     )
 
 
 def build_dept_subgraphs(
-    *, retriever: ChromaRetriever, rng: random.Random, llm: LLMClient | None = None,
-    doctor_agent: Any | None = None, patient_agent: Any | None = None, max_questions: int = 3
+    *, retriever: ChromaRetriever, llm: LLMClient | None = None,
+    doctor_agent: Any | None = None, patient_agent: Any | None = None, 
+    max_questions: int = 3  # 最底层默认值，通常从 config传入
 ) -> dict[str, Any]:
     """为各科室构建通用子图，返回 {dept_key: compiled_graph}
     
@@ -44,30 +39,15 @@ def build_dept_subgraphs(
     # 构建通用专科子图（所有科室共用）
     common_graph = build_common_specialty_subgraph(
         retriever=retriever,
-        rng=rng,
         llm=llm,
         doctor_agent=doctor_agent,
         patient_agent=patient_agent,
         max_questions=max_questions,
     )
     
-    # 所有15个标准科室都使用同一个通用子图
+    # 只保留神经医学科
     return {
-        "internal_medicine": common_graph,
-        "surgery": common_graph,
-        "orthopedics": common_graph,
-        "urology": common_graph,
-        "obstetrics_gynecology": common_graph,
-        "pediatrics": common_graph,
         "neurology": common_graph,
-        "oncology": common_graph,
-        "infectious_disease": common_graph,
-        "dermatology_std": common_graph,
-        "ent_ophthalmology_stomatology": common_graph,
-        "psychiatry": common_graph,
-        "emergency": common_graph,
-        "rehabilitation_pain": common_graph,
-        "traditional_chinese_medicine": common_graph,
     }
 
 
@@ -76,7 +56,6 @@ def build_common_graph(
     *,
     retriever: ChromaRetriever,
     services: Services,
-    rng: random.Random,
     llm: LLMClient | None = None,
     llm_reports: bool = False,
     use_agents: bool = True,  # 总是使用多智能体模式
@@ -84,14 +63,13 @@ def build_common_graph(
     doctor_agent: Any | None = None,
     nurse_agent: Any | None = None,
     lab_agent: Any | None = None,
-    max_questions: int = 3,
+    max_questions: int = 3,  # 最底层默认值，通常从config传入
     world: Any | None = None,  # 新增：HospitalWorld实例
 ):
     return CommonOPDGraph(
         retriever=retriever,
         dept_subgraphs=dept_subgraphs,
         services=services,
-        rng=rng,
         llm=llm,
         llm_reports=llm_reports,
         use_agents=use_agents,

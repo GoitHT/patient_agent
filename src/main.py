@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -25,14 +24,37 @@ from services.medical_record_integration import MedicalRecordIntegration
 from graphs.router import build_common_graph, build_dept_subgraphs, build_services, default_retriever
 from services.llm_client import build_llm_client
 from state.schema import BaseState
-from utils import make_rng, make_run_id, get_logger, setup_dual_logging
+from utils import make_run_id, get_logger, setup_dual_logging
 from config import Config
 from hospital_coordinator import HospitalCoordinator
-from multi_patient_processor import MultiPatientProcessor
-from monitoring_dashboard import print_simple_status
+from output_config import should_log, get_output_level
+# 微服务集成层
+from integration import get_coordinator, get_medical_record_service
 
 # 初始化logger
 logger = get_logger("hospital_agent.main")
+
+# 患者颜色映射（用于终端显示区分）
+PATIENT_COLORS = [
+    "\033[96m",  # 青色
+    "\033[93m",  # 黄色
+    "\033[92m",  # 绿色
+    "\033[95m",  # 紫色
+    "\033[94m",  # 蓝色
+    "\033[91m",  # 红色
+    "\033[97m",  # 白色
+    "\033[90m",  # 灰色
+]
+COLOR_RESET = "\033[0m"
+
+def get_patient_color(patient_index: int) -> str:
+    """获取患者的颜色代码"""
+    return PATIENT_COLORS[patient_index % len(PATIENT_COLORS)]
+
+def format_patient_log(patient_id: str, message: str, patient_index: int = 0) -> str:
+    """格式化患者日志，添加颜色标识"""
+    color = get_patient_color(patient_index)
+    return f"{color}[{patient_id}]{COLOR_RESET} {message}"
 
 # 创建 Typer 应用
 app = typer.Typer(
@@ -58,107 +80,37 @@ def _render_human_summary(state: BaseState) -> str:
 
 @app.command()
 def main(
-    # 核心参数
     config_file: Annotated[
         Optional[Path],
         typer.Option("--config", help="配置文件路径 (默认: config.yaml)"),
     ] = None,
     dataset_id: Annotated[
         Optional[int],
-        typer.Option("--dataset-id", help="病例ID (覆盖配置文件，与batch模式互斥)"),
+        typer.Option("--dataset-id", help="病例ID (快速覆盖配置文件中的值)"),
     ] = None,
-    start_id: Annotated[
-        Optional[int],
-        typer.Option("--start-id", help="批量处理起始ID（默认1）"),
-    ] = None,
-    end_id: Annotated[
-        Optional[int],
-        typer.Option("--end-id", help="批量处理结束ID（默认915）"),
-    ] = None,
-    batch_mode: Annotated[
-        bool,
-        typer.Option("--batch", help="批量处理模式"),
-    ] = False,
-    multi_patient: Annotated[
-        bool,
-        typer.Option("--multi-patient", help="多患者多医生模式"),
-    ] = True,
-    num_patients: Annotated[
-        Optional[int],
-        typer.Option("--num-patients", help="多患者模式下的患者数量（默认3）"),
-    ] = None,
-    patient_interval: Annotated[
-        Optional[int],
-        typer.Option("--patient-interval", help="患者进入间隔时间（秒，默认60秒）"),
-    ] = None,
-    llm: Annotated[
-        Optional[str],
-        typer.Option("--llm", help="LLM后端: mock 或 deepseek (覆盖配置文件)"),
-    ] = None,
-    max_questions: Annotated[
-        Optional[int],
-        typer.Option("--max-questions", help="最多问题数 (覆盖配置文件)"),
-    ] = None,
-    
-    # 可选参数
-    seed: Annotated[
-        Optional[int],
-        typer.Option("--seed", help="随机种子"),
-    ] = None,
-    llm_reports: Annotated[
-        bool,
-        typer.Option("--llm-reports", help="使用LLM增强报告"),
-    ] = False,
-    save_trace: Annotated[
-        Optional[Path],
-        typer.Option("--save-trace", help="保存追踪到指定文件"),
-    ] = None,
-    persist: Annotated[
-        Optional[Path],
-        typer.Option("--persist", help="Chroma目录"),
-    ] = None,
-    collection: Annotated[
-        Optional[str],
-        typer.Option("--collection", help="知识库集合名"),
-    ] = None,
-    use_hf_data: Annotated[
-        Optional[bool],
-        typer.Option("--use-hf-data", help="使用HuggingFace数据"),
-    ] = None,
-    
-    # 物理环境参数
-    physical_sim: Annotated[
-        bool,
-        typer.Option("--physical-sim", help="启用物理环境模拟"),
-    ] = True,
-    interactive: Annotated[
-        bool,
-        typer.Option("--interactive", help="启用交互式命令模式"),
-    ] = False,
-    skip_rag: Annotated[
-        bool,
-        typer.Option("--skip-rag", help="跳过RAG系统初始化（用于测试物理环境）"),
-    ] = True,
-    log_file: Annotated[
-        Optional[str],
-        typer.Option("--log-file", help="详细日志文件路径（默认: logs/hospital_agent_运行时间.log）"),
-    ] = None,
-    verbose: Annotated[
-        bool,
-        typer.Option("--verbose", "-v", help="终端显示详细日志"),
-    ] = False,
 ) -> None:
     """Hospital Agent System - 三智能体医疗诊断系统
     
-    配置优先级: CLI参数 > 环境变量 > config.yaml > 默认值
+    主要配置请在 config.yaml 中修改
+    命令行参数优先级: CLI > 环境变量 > config.yaml > 默认值
     """
-    # 设置双通道日志系统
-    from datetime import datetime
+    # 先加载配置以获取日志设置
+    from types import SimpleNamespace
+    temp_args = SimpleNamespace(
+        config=config_file,
+        dataset_id=dataset_id,
+    )
+    config = Config.load(config_file=temp_args.config, cli_args=temp_args)
+    
+    # 从配置读取日志设置
+    log_file = config.system.log_file
     if log_file is None:
         log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = str(log_dir / f"hospital_agent_{timestamp}.log")
+    
+    verbose = config.system.verbose
     
     # 设置日志级别：verbose模式显示所有日志（DEBUG），否则显示INFO及以上
     # 注意：所有print已改为logger.info，默认在终端显示
@@ -166,38 +118,35 @@ def main(
     console_level = logging.DEBUG if verbose else logging.INFO
     setup_dual_logging(log_file=log_file, console_level=console_level)
     
+    # 抑制第三方库的冗余警告日志
+    logging.getLogger("urllib3").setLevel(logging.ERROR)  # 抑制SSL重试警告
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # 抑制HTTP客户端详细日志
+    logging.getLogger("httpcore").setLevel(logging.WARNING)  # 抑制HTTP核心库日志
+    
     # 在终端显示简洁的启动信息
     logger.info("\n" + "="*80)
     logger.info("🏥 医院智能体系统 - Hospital Agent System")
     logger.info("="*80)
     
     logger.info("启动系统 ")
-    logger.info(f"📝 日志输出到: {log_file}\n")
+    logger.info(f"📝 日志输出到: {log_file}")
     
-    # 多患者多医生模式
-    if multi_patient:
+    # 显示关键配置信息
+    logger.info(f"\n⚙️  核心配置:")
+    logger.info(f"  • 医生问诊配额: {config.agent.max_questions} 个问题")
+    logger.info(f"  • 护士分诊问题: {config.agent.max_triage_questions} 个问题")
+    logger.info(f"  • LLM后端: {config.llm.backend}")
+    logger.info(f"  • 病例数据集: {'本地缓存' if config.dataset.use_local_cache else 'HuggingFace'}")
+    logger.info("")
+    
+    # 判断运行模式
+    if config.mode.multi_patient:
         logger.info("🏥 启动多患者多医生模式 (LangGraph 集成)")
         logger.info("="*80)
         
-        # 加载配置
-        from types import SimpleNamespace
-        temp_args = SimpleNamespace(
-            config=config_file,
-            dataset_id=None,
-            llm=llm,
-            max_questions=max_questions,
-            seed=seed,
-            llm_reports=llm_reports,
-            save_trace=save_trace,
-            persist=persist,
-            collection=collection,
-            use_hf_data=use_hf_data,
-        )
-        config = Config.load(config_file=temp_args.config, cli_args=temp_args)
-        
-        # 默认参数
-        _num_patients = num_patients if num_patients is not None else 3
-        _patient_interval = patient_interval if patient_interval is not None else 60  # 默认60秒
+        # 从config读取参数（CLI参数优先）
+        _num_patients = config.mode.num_patients
+        _patient_interval = config.mode.patient_interval
         
         logger.info(f"患者数量: {_num_patients}")
         logger.info(f"患者进入间隔: {_patient_interval} 秒")
@@ -213,7 +162,7 @@ def main(
             return
         
         # 初始化 RAG
-        if not skip_rag:
+        if not config.rag.skip_rag:
             logger.info(f"📂 初始化知识库检索器...")
             try:
                 retriever = default_retriever(
@@ -231,20 +180,48 @@ def main(
         
         # 初始化服务
         logger.info("⚙️ 初始化服务组件...")
-        services = build_services(seed=config.system.seed)
+        services = build_services()
         logger.info("  ✅ 服务组件初始化完成\n")
         
-        # 初始化医疗记录服务
+        # 初始化医疗记录服务（根据配置选择单体/数据库/微服务）
         logger.info("📋 初始化病例库服务...")
-        medical_record_service = MedicalRecordService(storage_dir=Path("./medical_records"))
-        logger.info(f"  ✅ 病例库服务初始化完成\n")
+        medical_record_service = get_medical_record_service(
+            config=config,
+            storage_dir=Path("./medical_records")
+        )
+        logger.info(f"  ✅ 病例库服务初始化完成")
+        if hasattr(config, 'database') and config.database.enabled:
+            logger.info(f"  🗄️  使用数据库存储: {config.database.connection_string.split('@')[1] if '@' in config.database.connection_string else 'MySQL'}")
+            if config.database.backup_to_file:
+                logger.info(f"  💾 同时备份到文件: {Path('./medical_records').absolute()}\n")
+            else:
+                logger.info("")
+        elif not config.microservices.enabled:
+            logger.info(f"  📁 病例存储目录: {Path('./medical_records').absolute()}\n")
+        else:
+            logger.info(f"  🌐 使用微服务: {config.microservices.record_service_url}\n")
         
-        # 初始化协调器
+        # 初始化协调器（根据配置选择单体或微服务）
         logger.info("🏥 初始化医院协调器...")
-        coordinator = HospitalCoordinator(medical_record_service)
+        coordinator = get_coordinator(
+            config=config.microservices,
+            medical_record_service=medical_record_service
+        )
         logger.info("  ✅ 协调器初始化完成\n")
         
-        # 初始化 LangGraph 多患者处理器
+        # 【重要】注册医生：必须在处理器初始化之前完成，否则无法预创建DoctorAgent
+        logger.info("🏥 注册神经内科医生...")
+        
+        # 创建3名神经内科医生
+        for i in range(3):
+            doc_id = f"DOC{i+1:03d}"
+            doc_name = f"神经内科医生{i+1}"
+            coordinator.register_doctor(doc_id, doc_name, "neurology")
+        
+        logger.info(f"  ✅ 已注册 3 名神经内科医生")
+        logger.info("")
+        
+        # 初始化 LangGraph 多患者处理器（必须在医生注册之后）
         logger.info("🚀 初始化 LangGraph 多患者处理器...")
         processor = LangGraphMultiPatientProcessor(
             coordinator=coordinator,
@@ -252,53 +229,10 @@ def main(
             llm=llm_client,
             services=services,
             medical_record_service=medical_record_service,
-            seed=config.system.seed,
             max_questions=config.agent.max_questions,
-            use_hf_data=config.agent.use_hf_data,
             max_workers=_num_patients,  # 每个患者一个线程
         )
         logger.info("  ✅ 处理器初始化完成\n")
-        
-        # 注册医生：为系统所有15个标准科室各配置一名医生
-        logger.info("🏥 为所有标准科室注册医生...")
-        
-        # 15个标准科室（与 NurseAgent.VALID_DEPTS 一致）
-        STANDARD_DEPTS = [
-            "internal_medicine", "surgery", "orthopedics", "urology",
-            "obstetrics_gynecology", "pediatrics", "neurology", "oncology",
-            "infectious_disease", "dermatology_std", "ent_ophthalmology_stomatology",
-            "psychiatry", "emergency", "rehabilitation_pain", "traditional_chinese_medicine"
-        ]
-        
-        # 科室中文名称映射
-        DEPT_CN_NAMES = {
-            "internal_medicine": "内科",
-            "surgery": "外科",
-            "orthopedics": "骨科",
-            "urology": "泌尿外科",
-            "obstetrics_gynecology": "妇产科",
-            "pediatrics": "儿科",
-            "neurology": "神经医学科",
-            "oncology": "肿瘤科",
-            "infectious_disease": "感染性疾病科",
-            "dermatology_std": "皮肤性病科",
-            "ent_ophthalmology_stomatology": "眼耳鼻喉口腔科",
-            "psychiatry": "精神心理科",
-            "emergency": "急诊医学科",
-            "rehabilitation_pain": "康复疼痛科",
-            "traditional_chinese_medicine": "中医科"
-        }
-        
-        doctor_id = 1
-        for dept in STANDARD_DEPTS:
-            doc_id = f"DOC{doctor_id:03d}"
-            dept_cn = DEPT_CN_NAMES.get(dept, dept)
-            doc_name = f"{dept_cn}医生"
-            
-            coordinator.register_doctor(doc_id, doc_name, dept)
-            logger.info(f"  ✅ {doc_name} (ID: {doc_id}, 科室: {dept})")
-            doctor_id += 1
-        logger.info(f"\n已注册 {len(STANDARD_DEPTS)} 名医生（覆盖所有标准科室）\n")
         
         # 准备患者数据（使用真实数据集病例，随机选择）
         import random
@@ -325,28 +259,104 @@ def main(
         logger.info(f"⏰ 患者将每隔 {interval_display} 进入系统（每个患者启动独立线程，竞争共享资源）\n")
         logger.info("="*80)
         
+        # 定义优先级计算函数
+        def calculate_priority_by_symptoms(chief_complaint: str) -> int:
+            """根据主诉中的症状严重程度判断优先级（1-10，数字越大越紧急）"""
+            # 紧急关键词（高优先级 9-10）
+            urgent_keywords = ["胸痛", "胸闷", "呼吸困难", "气促", "昏迷", "意识不清", 
+                             "大出血", "出血不止", "休克", "抽搐", "癫痫发作",
+                             "窒息", "严重外伤", "骨折", "剧烈头痛"]
+            
+            # 严重关键词（中高优先级 7-8）
+            severe_keywords = ["剧烈疼痛", "持续发热", "高热", "呕血", "黑便", "便血",
+                             "咯血", "晕厥", "持续呕吐", "腹痛加重", "无法忍受",
+                             "突发", "急性"]
+            
+            # 一般关键词（中等优先级 5-6）
+            moderate_keywords = ["疼痛", "不适", "发热", "咳嗽", "头晕", "乏力",
+                               "腹泻", "恶心", "反酸", "烧心"]
+            
+            complaint_lower = chief_complaint.lower()
+            
+            # 紧急情况：优先级 9-10
+            if any(keyword in complaint_lower for keyword in urgent_keywords):
+                return random.randint(9, 10)
+            # 严重情况：优先级 7-8
+            elif any(keyword in complaint_lower for keyword in severe_keywords):
+                return random.randint(7, 8)
+            # 一般情况：优先级 5-6
+            elif any(keyword in complaint_lower for keyword in moderate_keywords):
+                return random.randint(5, 6)
+            # 轻微情况：优先级 3-4
+            else:
+                return random.randint(3, 4)
+        
         task_ids = []
         timers = []  # 保存所有定时器，以便等待
         
         def submit_patient_thread(i, case_id, total_patients):
             """在独立线程中提交患者（每个患者到来时立即启动）"""
             patient_id = f"patient_{case_id:03d}"
-            priority = random.randint(3, 9)
             
-            # 患者到来
+            # 预加载病例数据以获取主诉，用于计算优先级
+            try:
+                case_bundle = load_diagnosis_arena_case(case_id)
+                known_case = case_bundle["known_case"]
+                case_info = known_case.get("Case Information", "")
+                
+                # 记录病例信息以便追踪
+                dataset_index = known_case.get('id', 'unknown')
+                original_case_id = known_case.get('original_id', 'N/A')
+                
+                # 提取主诉
+                if "主诉：" in case_info:
+                    start_idx = case_info.find("主诉：") + 3
+                    remaining = case_info[start_idx:]
+                    end_markers = ["现病史：", "既往史：", "个人史：", "家族史：", "体格检查：", "\n\n"]
+                    end_idx = len(remaining)
+                    for marker in end_markers:
+                        pos = remaining.find(marker)
+                        if pos != -1 and pos < end_idx:
+                            end_idx = pos
+                    chief_complaint = remaining[:end_idx].strip()
+                else:
+                    chief_complaint = case_info[:100].strip()
+                
+                # 根据主诉计算优先级
+                priority = calculate_priority_by_symptoms(chief_complaint)
+                
+            except Exception as e:
+                logger.warning(f"⚠️  无法加载病例 {case_id} 的主诉，使用随机优先级: {e}")
+                priority = random.randint(5, 7)  # 失败时使用中等优先级
+                chief_complaint = "未知"
+                dataset_index = case_id  # 使用case_id作为默认值
+                original_case_id = "N/A"
+            
+            # 患者到来 - 使用彩色标识，显示主诉概要
             current_time = time.strftime("%H:%M:%S")
-            logger.info(f"[{current_time}] 🚶 患者 {i+1}/{total_patients} 到达医院（启动独立处理线程）")
-            logger.info(f"  📋 {patient_id}: 病例 ID={case_id} (优先级: {priority})")
+            color = get_patient_color(i)
+            
+            # 根据优先级显示不同的图标
+            priority_icon = "🚨" if priority >= 9 else "⚠️" if priority >= 7 else "📋"
+            
+            logger.info(f"\n{color}{'='*80}{COLOR_RESET}")
+            logger.info(format_patient_log(patient_id, f"🚶 患者 {i+1}/{total_patients} 到达医院 [{current_time}]", i))
+            logger.info(format_patient_log(patient_id, f"{priority_icon} 数据集索引={dataset_index}, 原始ID={original_case_id}, 优先级={priority}/10", i))
+            # 显示主诉摘要（前50个字符）
+            chief_complaint_short = chief_complaint[:50] + "..." if len(chief_complaint) > 50 else chief_complaint
+            logger.info(format_patient_log(patient_id, f"💬 主诉: {chief_complaint_short}", i))
+            logger.info(f"{color}{'='*80}{COLOR_RESET}\n")
             
             # 立即提交患者，启动 LangGraph 执行线程
             task_id = processor.submit_patient(
                 patient_id=patient_id,
                 case_id=case_id,
-                dept="internal_medicine",  # 初始科室，会被护士分诊覆盖
+                dept="neurology",  # 神经内科
                 priority=priority
             )
             task_ids.append(task_id)
-            logger.info(f"  ✅ 线程已启动: {task_id}（开始竞争资源）\n")
+            
+            logger.info(format_patient_log(patient_id, f"✅ 线程已启动，开始竞争资源", i))
         
         # 为每个患者创建定时器，按指定间隔触发
         for i, case_id in enumerate(selected_case_ids):
@@ -363,25 +373,120 @@ def main(
         for timer in timers:
             timer.join()
         
-        logger.info("="*80)
-        logger.info(f"✅ 所有 {len(selected_case_ids)} 名患者已到达，各自线程正在并发执行\n")
+        logger.info("\n" + "="*80)
+        logger.info(f"✅ 所有 {len(selected_case_ids)} 名患者已到达，各自线程正在并发执行")
+        logger.info("="*80 + "\n")
+        
+        # 启动状态监控线程
+        monitoring_active = threading.Event()
+        monitoring_active.set()
+        
+        def monitor_status():
+            """定期显示所有患者的状态（仅在详细模式下）"""
+            import time
+            iteration = 0
+            while monitoring_active.is_set():
+                time.sleep(60)  # 每60秒检查一次（降低频率）
+                iteration += 1
+                if not monitoring_active.is_set():
+                    break
+                    
+                active_count = processor.get_active_count()
+                if active_count == 0:
+                    break
+                
+                # 仅在详细级别2以上或每2分钟显示一次
+                if not should_log(2, "main", "monitor") and iteration % 4 != 0:
+                    continue
+                    
+                logger.info("\n" + "┌" + "─"*78 + "┐")
+                logger.info("│" + " "*25 + "\033[1m📊 实时状态监控\033[0m" + " "*28 + "│")
+                logger.info("├" + "─"*78 + "┤")
+                
+                # 显示系统状态
+                sys_stats = coordinator.get_system_stats()
+                logger.info(f"│  🏥 系统状态: {active_count} 个患者处理中" + " "*(78 - 30 - len(str(active_count))) + "│")
+                logger.info(f"│  👨‍⚕️  可用医生: {sys_stats['available_doctors']}/{sys_stats['total_doctors']}" + " "*(78 - 25 - len(str(sys_stats['available_doctors'])) - len(str(sys_stats['total_doctors']))) + "│")
+                logger.info(f"│  ✅ 已完成: {sys_stats['total_consultations_completed']} 次" + " "*(78 - 20 - len(str(sys_stats['total_consultations_completed']))) + "│")
+                
+                # 显示各科室状态（显示所有有活动的科室）
+                logger.info("├" + "─"*78 + "┤")
+                dept_status = coordinator.get_all_dept_status()
+                # 过滤有活动的科室：有等待、有医生忙碌、或有医生在问诊
+                active_depts = [d for d in dept_status 
+                              if d['waiting_patients'] > 0 
+                              or d['busy_doctors'] > 0 
+                              or d['consulting_doctors'] > 0]
+                
+                if active_depts:
+                    # 按忙碌程度排序（等待+就诊中的患者数）
+                    active_depts.sort(key=lambda x: x['waiting_patients'] + x['busy_doctors'] + x['consulting_doctors'], reverse=True)
+                    
+                    displayed = 0
+                    for dept in active_depts:
+                        if displayed >= 8:  # 最多显示8个科室
+                            remaining = len(active_depts) - displayed
+                            logger.info(f"│  ... 及其他 {remaining} 个科室有活动" + " "*(78 - 24 - len(str(remaining))) + "│")
+                            break
+                        
+                        # 科室名称映射（显示中文）
+                        dept_name_map = {
+                            "neurology": "神经医学科",
+                        }
+                        dept_name = dept_name_map.get(dept['dept'], dept['dept'][:15])
+                        
+                        waiting = dept['waiting_patients']
+                        consulting = dept['consulting_doctors']
+                        busy = dept['busy_doctors']
+                        avail = dept['available_doctors']
+                        
+                        # 构建状态行
+                        status_line = f"│  {dept_name:12s}: 等待={waiting}, 问诊={consulting}, 忙碌={busy}, 空闲={avail}"
+                        # 计算需要的填充空格（考虑中文字符宽度）
+                        line_width = len(status_line.encode('gbk', errors='ignore'))
+                        padding = max(0, 78 - line_width + len("│  "))
+                        logger.info(status_line + " "*padding + "│")
+                        displayed += 1
+                else:
+                    logger.info("│  " + " "*30 + "（所有科室空闲）" + " "*29 + "│")
+                
+                logger.info("└" + "─"*78 + "┘\n")
+        
+        monitor_thread = threading.Thread(target=monitor_status, daemon=True)
+        monitor_thread.start()
         
         # 等待所有任务完成
         logger.info("\n⏳ 等待所有患者完成 LangGraph 诊断流程...")
-        results = processor.wait_all(timeout=600)  # 增加超时时间
+        if should_log(2, "main", "monitor"):
+            logger.info("💡 提示: 系统每30秒显示一次实时状态（详细模式）")
+        else:
+            logger.info("💡 提示: 系统每2分钟显示一次简要状态（使用 --output-level 2 查看详细监控）\n")
+        # 根据患者数量动态调整超时时间（每个患者预留10分钟）
+        timeout = max(600, _num_patients * 600)
+        results = processor.wait_all(timeout=timeout)
         
-        # 打印结果
+        # 停止监控线程
+        monitoring_active.clear()
+        monitor_thread.join(timeout=2)
+        
+        # 打印结果 - 使用表格格式
         logger.info("\n" + "="*80)
         logger.info("📊 LangGraph 多患者诊断结果")
-        logger.info("="*80)
+        logger.info("="*80 + "\n")
         
         success_count = 0
         failed_count = 0
         
-        for result in results:
+        # 创建结果表格
+        logger.info("┌" + "─"*78 + "┐")
+        logger.info("│ " + "患者ID".ljust(15) + "│ " + "案例".ljust(6) + "│ " + "科室".ljust(18) + "│ " + "状态".ljust(8) + "│ " + "节点数".ljust(8) + "│")
+        logger.info("├" + "─"*78 + "┤")
+        
+        for i, result in enumerate(results):
             status = result.get("status")
             patient_id = result.get("patient_id", "未知")
             case_id = result.get("case_id", "N/A")
+            color = get_patient_color(i)
             
             if status == "completed":
                 diagnosis = result.get("diagnosis", "未明确")
@@ -389,20 +494,19 @@ def main(
                 dept = result.get("dept", "N/A")
                 node_count = result.get("node_count", 0)
                 
-                logger.info(f"\n✅ {patient_id} (案例 {case_id})")
-                logger.info(f"   科室: {dept}")
-                logger.info(f"   诊断结果: {diagnosis}")
-                logger.info(f"   标准诊断: {ground_truth}")
-                logger.info(f"   执行节点: {node_count} 个")
+                # 表格行
+                status_icon = f"{color}✅{COLOR_RESET}"
+                logger.info(f"│ {color}{patient_id[:15].ljust(15)}{COLOR_RESET}│ {str(case_id)[:6].ljust(6)}│ {dept[:18].ljust(18)}│ {status_icon}     │ {str(node_count)[:8].ljust(8)}│")
                 
                 success_count += 1
             else:
                 error_msg = result.get('error', result.get('reason', '未知错误'))
-                logger.info(f"\n❌ {patient_id} (案例 {case_id})")
-                logger.info(f"   状态: {status}")
-                logger.info(f"   错误: {error_msg}")
+                status_icon = f"{color}❌{COLOR_RESET}"
+                logger.info(f"│ {color}{patient_id[:15].ljust(15)}{COLOR_RESET}│ {str(case_id)[:6].ljust(6)}│ {'N/A'[:18].ljust(18)}│ {status_icon}     │ {'N/A'[:8].ljust(8)}│")
                 
                 failed_count += 1
+        
+        logger.info("└" + "─"*78 + "┘\n")
         
         # 最终统计
         logger.info("\n" + "="*80)
@@ -432,96 +536,12 @@ def main(
         logger.info(f"📝 详细日志已保存到: {log_file}")
         
         # 关闭处理器
+        logger.info("\n" + "="*80)
+        logger.info("🔚 关闭系统")
+        logger.info("="*80)
         processor.shutdown()
         
         logger.info("\n✅ LangGraph 多患者模式执行完毕\n")
-        
-        return
-    
-    # 批量处理模式
-    if batch_mode:
-        batch_start = start_id if start_id is not None else 1
-        batch_end = end_id if end_id is not None else 915
-        logger.info(f"🔄 批量处理模式: 处理病例 {batch_start} 到 {batch_end}")
-        
-        # 批量处理结果保存路径
-        results_dir = Path("results")
-        results_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        batch_results_file = results_dir / f"batch_results_{batch_start}_to_{batch_end}_{timestamp}.jsonl"
-        
-        logger.info(f"📊 批量结果将保存到: {batch_results_file}")
-        
-        # 统计信息
-        success_count = 0
-        fail_count = 0
-        
-        with open(batch_results_file, "w", encoding="utf-8") as f:
-            for case_id in range(batch_start, batch_end + 1):
-                logger.info(f"\n{'='*80}")
-                logger.info(f"处理病例 {case_id}/{batch_end} ({case_id - batch_start + 1}/{batch_end - batch_start + 1})")
-                logger.info(f"{'='*80}")
-                logger.info(f"\n{'='*80}")
-                logger.info(f"处理病例 {case_id}/{batch_end}")
-                logger.info(f"{'='*80}")
-                
-                try:
-                    # 调用单病例处理函数
-                    result = process_single_case(
-                        case_id=case_id,
-                        config_file=config_file,
-                        llm=llm,
-                        max_questions=max_questions,
-                        seed=seed,
-                        llm_reports=llm_reports,
-                        save_trace=save_trace,
-                        persist=persist,
-                        collection=collection,
-                        use_hf_data=use_hf_data,
-                        physical_sim=physical_sim,
-                        interactive=interactive,
-                        skip_rag=skip_rag,
-                        verbose=verbose,
-                    )
-                    
-                    # 保存结果
-                    f.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    f.flush()
-                    
-                    success_count += 1
-                    logger.info(f"✅ 病例 {case_id} 处理成功")
-                    logger.info(f"✅ 病例 {case_id} 处理成功")
-                    
-                except Exception as e:
-                    fail_count += 1
-                    error_msg = f"❌ 病例 {case_id} 处理失败: {str(e)}"
-                    logger.info(error_msg)
-                    logger.error(error_msg, exc_info=True)
-                    
-                    # 记录失败信息
-                    error_result = {
-                        "case_id": case_id,
-                        "status": "failed",
-                        "error": str(e),
-                    }
-                    f.write(json.dumps(error_result, ensure_ascii=False) + "\n")
-                    f.flush()
-        
-        # 打印批量处理统计
-        logger.info(f"\n{'='*80}")
-        logger.info("📊 批量处理完成")
-        logger.info(f"{'='*80}")
-        logger.info(f"✅ 成功: {success_count}")
-        logger.info(f"❌ 失败: {fail_count}")
-        logger.info(f"📊 总计: {success_count + fail_count}")
-        logger.info(f"📁 结果文件: {batch_results_file}")
-        logger.info(f"📝 日志文件: {log_file}")
-        logger.info(f"{'='*80}\n")
-        
-        logger.info(f"\n{'='*80}")
-        logger.info("📊 批量处理完成")
-        logger.info(f"✅ 成功: {success_count}, ❌ 失败: {fail_count}")
-        logger.info(f"{'='*80}")
         
         return
     
@@ -530,19 +550,11 @@ def main(
     temp_args = SimpleNamespace(
         config=config_file,
         dataset_id=dataset_id,
-        llm=llm,
-        max_questions=max_questions,
-        seed=seed,
-        llm_reports=llm_reports,
-        save_trace=save_trace,
-        persist=persist,
-        collection=collection,
-        use_hf_data=use_hf_data,
     )
     temp_config = Config.load(config_file=temp_args.config, cli_args=temp_args)
     
     # 使用配置中的dataset_id（如果命令行未指定）
-    final_dataset_id = dataset_id if dataset_id is not None else temp_config.agent.dataset_id
+    final_dataset_id = dataset_id if dataset_id is not None else temp_config.dataset.dataset_id
     
     if final_dataset_id is None:
         logger.info("❌ 错误: 请指定 --dataset-id 或在配置文件中设置 dataset_id，或使用 --batch 模式")
@@ -555,22 +567,23 @@ def main(
     result = process_single_case(
         case_id=final_dataset_id,
         config_file=config_file,
-        llm=llm,
-        max_questions=max_questions,
-        seed=seed,
-        llm_reports=llm_reports,
-        save_trace=save_trace,
-        persist=persist,
-        collection=collection,
-        use_hf_data=use_hf_data,
-        physical_sim=physical_sim,
-        interactive=interactive,
-        skip_rag=skip_rag,
+        llm=None,  # 在 process_single_case 中从配置初始化
+        max_questions=None,  # 使用配置文件中的值
+        seed=None,  # 使用配置文件中的值
+        llm_reports=False,  # 使用配置文件中的值
+        save_trace=None,  # 使用配置文件中的值
+        persist=None,  # 使用配置文件中的值
+        collection=None,  # 使用配置文件中的值
+        physical_sim=True,  # 默认启用物理模拟
+        interactive=False,  # 默认非交互模式
+        skip_rag=True,  # 使用配置文件中的值
         verbose=verbose,
     )
     
-    logger.info(f"\n📝 详细日志已保存到: {log_file}")
-    logger.info("✅ 程序执行完毕\n")
+    logger.info("\n" + "="*80)
+    logger.info(f"📝 详细日志已保存到: {log_file}")
+    logger.info("✅ 程序执行完毕")
+    logger.info("="*80 + "\n")
 
 
 def process_single_case(
@@ -583,7 +596,6 @@ def process_single_case(
     save_trace: Optional[Path] = None,
     persist: Optional[Path] = None,
     collection: Optional[str] = None,
-    use_hf_data: Optional[bool] = None,
     physical_sim: bool = True,
     interactive: bool = False,
     skip_rag: bool = True,
@@ -610,7 +622,6 @@ def process_single_case(
         save_trace=save_trace,
         persist=persist,
         collection=collection,
-        use_hf_data=use_hf_data,
     )
     
     # 加载配置（优先级: CLI > 环境变量 > config.yaml > 默认值）
@@ -620,27 +631,18 @@ def process_single_case(
     logger.info(config.summary())
 
     repo_root = Path(__file__).resolve().parents[1]
-
-    rng = make_rng(config.system.seed)
     
     # 从数据集加载病例
     logger.info("📚 加载病例数据...")
-    logger.info(f"  🔢 数据集索引: {config.agent.dataset_id}")
+    logger.info(f"  🔢 数据集索引: {config.dataset.dataset_id}")
     
-    # 使用配置的缓存目录
-    cache_dir = str(config.dataset.cache_dir) if config.dataset.use_local_cache else None
-    if cache_dir:
-        logger.info(f"  📂 本地缓存: {cache_dir}")
-    
-    case_bundle = load_diagnosis_arena_case(
-        config.agent.dataset_id, 
-        use_mock=not config.agent.use_hf_data,
-        local_cache_dir=cache_dir or "./diagnosis_dataset"
-    )
+    # 从Excel文件加载患者数据（默认: patient_text.xlsx）
+    case_bundle = load_diagnosis_arena_case(config.dataset.dataset_id)
     known_case = case_bundle["known_case"]
     ground_truth = case_bundle["ground_truth"]
     
-    logger.info(f"  ✅ 病例ID: {known_case.get('id', 'unknown')}（数据集第{config.agent.dataset_id}条）")
+    original_id = known_case.get('original_id', 'N/A')
+    logger.info(f"  ✅ 数据集索引: {known_case.get('id', 'unknown')} | 原始病例ID: {original_id}")
     
     # 提取原始主诉（仅提供给患者智能体）- 改进提取逻辑，避免在句号处截断
     case_info = known_case.get("Case Information", "")
@@ -663,7 +665,9 @@ def process_single_case(
         original_chief_complaint = case_info[:200].strip()
     
     logger.info(f"  ✅ 原始主诉（患者）: {original_chief_complaint}")
-    logger.info(f"  ✅ 标准诊断: {ground_truth.get('Final Diagnosis', 'N/A')}\n")
+    if ground_truth.get('treatment_plan'):
+        logger.info(f"  ✅ 参考治疗方案: {ground_truth['treatment_plan'][:100]}...")
+    logger.info("")
 
     # 初始化 State（科室待护士分诊后确定）
     # 注意：run_id会在护士分诊后根据实际科室重新生成
@@ -671,7 +675,7 @@ def process_single_case(
     
     state = BaseState(
         run_id="temp",  # 临时值，分诊后会更新
-        dept="internal_medicine",  # 临时值，护士分诊后会更新
+        dept="neurology",  # 神经内科
         patient_profile={"case_text": case_info},
         appointment={"channel": "APP", "timeslot": "上午"},
         original_chief_complaint=original_chief_complaint,  # 原始主诉（仅患者可见）
@@ -722,7 +726,7 @@ def process_single_case(
     logger.info("🤖 初始化系统组件...")
     try:
         logger.info(f"\n🤖 初始化大语言模型客户端 ({config.llm.backend})...")
-        llm = build_llm_client(config.llm.backend)
+        llm_client = build_llm_client(config.llm.backend)
         logger.info("  ✅ 大语言模型客户端初始化成功")
     except Exception as e:  # noqa: BLE001
         logger.info(f"❌ 大语言模型初始化失败：{e}")
@@ -748,7 +752,7 @@ def process_single_case(
         retriever = DummyRetriever()
 
     logger.info("\n⚙️ 初始化服务组件...")
-    services = build_services(seed=config.system.seed)
+    services = build_services()
     logger.info("  ✅ 服务组件初始化完成")
     
     # 初始化病例库服务
@@ -766,7 +770,7 @@ def process_single_case(
         "name": state.case_data.get("name", "患者"),
         "age": state.case_data.get("age", 0),
         "gender": state.case_data.get("gender", "未知"),
-        "dataset_id": config.agent.dataset_id,
+        "dataset_id": config.dataset.dataset_id,
     }
     record_id = medical_record_integration.on_patient_entry(patient_id, patient_profile)
     logger.info(f"  ✅ 病例已创建: {record_id}")
@@ -820,14 +824,14 @@ def process_single_case(
     # 初始化三智能体
     logger.info("🧑 初始化多智能体并执行分诊...")
     logger.info("\n🧑 初始化多智能体...")
-    if llm is None:
+    if llm_client is None:
         logger.warning("⚠️  建议使用LLM（--llm deepseek），否则对话质量较差")
     
     # 患者智能体使用原始主诉（从数据集读取的）
-    patient_agent = PatientAgent(known_case=state.case_data, llm=llm, chief_complaint=original_chief_complaint)
+    patient_agent = PatientAgent(known_case=state.case_data, llm=llm_client, chief_complaint=original_chief_complaint)
     logger.info("  ✅ 患者Agent初始化完成")
     
-    nurse_agent = NurseAgent(llm=llm, max_triage_questions=config.agent.max_triage_questions)
+    nurse_agent = NurseAgent(llm=llm_client, max_triage_questions=config.agent.max_triage_questions)
     logger.info(f"  ✅ 护士Agent初始化完成（最多可问{config.agent.max_triage_questions}个问题）")
     
     # 【新增】将护士添加到物理环境
@@ -837,7 +841,7 @@ def process_single_case(
         logger.info(f"  ✅ 护士已就位于: {world.locations['triage'].name}")
     
     # 初始化检验科Agent
-    lab_agent = LabAgent(llm=llm)
+    lab_agent = LabAgent(llm=llm_client)
     logger.info("  ✅ 检验科Agent初始化完成")
     
     # 【新增】将检验科添加到物理环境
@@ -953,7 +957,7 @@ def process_single_case(
     logger.info("="*80 + "\n")
     
     # 根据分诊科室生成正确的run_id
-    run_id = make_run_id(config.system.seed, triaged_dept)
+    run_id = make_run_id(triaged_dept)
     state.run_id = run_id
     logger.info(f"  ✅ 生成run_id: {run_id}")
     
@@ -961,7 +965,7 @@ def process_single_case(
     doctor_agent = DoctorAgent(
         dept=state.dept, 
         retriever=retriever, 
-        llm=llm,
+        llm=llm_client,
         max_questions=config.agent.max_questions
     )
     # 医生不直接获得主诉，需要通过问诊从患者处获得
@@ -970,20 +974,9 @@ def process_single_case(
     # 【新增】将医生添加到物理环境（根据分诊科室）
     if world:
         doctor_id = "doctor_001"
-        # 医生在对应科室诊室（映射所有可能的分诊科室）
-        # 注意：部分科室共享诊室（如皮肤科使用内科诊室）
+        # 医生在对应科室诊室
         dept_location_map = {
-            "internal_medicine": "internal_medicine",
-            "surgery": "surgery", 
-            "gastro": "gastro",
-            "neuro": "neuro",
-            "emergency": "emergency",
-            "orthopedics": "surgery",  # 骨科使用外科诊室
-            "urology": "surgery",  # 泌尿外科使用外科诊室
-            "obstetrics_gynecology": "internal_medicine",  # 妇产科使用内科诊室
-            "pediatrics": "internal_medicine",  # 儿科使用内科诊室
             "neurology": "neuro",  # 神经医学使用神经内科诊室
-            "oncology": "internal_medicine",  # 肿瘤科使用内科诊室
             "infectious_disease": "internal_medicine",  # 感染科使用内科诊室
             "dermatology_std": "internal_medicine",  # 皮肤性病科使用内科诊室
             "ent_ophthalmology_stomatology": "internal_medicine",  # 五官科使用内科诊室
@@ -996,24 +989,9 @@ def process_single_case(
         
         # 科室中文名映射
         dept_cn_names = {
-            "internal_medicine": "内科",
-            "surgery": "外科",
-            "gastro": "消化内科",
-            "neuro": "神经内科",
-            "emergency": "急诊科",
-            "orthopedics": "骨科",
-            "urology": "泌尿外科",
-            "obstetrics_gynecology": "妇产科",
-            "pediatrics": "儿科",
             "neurology": "神经医学",
-            "oncology": "肿瘤科",
-            "infectious_disease": "感染性疾病科",
-            "dermatology_std": "皮肤性病科",
-            "ent_ophthalmology_stomatology": "眼耳鼻喉口腔科",
-            "psychiatry": "精神心理科",
-            "rehabilitation_pain": "康复疼痛科",
-            "traditional_chinese_medicine": "中医科",
         }
+        
         dept_cn = dept_cn_names.get(state.dept, state.dept)
         location_cn = world.locations[doctor_location].name
         
@@ -1025,9 +1003,8 @@ def process_single_case(
     
     logger.info("\n🏭 构建专科子图...")
     dept_subgraphs = build_dept_subgraphs(
-        retriever=retriever, 
-        rng=rng, 
-        llm=llm,
+        retriever=retriever,
+        llm=llm_client,
         doctor_agent=doctor_agent,
         patient_agent=patient_agent,
         max_questions=config.agent.max_questions
@@ -1039,8 +1016,7 @@ def process_single_case(
         dept_subgraphs,
         retriever=retriever,
         services=services,
-        rng=rng,
-        llm=llm,
+        llm=llm_client,
         llm_reports=config.llm.enable_reports,
         use_agents=True,  # 总是启用Agent模式
         patient_agent=patient_agent,
@@ -1078,46 +1054,14 @@ def process_single_case(
         if doctor_id in world.agents:
             # 显示医生科室和位置（从患者视角显示科室诊室）
             dept_cn_names = {
-                "internal_medicine": "内科",
-                "surgery": "外科",
-                "gastro": "消化内科",
-                "neuro": "神经内科",
-                "emergency": "急诊科",
-                "orthopedics": "骨科",
-                "urology": "泌尿外科",
-                "obstetrics_gynecology": "妇产科",
-                "pediatrics": "儿科",
                 "neurology": "神经医学",
-                "oncology": "肿瘤科",
-                "infectious_disease": "感染科",
-                "dermatology_std": "皮肤科",
-                "ent_ophthalmology_stomatology": "五官科",
-                "psychiatry": "精神心理科",
-                "rehabilitation_pain": "康复疼痛科",
-                "traditional_chinese_medicine": "中医科",
             }
             dept_cn = dept_cn_names.get(state.dept, state.dept)
             actual_location = world.locations[world.agents[doctor_id]].name
             
             # 检查是否是共享诊室（科室诊室名与实际位置不同）
             dept_location_map = {
-                "internal_medicine": "internal_medicine",
-                "surgery": "surgery", 
-                "gastro": "gastro",
-                "neuro": "neuro",
-                "emergency": "emergency",
-                "orthopedics": "surgery",
-                "urology": "surgery",
-                "obstetrics_gynecology": "internal_medicine",
-                "pediatrics": "internal_medicine",
                 "neurology": "neuro",
-                "oncology": "internal_medicine",
-                "infectious_disease": "internal_medicine",
-                "dermatology_std": "internal_medicine",
-                "ent_ophthalmology_stomatology": "internal_medicine",
-                "psychiatry": "internal_medicine",
-                "rehabilitation_pain": "internal_medicine",
-                "traditional_chinese_medicine": "internal_medicine",
             }
             
             if dept_location_map.get(state.dept) != state.dept:
@@ -1369,11 +1313,12 @@ def process_single_case(
                 logger.info(f"   🔬 完成检查: {tests_count} 项")
                 logger.info(f"   💬 问诊轮数: {len(state.agent_interactions.get('doctor_patient_qa', []))} 轮（配额 {max_q}，医生可主动结束）")
             
-                
-                # 将完整时间线输出到日志
-                logger.info("\n🕐 完整物理环境时间线:")
-                for entry in timeline_report:
-                    logger.info(f"  [{entry['time']}] {entry['type']}: {entry['details']}")
+                # 生成并输出完整时间线
+                if state.world_context:
+                    timeline_report = state.world_context.generate_timeline_report(patient_id)
+                    logger.info("\n🕐 完整物理环境时间线:")
+                    for entry in timeline_report:
+                        logger.info(f"  [{entry['time']}] {entry['type']}: {entry['details']}")
             
         
     except Exception as e:
@@ -1493,7 +1438,6 @@ def process_single_case(
         logger.info("【诊断评估】")
         logger.info("="*80)
         logger.info(f"📋 医生诊断: {eval_data['doctor_diagnosis']}")
-        logger.info(f"🎯 标准答案: {eval_data['correct_diagnosis']}")
         
         # 显示多维度评估结果（如果有）
         if eval_data.get('multi_dim_scores'):
@@ -1625,7 +1569,7 @@ def process_single_case(
         "chief_complaint": final_state.chief_complaint,
         "dept": final_state.dept,
         "diagnosis": final_state.diagnosis.get("name", ""),
-        "ground_truth": final_state.ground_truth.get("Final Diagnosis", "") if final_state.ground_truth else "",
+        "ground_truth": ground_truth.get("treatment_plan", "") if final_state.ground_truth else "",
         "questions_asked": sum(1 for entry in final_state.audit_trail if "interview" in entry.get("node_name", "").lower()),
         "tests_ordered": len(final_state.ordered_tests) if final_state.ordered_tests else 0,
         "escalations": final_state.escalations,

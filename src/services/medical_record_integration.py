@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Any, TYPE_CHECKING
 
+from utils import now_iso
+
 if TYPE_CHECKING:
     from environment import HospitalWorld
     from services.medical_record import MedicalRecordService
@@ -70,6 +72,14 @@ class MedicalRecordIntegration:
             nurse_id: 护士ID
         """
         patient_id = state.patient_id
+        
+        # 更新病例的patient_profile中的dept字段（护士分诊后的实际科室）
+        record = self.mrs.get_record(patient_id)
+        if record:
+            record.patient_profile["dept"] = state.dept
+            record.current_dept = state.dept  # 同时更新current_dept字段
+            record.last_updated = now_iso()  # 更新时间戳
+            self.mrs._save_record(record)  # 调用私有方法保存更新后的病例
         
         # 记录分诊信息
         self.mrs.add_triage(
@@ -346,11 +356,7 @@ class MedicalRecordIntegration:
             位置ID
         """
         dept_location_map = {
-            "internal_medicine": "internal_medicine",
-            "surgery": "surgery",
             "neurology": "neuro",
-            "gastroenterology": "gastro",
-            "emergency": "emergency",
         }
         
         return dept_location_map.get(dept, "internal_medicine")

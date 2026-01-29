@@ -17,14 +17,14 @@ class DoctorAgent:
         dept: str,
         retriever: ChromaRetriever,
         llm: LLMClient | None = None,
-        max_questions: int = 10
+        max_questions: int = 10  # 最底层默认值，通常由config.yaml覆盖
     ):
         """
         Args:
-            dept: 科室 (gastro/neuro)
+            dept: 科室代码 (例如: neurology)
             retriever: RAG检索器
             llm: 语言模型客户端
-            max_questions: 最多问题数
+            max_questions: 最多问题数（通常从config.yaml读取）
         """
         self.dept = dept
         self._retriever = retriever
@@ -36,22 +36,33 @@ class DoctorAgent:
             "symptoms": [],
             "duration": "",
             "history": {},
-            "exam_findings": {}
+            "exam_findings": {},
+            "conversation_history": []  # 新增：完整的对话历史（问题+回答）
         }
         self.questions_asked: list[str] = []
-        self._patient_answers: list[str] = []
     
     def reset(self) -> None:
-        """重置医生状态（用于处理新患者）"""
+        """重置医生状态（用于处理新患者）
+        
+        清空所有与上一个患者相关的状态，确保每个新患者都从零开始问诊：
+        - collected_info: 清空已收集的患者信息
+        - questions_asked: 清空已问问题列表（避免重复问题检查时误判）
+        
+        ⚠️ 多患者处理时必须调用此方法，否则会出现：
+          1. 问题重复检查失效（以为已经问过，实际是上个患者问的）
+          2. 问诊历史污染（显示错误的历史记录）
+        """
         self.collected_info = {
             "chief_complaint": "",
             "symptoms": [],
             "duration": "",
             "history": {},
-            "exam_findings": {}
+            "exam_findings": {},
+            "conversation_history": []  # 确保重置时清空历史对话
         }
+        # ⚠️ 关键：清空已问问题列表
         self.questions_asked = []
-        self._patient_answers = []
+        self._logger.debug(f"医生 Agent 已重置：collected_info + questions_asked 已清空")
     
     def generate_one_question(
         self,
@@ -73,12 +84,6 @@ class DoctorAgent:
         if len(self.questions_asked) >= self._max_questions:
             return ""
         
-        if self._llm is None:
-            # 规则模式：依次返回规则问题
-            all_questions = self._rule_based_questions(chief_complaint)
-            remaining = [q for q in all_questions if q not in self.questions_asked]
-            return remaining[0] if remaining else ""
-        
         # 构建RAG上下文
         kb_context = ""
         if rag_chunks:
@@ -92,14 +97,74 @@ class DoctorAgent:
             )
             kb_context = self._format_chunks(chunks)
         
-        # 构建已问问题列表 - 完整展示，用于避免重复
-        if self.questions_asked:
-            asked_list = "\n".join([f"  {i+1}. {q}" for i, q in enumerate(self.questions_asked)])
-            asked_summary = f"已问过的问题（共{len(self.questions_asked)}个）：\n{asked_list}"
-        else:
-            asked_summary = "（尚未开始问诊）"
+        # 构建历史对话展示 - 包括问题和患者的回答
+        is_first_question = len(self.questions_asked) == 0
         
-        answers_summary = "\n".join([f"A{i+1}: {a[:50]}..." for i, a in enumerate(self._patient_answers)])
+        if self.questions_asked:
+            # 显示完整的对话历史（问题 + 回答）
+            conversation_history = self.collected_info.get("conversation_history", [])
+            
+            if conversation_history:
+                # 如果有完整的对话记录，显示问题和回答
+                history_lines = []
+                for i, conv in enumerate(conversation_history, 1):
+                    history_lines.append(f"👨‍⚕️ 医生第{i}问: {conv.get('question', '')}")
+                    history_lines.append(f"👤 患者回答: {conv.get('answer', '')[:100]}{'...' if len(conv.get('answer', '')) > 100 else ''}")
+                    history_lines.append("")  # 空行分隔
+                history_display = "\n".join(history_lines)
+            else:
+                # 如果没有对话记录，只显示问题列表
+                history_display = "\n".join([f"  {i+1}. {q}" for i, q in enumerate(self.questions_asked)])
+            
+            asked_summary = f"""⛔ **已问过的所有问题及患者回答（共{len(self.questions_asked)}个）**
+
+{history_display}
+
+⚠️ **绝对禁止重复！**
+- 以上每一个问题都已经问过，绝对不能再问！
+- 不能问语义相同或相似的问题（即使换个说法也不行）
+- **仅当患者的回答不完整时，才可以针对回答中的具体内容深入追问**
+- 如果患者已经回答了该问题，就不要再问相关内容！
+- 如果想不出新问题，就返回空字符串停止问诊！
+
+💡 **如何判断是否重复**：
+1. 检查你想问的内容是否已经在患者的回答中出现
+2. 检查是否已经有相似的问题（即使表述不同）
+3. 如果患者已经提到过某个症状，就不要再问“有没有这个症状”
+
+📝 **深入追问示例**：
+- 已问：“有哪里不舒服？” 患者答：“头疼”
+  ✅ 允许：“头哪个位置疼？前额、后脑勺还是两侧？”
+  ❌ 禁止：“还有别的不舒服吗？”（这是新问题，不是深入追问）
+
+- 已问：“疼痛会扩散到其他地方吗？” 患者答：“会，有时候会到后背”
+  ✅ 允许：“后背的哪个位置？是一直疼还是偶尔疼？”
+  ❌ 禁止：“疼痛的范围大吗？”（与已问问题重复）
+"""
+        else:
+            asked_summary = """🎯 **首次问诊 - 开放式问题策略**
+
+这是患者第一次见到你，你还不了解患者的任何情况。
+真实医生的做法是：先用开放式问题让患者自己描述，而不是直接问很具体的医学问题。
+
+✅ **推荐的首次问题**（选一个）：
+- "您好，哪里不舒服？" 
+- "您好，今天来看什么问题？"
+- "您好，有什么不舒服的吗？"
+- "您好，跟我说说您的情况吧。"
+
+⚠️ **首次问诊禁忌**：
+❌ 不要直接问很具体的问题（如"疼痛持续多久了？" - 患者还没说疼痛呢）
+❌ 不要使用专业术语（如"放射痛"、"触痛" - 患者可能不懂）
+❌ 不要一次问多个问题（让患者先说完主要问题）
+❌ 不要假设患者的症状（应该让患者自己描述）
+
+💡 **后续问诊策略**：
+- 第1-2个问题：开放式，让患者描述主要症状
+- 第3-5个问题：针对患者提到的症状，追问关键细节（时间、程度、性质）
+- 第6-8个问题：筛查危险信号、伴随症状、既往病史
+- 第9-10个问题：补充暴露史、鉴别诊断关键点
+"""
         
         system_prompt = f"""你是一名经验丰富的{self._dept_name()}医生，正在进行{context}。你需要通过系统的问诊收集关键信息，做出准确诊断。
 
@@ -118,34 +183,94 @@ class DoctorAgent:
 【问诊历史】({len(self.questions_asked)}/{self._max_questions}）
 {asked_summary}
 
-【患者回答摘要】
-{answers_summary if answers_summary else "（尚无回答）"}
-
 【临床知识参考】
 {kb_context}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🚫 **重复问题检测 - 强制要求**
-在生成新问题前，你必须：
-1. 仔细阅读上方【问诊历史】中的所有已问问题
-2. 确保新问题与已问问题在内容和意图上都不重复
-3. 如果某个方面已经问过，应该基于已有答案深入追问，而不是换个说法再问一遍
+🚫 **重复问题检测 - 核心原则（最高优先级）**
 
-❌ 重复问题示例：
-- 已问"是否扩散到其他部位？" → 不要再问"有没有扩散现象？"
-- 已问"接触什么会加重？" → 不要再问"有什么因素会诱发或加重吗？"
-- 已问"疼痛程度如何？" → 不要再问"能给疼痛打个分吗？"
+⚠️ 在生成新问题前，你必须执行以下严格检查流程：
 
-✅ 正确做法：
-- 已问"是否扩散？"患者答"有" → 可以问"具体扩散到哪些部位？"
-- 已问"接触水加重"患者确认 → 可以问"除了水，其他液体如肥皂水会怎样？"
+**步骤1：逐一核对已问问题**
+仔细阅读【问诊历史】中列出的每一个问题，逐条检查你想生成的问题是否与任何一个已问问题在以下维度重复：
+- 语义重复：询问的内容实质相同（如"是否扩散"和"有无扩散现象"）
+- 意图重复：目的相同但表述不同（如"疼痛程度"和"疼痛打几分"）
+- 部分重复：询问的某个方面已包含在之前的问题中
 
-【问诊策略 - 按优先级顺序】
+**步骤2：判断是否为深入追问**
+如果你想问的内容与已问问题相关，必须确保是基于已有答案的深入追问：
+- ✅ 允许：患者已回答"疼痛会扩散"，追问"具体扩散到哪些部位？"
+- ❌ 禁止：患者已回答"疼痛会扩散"，再问"疼痛有没有放射到其他地方？"（语义重复）
 
-1️⃣ **首要信息**（必问，诊断基础）
-   - 症状特点：性质、部位、程度（要求量化：1-10分评分）
-   - 时间信息：何时开始、持续时间、发作频率（具体到小时/天/周）
-   - 伴随症状：是否有其他不适（系统性询问）
+**步骤3：重复问题识别规则**
+以下情况都属于重复，严禁生成：
+1. **换词重述**：用不同词汇表达相同问题
+   - 已问"是否扩散到其他部位？" ❌ "有没有扩散现象？" ❌ "会不会放射到别的地方？"
+   
+2. **量化方式重复**：已经问过定量或定性评估
+   - 已问"疼痛程度如何？" ❌ "能给疼痛打个分吗？" ❌ "疼痛厉害吗？"
+   
+3. **因素重复**：已经询问过加重/缓解/诱发因素
+   - 已问"接触什么会加重？" ❌ "有什么因素会诱发或加重吗？" ❌ "什么情况下会更严重？"
+   
+4. **时间重复**：已经问过持续时间、发作频率、时间规律
+   - 已问"持续多久了？" ❌ "什么时候开始的？" ❌ "症状出现多长时间？"
+
+5. **伴随症状重复**：已经全面询问过其他症状
+   - 已问"还有其他不舒服吗？" ❌ "伴随什么症状？" ❌ "有别的异常吗？"
+
+**执行要求**：
+- 生成问题前，必须在心中逐条检查上述5类重复模式
+- 如果存在任何疑似重复，立即放弃该问题，生成完全不同方向的问题
+- 当无法确定新问题是否重复时，宁可选择其他信息缺口，绝不冒险生成
+
+❌ 重复示例（绝对禁止）：
+```
+已问："疼痛会扩散吗？"
+禁止："有没有放射到其他部位？"  # 语义完全相同
+禁止："疼痛范围有变化吗？"      # 意图相同
+
+已问："什么因素会加重疼痛？"
+禁止："有什么诱因吗？"          # 询问相同的因素
+禁止："做什么动作会更痛？"      # 仍然是加重因素
+
+已问："疼痛程度如何？"
+禁止："能打几分吗？"            # 都是量化疼痛
+禁止："很痛吗？"                # 仍然问程度
+```
+
+✅ 正确做法（深入追问）：
+```
+已问："疼痛会扩散吗？" 患者答："会"
+允许："具体扩散到哪些部位？左肩？右肩？还是背部？"  # 基于答案深入细节
+
+已问："什么因素会加重？" 患者答："吃饭后"
+允许："是吃完饭立即加重，还是过一段时间？大概多久？"  # 基于答案细化时间
+
+已问："疼痛程度如何？" 患者答："很痛，8分"
+允许："这8分的疼痛会影响您的日常活动吗？比如睡眠、工作？"  # 转向功能影响
+```
+
+💡 **防重复策略**：
+- 优先询问不同维度的信息（症状→危险信号→病史→暴露史）
+- 当某个维度已充分询问时，立即转向其他维度
+- 使用【已收集的信息】判断哪些方面仍然空白
+
+【问诊策略 - 逐步深入原则】
+
+🔰 **第一阶段：开放式问诊**（第1-2个问题）
+   - **如果是首次问诊**：必须使用开放式问题
+     * "您好，哪里不舒服？" 或 "今天来看什么问题？"
+     * 让患者自己描述，不要假设患者的症状
+   - **避免**：直接问很具体的问题、使用专业术语、一次问多个问题
+   - **目的**：了解患者的主要症状和主诉
+
+1️⃣ **第二阶段：核心信息收集**（第3-5个问题）
+   - **基于患者的初步描述**，追问关键细节：
+     * 症状特点：性质、部位、程度（用患者能理解的方式问，如"有多痛？能给个分数吗？1-10分"）
+     * 时间信息："什么时候开始的？持续多久了？"（避免说"病程"这种专业词）
+     * 伴随症状："除了XX，还有哪里不舒服吗？"（基于患者已说的症状）
+   - **问题要求**：口语化、具体、一次一个问题
 
 2️⃣ **危险信号**（排除急危重症）
    - 红旗征象：突发剧烈、进行性加重、意识改变、生命体征异常
@@ -186,36 +311,62 @@ class DoctorAgent:
 
 分析当前问诊进度，决定下一步行动：
 
-🛑 **应该停止提问**（优先判断，满足以下任一条件即可停止）：
+🛑 **应该停止提问**（优先判断，满足以下**多个**条件时才停止）：
 1. **诊断清晰度**：已收集足够信息可以做出初步诊断或制定检查计划
-2. **核心信息完整**（问诊完整性检查）：
+2. **核心信息完整**（问诊完整性检查，必须满足以下所有条件）：
    - ✅ 主要症状已量化（严重度用1-10评分、持续时间具体到天/周）
    - ✅ 危险征象已排查（发热、体重下降、意识改变、急性恶化等）
    - ✅ 鉴别诊断关键信息已获取（至少2-3个鉴别点）
    - ✅ 时间轴清晰（起病时间、进展趋势）
    - ✅ 加重/缓解因素明确
-3. **检查优先**：进一步明确需要依赖检查而非问诊（如需要影像、化验）
-4. **患者状态**：患者表现痛苦、疲劳或回答质量下降，应尽快转入诊疗
-5. **边际效益递减**：继续提问获得的新信息价值不大
-6. **已达上限**：问诊次数接近或达到上限（{len(self.questions_asked)}/{self._max_questions}）
+3. **检查优先** AND **患者状态良好**：进一步明确需要依赖检查而非问诊（如需要影像、化验）且患者可以继续
+4. **已达上限**：问诊次数**已达到**上限（{len(self.questions_asked)}/{self._max_questions}）
 
-✅ **继续提问**（仅当以下关键信息缺失时）：
-- 🔴 **必问项缺失**（诊断基础）：
-  * 症状性质/部位/程度未明确
-  * 持续时间不详（回答"最近"等模糊描述）
-  * 症状未量化（无1-10评分）
-- 🔴 **危险征象未排查**：存在可疑的红旗症状需要确认
-- 🔴 **鉴别诊断关键点缺失**：需要特定信息来区分不同疾病
-- 💡 **重要线索待挖掘**：患者提到但未详述的异常表现
+注意：仅当核心信息完整（第2条所有子项都满足）且满足第1、3或4条中的至少一条时，才应停止。
 
-⚖️ **判断标准**：
-- 如果核心信息已获取，即使未达到最大轮数，也应停止
-- 如果患者回答已经足够支持临床决策，不要为了问而问
-- 优先考虑"这个问题对诊断/治疗有实质帮助吗？"而非"还能问什么"
+✅ **继续提问**（严格按顺序执行）：
 
-【输出要求】
-1. **首先判断是否应该停止**：仔细评估上述"停止提问"的条件，如果满足任一条件，直接返回空字符串 ""
-2. **如果确实需要继续**：
+第1步：【重复检查 - 最高优先级】
+- 仔细阅读【问诊历史】中的每一个已问问题
+- 在生成新问题前，确保新问题不与任何已问问题重复（参考上方🚫重复问题检测规则）
+- 检查维度：语义、意图、部分包含关系
+- 如果无法确定是否重复，宁可换一个完全不同的方向
+
+第2步：【评估信息完整性】
+- 当前已收集的信息是否足够做出临床决策？
+- 核心诊断要素是否齐全？
+
+第3步：【检查停止条件】
+- 是否满足任何一个"应该停止提问"的条件？
+
+第4步：【决定行动】
+- 满足停止条件 → 返回空字符串 + 说明理由
+- 需要继续 → 生成针对信息缺口的高质量问题
+
+**生成问题的强制要求**：
+1. ⚠️ 问题不得与【问诊历史】中的任何问题重复（最重要！）
+2. 问题必须针对【已收集的信息】中明显的空白点
+3. 问题要简洁、口语化、患者易懂
+4. 一次只问一个问题
+5. 避免开放式泛问（如"还有什么"）
+
+**质量原则**：
+- 不要为了达到问诊轮数而机械提问
+- 信息足够时主动停止
+- 每个问题都应该有明确的诊断价值
+
+**输出JSON格式**：
+{{
+  "question": "问题内容（如果信息足够或应停止则为空字符串）",
+  "reason": "决策理由（说明为什么问这个问题/为什么停止，如果是新问题需简要说明与已问问题的区别）",
+  "duplicate_check": "已确认不与以下问题重复：[列出最相关的1-2个已问问题编号]"
+}}
+
+⚠️ **特别提醒 - 重复检查是最高优先级**：
+- 在生成问题前，必须逐条检查上面《已问过的所有问题》列表
+- 如果想生成的问题可能与任何一个已问问题重复，必须立即更换方向
+- 如果无法想到不重复的新问题，就返回 question="" 停止问诊
+- duplicate_check 字段必须填写，说明你检查过了哪些相关问题 **如果确实需要继续**：
    - 生成一个简洁、口语化的问题（避免医学术语，患者容易理解）
    - 问题要有明确的临床目的，能填补关键信息缺口
    - 避免开放式泛问（如"还有什么不舒服"）
@@ -223,95 +374,122 @@ class DoctorAgent:
    - **必须确保新问题与已问问题完全不重复**
 3. **质量优先于数量**：宁可问5个高质量问题得到足够信息，也不要机械地问满10个问题
 
-【良好问题示例】
+【良好问题示例 - 按问诊阶段分类】
 
-✅ **量化追问**：
-  "如果用1-10分给疼痛打分，10分是最痛，现在是几分？"
-  "一天发作几次？每次持续多长时间？"
+🔰 **首次问诊（开放式）**：
+  ✅ "您好，哪里不舒服？"
+  ✅ "您好，今天来看什么问题？"
+  ✅ "您好，跟我说说您的情况吧。"
+  ❌ "疼痛持续多久了？"（患者还没说疼痛）
+  ❌ "您的放射痛如何？"（太专业，患者不懂）
+
+✅ **量化追问**（要用口语化方式）：
+  "有多痛？能给个分数吗？1分是最轻，10分是最痛。"
+  "一天发作几次？每次大概多长时间？"
+  "什么时候开始的？有多久了？"
   
-✅ **深度挖掘**：
-  "疼痛是钝痛、刺痛、还是绞痛？能描述一下具体的感觉吗？"
-  "疼痛会扩散到其他地方吗？比如后背、肩膀？"
+✅ **深度挖掘**（避免专业术语）：
+  "疼起来是什么感觉？是闷痛、刺痛、还是像针扎一样？"
+  "痛的地方会跑到别的地方吗？比如后背或者肩膀？"
+  "疼痛的位置能指给我看看吗？"
   
-✅ **鉴别关键**：
-  "吃饭后疼痛会加重还是缓解？空腹时怎么样？"
-  "躺下时疼痛会加重吗？弯腰或咳嗽时呢？"
+✅ **鉴别关键**（基于患者已有描述）：
+  "吃饭后会更痛还是好一点？"
+  "躺下时会不会加重？弯腰或者咳嗽的时候呢？"
+  "什么情况下会更难受？"
   
-✅ **危险筛查**：
-  "最近有没有发烧？体重有没有下降？"
-  "有没有觉得心慌、气短、或者晕倒过？"
+✅ **危险筛查**（用患者能懂的话）：
+  "最近有没有发烧？"
+  "体重有没有掉？"
+  "有没有觉得心跳快、喘不上气、或者晕倒过？"
   
 ✅ **病史关联**：
-  "以前有过类似的情况吗？当时怎么处理的？"
-  "有没有高血压、糖尿病这些慢性病？"
+  "以前有没有这样过？当时怎么好的？"
+  "有没有什么慢性病？比如高血压、糖尿病？"
 
-❌ 避免："您还有什么其他症状吗？"（太泛，无针对性）
-❌ 避免："请描述一下您的疼痛性质、部位和持续时间。"（一次问太多）
+❌ **避免的问题类型**：
+1. **首次问诊就问具体细节**（患者还没描述主要症状）
+   - ❌ "疼痛持续多久了？" → 应先问"哪里不舒服？"
+   - ❌ "有放射痛吗？" → 应先让患者描述症状
+   
+2. **使用专业术语**（患者可能不理解）
+   - ❌ "触痛明显吗？" → ✅ "我按这里会痛吗？"
+   - ❌ "有夜间盗汗吗？" → ✅ "晚上睡觉会出很多汗吗？"
+   - ❌ "放射性疼痛" → ✅ "痛会扩散到其他地方吗？"
+   
+3. **一次问多个问题**（患者难以回答）
+   - ❌ "请描述一下疼痛的性质、部位、持续时间和加重因素。" 
+   - ✅ 一次问一个："是什么样的痛？闷痛还是刺痛？"
+   
+4. **过度开放的问题**（无法引导患者）
+   - ❌ "您还有什么其他症状吗？"
+   - ✅ "除了头痛，肚子有没有不舒服？恶心想吐吗？"
+   
+5. **假设性问题**（患者还没提到的情况）
+   - ❌ "您的胸痛会放射到左臂吗？"（患者可能只是头痛）
+   - ✅ 先确认症状，再追问细节
+
+💡 **口语化原则**：
+- 用"痛"而不是"疼痛"、"触痛"
+- 用"有没有"而不是"是否存在"
+- 用"什么时候开始的"而不是"发病时间"
+- 用"晚上"而不是"夜间"
+- 用"拉肚子"而不是"腹泻"
+
+💡 **逐步引导原则**：
+- 第1问：开放式，让患者自己说
+- 第2-3问：针对患者提到的症状，问时间、程度
+- 第4-5问：追问伴随症状、加重缓解因素
+- 第6-7问：危险信号筛查
+- 第8-10问：既往史、暴露史
 ❌ 避免：与已问问题意思相同或高度相似的问题
 ❌ 避免："最近怎么样？"（过于开放，缺乏目的性）
 """
         
-        user_prompt = """请分析当前问诊情况并决定下一步行动。
-
-**决策流程**（必须按顺序执行）：
-1. **评估信息完整性**：当前已收集的信息是否足够做出临床决策？
-2. **检查停止条件**：是否满足任何一个"应该停止提问"的条件？
-3. **如果满足停止条件**：返回空字符串，理由说明为什么信息已足够
-4. **如果需要继续**：生成一个针对关键信息缺口的高质量问题
-
-**重要提醒**：
-- 不要为了达到问诊轮数而机械提问
-- 信息足够时应主动停止，体现专业的临床判断能力
-- 先检查【问诊历史】，确保不重复已问过的问题
-- 每个问题都应该有明确的诊断价值
-
-输出JSON格式：
-{{
-  "question": "问题内容（如果信息足够或应停止则为空字符串）",
-  "reason": "决策理由（为什么继续问/为什么停止）"
-}}"""
+        user_prompt = "请根据以上信息，决定是否继续问诊。如果需要继续，生成下一个问题；如果信息已足够，返回空字符串。"
         
-        # 尝试最多2次，避免重复问题
-        max_attempts = 2
-        for attempt in range(max_attempts):
-            try:
-                obj, _, _ = self._llm.generate_json(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    fallback=lambda: {"question": "", "reason": ""},
-                    temperature=0.3 + (attempt * 0.1)  # 第二次尝试时稍微提高温度
+        # 调用LLM生成问题(只尝试1次，因为prompt已经充分强调了避免重复)
+        try:
+            obj, _, _ = self._llm.generate_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                fallback=lambda: {"question": "", "reason": "", "duplicate_check": ""},
+                temperature=0.3
+            )
+            question = str(obj.get("question", "")).strip()
+            reason = str(obj.get("reason", "")).strip()
+            duplicate_check = str(obj.get("duplicate_check", "")).strip()
+            
+            # 如果为空，直接返回
+            if not question:
+                if reason:
+                    self._logger.debug(f"  💡 停止问诊: {reason}")
+                return ""
+            
+            # 【最后的安全网】检查是否重复
+            # 注意：由于prompt已经强调避免重复，这里应该很少触发
+            if self._is_duplicate_question(question):
+                self._logger.warning(
+                    f"  ⚠️  LLM生成了重复问题（尽管prompt已强调避免）\n"
+                    f"     生成的问题: {question}\n"
+                    f"     LLM自己的检查: {duplicate_check if duplicate_check else '未填写'}\n"
+                    f"     当前已问问题数: {len(self.questions_asked)}"
                 )
-                question = str(obj.get("question", "")).strip()
-                reason = str(obj.get("reason", "")).strip()
-                
-                # 如果为空或者不重复，直接返回
-                if not question:
-                    return ""
-                
-                # 检查是否重复（作为最后的安全网）
-                if not self._is_duplicate_question(question):
-                    if reason and attempt == 0:
-                        self._logger.debug(f"  💡 问题目的: {reason}")
-                    return question
-                
-                # 如果是重复的，且还有尝试次数，继续下一轮
-                if attempt < max_attempts - 1:
-                    self._logger.warning(f"  ⚠️  LLM生成了重复问题（尝试{attempt+1}/{max_attempts}），重新生成...")
-                    # 在system_prompt中添加额外提醒
-                    system_prompt += f"\n\n⚠️ 注意：刚才生成的问题「{question}」与已问问题重复，请生成完全不同的问题！"
-                else:
-                    # 最后一次尝试仍然重复，返回空
-                    self._logger.warning(f"  ❌ 多次尝试后仍生成重复问题，跳过本轮提问")
-                    return ""
+                self._logger.warning(f"      已问问题参考: {self.questions_asked[-3:] if len(self.questions_asked) >= 3 else self.questions_asked}")
+                self._logger.warning(f"      跳过本轮提问，避免重复")
+                return ""
+            
+            # 显示问题生成信息
+            if reason:
+                self._logger.debug(f"  💡 问题目的: {reason}")
+            if duplicate_check:
+                self._logger.debug(f"  ✓ 重复检查: {duplicate_check}")
+            
+            return question
                     
-            except Exception as e:
-                self._logger.error(f"  ❌ 生成问题时出错: {e}")
-                # 发生异常时返回规则问题
-                all_questions = self._rule_based_questions(chief_complaint)
-                remaining = [q for q in all_questions if q not in self.questions_asked]
-                return remaining[0] if remaining else ""
-        
-        return ""  # 安全返回
+        except Exception as e:
+            self._logger.error(f"  ❌ 生成问题时出错: {e}")
+            return ""
     
     def generate_question_based_on_tests(
         self,
@@ -331,22 +509,6 @@ class DoctorAgent:
         
         注意：问题数量限制由调用方（如C11节点）通过全局计数器控制
         """
-        
-        if self._llm is None:
-            # 规则模式：基于异常结果生成简单问题
-            abnormal = [r for r in test_results if r.get("abnormal")]
-            if not abnormal:
-                return ""
-            
-            first_abnormal = abnormal[0]
-            test_name = first_abnormal.get("test", "")
-            
-            if "贫血" in str(test_name) or "血红蛋白" in str(test_name):
-                return "最近有没有感觉特别疲劳或者头晕？"
-            elif "炎症" in str(test_name) or "白细胞" in str(test_name):
-                return "有没有发热或者身体哪里特别不舒服？"
-            else:
-                return "看到检查结果有些异常，您最近身体还有其他不适吗？"
         
         # LLM模式：智能生成问题
         # 提取异常结果
@@ -460,29 +622,6 @@ class DoctorAgent:
                 return "看到检查结果有些异常，您最近身体还有其他不适吗？"
             return ""
     
-    def _rule_based_questions(self, chief_complaint: str) -> list[str]:
-        """基于规则的问题生成（当没有LLM时）"""
-        base_questions = [
-            "这个症状有多久了？",
-            "有什么能让症状加重或缓解的因素吗？",
-            "还有其他不舒服的地方吗？"
-        ]
-        
-        if self.dept == "gastro":
-            specific = [
-                "有没有恶心、呕吐？",
-                "大便颜色正常吗？有没有黑便？",
-                "吃饭后症状会加重吗？"
-            ]
-        else:  # neuro
-            specific = [
-                "头痛的话，是哪个部位痛？",
-                "有没有视物模糊或者复视？",
-                "四肢活动有没有受影响？"
-            ]
-        
-        return (base_questions + specific)[:3]
-    
     def _is_duplicate_question(self, new_question: str) -> bool:
         """检测新问题是否与已问问题重复
         
@@ -538,7 +677,6 @@ class DoctorAgent:
     def process_patient_answer(self, question: str, answer: str) -> None:
         """处理患者的回答，更新收集的信息"""
         self.questions_asked.append(question)
-        self._patient_answers.append(answer)
         
         # 如果是第一个问题且询问主诉，提取主诉
         if len(self.questions_asked) == 1 and any(keyword in question for keyword in ["哪里不舒服", "什么症状", "怎么了", "主诉"]):
@@ -595,23 +733,7 @@ class DoctorAgent:
                             # 单值类型，覆盖
                             self.collected_info["history"][key] = value
             except Exception:
-                # LLM失败，使用简单规则
-                self._simple_extract(question, answer)
-        else:
-            # 无LLM，使用简单规则
-            self._simple_extract(question, answer)
-    
-    def _simple_extract(self, question: str, answer: str) -> None:
-        """简单的规则提取（备用）"""
-        if "久" in question or "时间" in question:
-            self.collected_info["history"]["duration"] = answer
-        elif "加重" in question or "缓解" in question:
-            if "aggravating_factors" not in self.collected_info["history"]:
-                self.collected_info["history"]["aggravating_factors"] = []
-            self.collected_info["history"]["aggravating_factors"].append(answer)
-        elif "还有" in question or "其他" in question:
-            if answer and "没" not in answer and "不" not in answer:
-                self.collected_info["symptoms"].append(answer)
+                pass
     
     def assess_interview_quality(self) -> dict[str, Any]:
         """评估当前问诊质量，提供改进建议
@@ -631,19 +753,29 @@ class DoctorAgent:
         
         # 1. 完整性评估（40分）
         completeness = 0
-        required_keys = ["chief_complaint", "duration", "severity"]
-        for key in required_keys:
-            if key == "chief_complaint":
-                if self.collected_info.get(key):
-                    completeness += 10
-            elif key in self.collected_info.get("history", {}):
-                completeness += 15
         
-        # 检查是否有伴随症状
-        if self.collected_info.get("symptoms") or self.collected_info.get("history", {}).get("associated_symptoms"):
+        # 检查主诉（必须有，10分）
+        if self.collected_info.get("chief_complaint"):
             completeness += 10
         
-        quality_report["completeness_score"] = min(100, completeness * 2.5)
+        # 检查持续时间（必须有，15分）
+        history = self.collected_info.get("history", {})
+        if "duration" in history and history["duration"]:
+            completeness += 15
+        else:
+            quality_report["missing_areas"].append("症状持续时间")
+        
+        # 检查严重程度（必须有，15分）
+        if "severity" in history and history["severity"]:
+            completeness += 15
+        else:
+            quality_report["missing_areas"].append("症状严重程度")
+        
+        # 检查伴随症状（10分）
+        if self.collected_info.get("symptoms") or history.get("associated_symptoms"):
+            completeness += 10
+        
+        quality_report["completeness_score"] = min(100, completeness * 2)
         
         # 2. 深度评估（30分）
         depth = 0
@@ -695,17 +827,13 @@ class DoctorAgent:
             quality_report["efficiency_score"] * 0.3
         )
         
-        # 识别缺失的关键信息
-        if "duration" not in self.collected_info.get("history", {}):
-            quality_report["missing_areas"].append("症状持续时间（具体到天/周/月）")
-            quality_report["suggestions"].append("建议询问：'这个症状有多久了？具体从什么时候开始的？'")
+        # 识别缺失的关键信息（避免重复添加已在completeness检查中添加的）
+        # 持续时间和严重程度在completeness评估时已经添加到missing_areas
         
-        if "severity" not in self.collected_info.get("history", {}):
-            quality_report["missing_areas"].append("症状严重程度量化")
-            quality_report["suggestions"].append("建议量化询问：'如果用1-10分评价，10分最严重，现在是几分？'")
-        
+        # 检查危险征象筛查
         if not red_flag_questions:
-            quality_report["missing_areas"].append("危险征象筛查")
+            if "危险征象筛查" not in quality_report["missing_areas"]:
+                quality_report["missing_areas"].append("危险征象筛查")
             quality_report["suggestions"].append("建议筛查红旗症状：'最近有没有发烧、体重下降、夜间盗汗？'")
         
         if not differential_questions:
@@ -721,21 +849,18 @@ class DoctorAgent:
             quality_report["missing_areas"].append("暴露史（吸烟/饮酒/职业/环境/药物等,常是漏诊线索）")
             quality_report["suggestions"].append("建议询问暴露史：'您平时吸烟或使用电子烟吗？有没有特殊的职业接触？'")
         
-        # 警告
+        # 警告（不直接显示，由调用方记录到detail_logger）
         if quality_report["overall_score"] < 50:
-            quality_report["warning"] = f"⚠️  问诊质量偏低（{quality_report['overall_score']}/100），建议补充关键信息"
+            quality_report["warning"] = f"问诊质量偏低（{quality_report['overall_score']}/100），建议补充关键信息"
         elif quality_report["overall_score"] < 70:
-            quality_report["warning"] = f"💡 问诊质量中等（{quality_report['overall_score']}/100），可进一步完善"
+            quality_report["warning"] = f"问诊质量中等（{quality_report['overall_score']}/100），可进一步完善"
         else:
-            quality_report["warning"] = f"✅ 问诊质量良好（{quality_report['overall_score']}/100）"
+            quality_report["warning"] = f"问诊质量良好（{quality_report['overall_score']}/100）"
         
         return quality_report
     
     def decide_tests(self) -> list[dict[str, Any]]:
         """根据收集的信息决定需要做哪些检查"""
-        if self._llm is None:
-            return self._rule_based_tests()
-        
         # 检索检查指南
         chunks = self._retriever.retrieve(
             f"{self.dept} 检查 适应症 {self.collected_info.get('chief_complaint', '')}",
@@ -768,58 +893,15 @@ class DoctorAgent:
             obj, _, _ = self._llm.generate_json(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                fallback=lambda: {"ordered_tests": self._rule_based_tests()},
                 temperature=0.2
             )
             return obj.get("ordered_tests", [])
-        except Exception:
-            return self._rule_based_tests()
-    
-    def _rule_based_tests(self) -> list[dict[str, Any]]:
-        """基于规则的检查开单"""
-        tests = []
-        
-        if self.dept == "gastro":
-            tests = [
-                {
-                    "dept": "gastro",
-                    "type": "endoscopy",
-                    "name": "胃镜",
-                    "reason": "上消化道症状评估",
-                    "priority": "routine",
-                    "need_prep": True,
-                    "need_schedule": True
-                },
-                {
-                    "dept": "gastro",
-                    "type": "lab",
-                    "name": "血常规",
-                    "reason": "评估炎症/贫血",
-                    "priority": "routine",
-                    "need_prep": False,
-                    "need_schedule": False
-                }
-            ]
-        else:  # neuro
-            tests = [
-                {
-                    "dept": "neuro",
-                    "type": "imaging",
-                    "name": "头颅CT",
-                    "reason": "排除颅内病变",
-                    "priority": "urgent",
-                    "need_prep": False,
-                    "need_schedule": False
-                }
-            ]
-        
-        return tests
+        except Exception as e:
+            self._logger.error(f"❌ 检查开单失败: {e}")
+            return []
     
     def make_diagnosis(self, test_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """综合分析后做出诊断"""
-        if self._llm is None:
-            return self._rule_based_diagnosis()
-        
         # 检索诊疗指南
         chunks = self._retriever.retrieve(
             f"{self.dept} 诊断 治疗方案 {self.collected_info.get('chief_complaint', '')}",
@@ -915,52 +997,20 @@ class DoctorAgent:
             obj, _, _ = self._llm.generate_json(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                fallback=lambda: self._rule_based_diagnosis(),
                 temperature=0.2
             )
             return obj
-        except Exception:
-            return self._rule_based_diagnosis()
-    
-    def _rule_based_diagnosis(self) -> dict[str, Any]:
-        """基于规则的诊断"""
-        if self.dept == "gastro":
-            diagnosis_name = "消化不良"
-        else:
-            diagnosis_name = "神经系统症状待查"
-        
-        return {
-            "diagnosis": {
-                "name": diagnosis_name,
-                "confidence": "medium",
-                "differential": ["需进一步检查明确"]
-            },
-            "treatment_plan": {
-                "medications": ["对症治疗"],
-                "lifestyle": ["注意休息", "清淡饮食"],
-                "followup": "1-2周复诊"
+        except Exception as e:
+            self._logger.error(f"❌ 诊断失败: {e}")
+            return {
+                "diagnosis": {"name": "诊断失败", "confidence": "low", "differential": []},
+                "treatment_plan": {"medications": [], "lifestyle": [], "followup": ""}
             }
-        }
     
     def _dept_name(self) -> str:
         """根据科室代码返回科室中文名"""
         dept_names = {
-            "gastro": "消化内科",
-            "neuro": "神经内科",
-            "internal_medicine": "内科",
-            "surgery": "外科",
-            "orthopedics": "骨科",
-            "urology": "泌尿外科",
-            "obstetrics_gynecology": "妇产科",
-            "pediatrics": "儿科",
             "neurology": "神经医学",
-            "oncology": "肿瘤科",
-            "infectious_disease": "感染性疾病科",
-            "dermatology_std": "皮肤性病科",
-            "ent_ophthalmology_stomatology": "眼耳鼻喉口腔科",
-            "psychiatry": "精神心理科",
-            "emergency": "急诊医学科",
-            "rehabilitation_pain": "康复疼痛科",
             "traditional_chinese_medicine": "中医科",
         }
         return dept_names.get(self.dept, "通用科室")
@@ -978,11 +1028,12 @@ class DoctorAgent:
     
     def get_interaction_summary(self) -> dict[str, Any]:
         """获取医生问诊摘要"""
+        conversation_history = self.collected_info.get("conversation_history", [])
         return {
             "questions_count": len(self.questions_asked),
             "qa_pairs": [
-                {"question": q, "answer": a}
-                for q, a in zip(self.questions_asked, self._patient_answers)
+                {"question": conv.get("question", ""), "answer": conv.get("answer", "")}
+                for conv in conversation_history
             ],
             "collected_info": self.collected_info
         }
@@ -995,18 +1046,14 @@ class DoctorAgent:
         Returns:
             总结的主诉字符串
         """
-        if not self.questions_asked or not self._patient_answers:
+        conversation_history = self.collected_info.get("conversation_history", [])
+        if not self.questions_asked or not conversation_history:
             return "患者主诉不明"
         
-        if self._llm is None:
-            # 规则模式：使用第一个回答作为主诉
-            first_answer = self._patient_answers[0] if self._patient_answers else "不适"
-            return first_answer[:50]  # 限制长度
-        
-        # LLM模式：智能总结
+        # LLM模式：智能总结（只使用前5轮）
         qa_text = "\n".join([
-            f"医生：{q}\n患者：{a}"
-            for q, a in zip(self.questions_asked[:5], self._patient_answers[:5])  # 只使用前5轮
+            f"医生：{conv.get('question', '')}\n患者：{conv.get('answer', '')}"
+            for conv in conversation_history[:5]
         ])
         
         system_prompt = f"""你是一名{self._dept_name()}医生，需要根据问诊记录总结患者的主诉。
@@ -1030,10 +1077,10 @@ class DoctorAgent:
             obj, _, _ = self._llm.generate_json(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                fallback=lambda: {"chief_complaint": self._patient_answers[0][:50] if self._patient_answers else "不适"},
                 temperature=0.1
             )
             return obj.get("chief_complaint", "患者主诉不明")
         except Exception:
             # LLM失败时使用第一个回答
-            return self._patient_answers[0][:50] if self._patient_answers else "患者主诉不明"
+            first_answer = conversation_history[0].get("answer", "") if conversation_history else ""
+            return first_answer[:50] if first_answer else "患者主诉不明"

@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-import random
+import time
 from typing import Any
 
 from utils import now_iso
 
 
 class EndoscopyService:
-    def __init__(self, *, rng: random.Random) -> None:
-        self.rng = rng
+    def __init__(self) -> None:
+        pass
 
     def schedule_endoscopy(self, *, procedure: str) -> dict[str, Any]:
         return {
             "procedure": procedure,
             "scheduled": True,
-            "schedule_id": f"END-{self.rng.randint(10000, 99999)}",
+            "schedule_id": f"END-{int(time.time() * 1000) % 100000}",
             "scheduled_at": now_iso(),
         }
 
@@ -33,7 +33,7 @@ class EndoscopyService:
         ]
 
     def generate_report(self, *, procedure: str) -> dict[str, Any]:
-        abnormal = self.rng.random() < 0.3
+        abnormal = False  # 默认正常
         conclusion = "未见明显异常" if not abnormal else "发现黏膜炎症/糜烂改变"
         return {
             "type": "endoscopy",

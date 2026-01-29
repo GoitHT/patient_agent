@@ -102,6 +102,9 @@ class BaseState(BaseModel):
     # 病例库集成字段
     medical_record_integration: Optional[Any] = Field(default=None, exclude=True)  # 病例库集成器（不序列化）
     dept_display_name: str = ""  # 科室中文显示名称（用于输出显示）
+    
+    # 患者详细日志记录器（不序列化）
+    patient_detail_logger: Optional[Any] = Field(default=None, exclude=True)
 
     def model_post_init(self, __context: Any) -> None:  # noqa: D401
         # LangGraph may serialize Pydantic state with `exclude_unset=True`.

@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import random
+import time
 from typing import Any
 
 from utils import now_iso
 
 
 class AppointmentService:
-    def __init__(self, *, rng: random.Random) -> None:
-        self.rng = rng
+    def __init__(self) -> None:
+        pass
 
     def create_appointment(self, *, channel: str, dept: str, timeslot: str) -> dict[str, Any]:
-        appt_id = f"APT-{self.rng.randint(100000, 999999)}"
+        appt_id = f"APT-{int(time.time() * 1000) % 1000000}"
         return {
             "appointment_id": appt_id,
             "channel": channel,

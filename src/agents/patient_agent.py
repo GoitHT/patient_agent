@@ -27,8 +27,18 @@ class PatientAgent:
         if not self.case_info:
             raise ValueError("Case Information为空，无法创建患者智能体")
         
-        self.conversation_history: list[dict[str, str]] = []  # 公开：对话历史
         self.llm = llm
+        self._recent_context: list[dict[str, str]] = []  # 仅保留最近5轮用于生成自然回答
+    
+    def reset(self) -> None:
+        """重置患者对话状态（用于处理新对话或重新开始问诊）
+        
+        清空对话历史上下文，确保不会将之前的对话记忆带入新的问诊。
+        
+        注意：在多患者处理系统中，每个患者都会创建新的PatientAgent实例，
+        因此通常不需要手动调用reset。此方法主要用于测试或单患者多轮对话场景。
+        """
+        self._recent_context = []
     
     def describe_to_nurse(self) -> str:
         """患者向护士描述自己的症状（基于主诉，用自然语言）
@@ -36,10 +46,6 @@ class PatientAgent:
         Returns:
             患者的症状描述（口语化表达）
         """
-        if not self.llm:
-            # 如果没有LLM，直接返回主诉
-            return self._chief_complaint if self._chief_complaint else "我感觉不太舒服"
-        
         system_prompt = f"""你是一位感到不适的患者，刚来到医院分诊台。
 
 【你的病情】
@@ -104,12 +110,11 @@ class PatientAgent:
             doctor_question: 医生的问题
             physical_state: 患者当前物理状态快照（energy_level, pain_level等）
         """
-        # 构建对话历史上下文
+        # 构建对话历史上下文（仅最近5轮）
         history_context = ""
-        if self.conversation_history:
-            recent = self.conversation_history[-5:]  # 保留最近5轮
+        if self._recent_context:
             history_lines = []
-            for turn in recent:
+            for turn in self._recent_context:
                 history_lines.append(f"医生：{turn['doctor']}")
                 history_lines.append(f"患者：{turn['patient']}")
             history_context = "\n".join(history_lines)
@@ -136,7 +141,7 @@ class PatientAgent:
             elif energy_level < 6:
                 state_instruction += f"\n你感到疲劳（体力{energy_level}/10），不太想多说话，回答倾向简洁。"
         
-        system_prompt = f"""你是一位真实的患者，正在医院接受医生问诊。你对自己的病情感到担心。
+        system_prompt = f"""你是一位真实的患者，正在医院接受医生问诊。你对自己的病情感到担心。你没有医学专业知识，是一个普通人。
 
 【你的真实病情】
 {self.case_info}
@@ -145,24 +150,55 @@ class PatientAgent:
 {history_context}
 {state_instruction}
 
-【角色要求】
-1. **信息真实性**：只说病情描述中明确提到的信息，没提到的就说'不太清楚'、'不记得了'、'应该没有吧'
-2. **表达方式**：用普通人的口语表达，不要用医学术语（比如说'肚子疼'而不是'腹痛'）
-3. **情绪表现**：适度表现出担心、焦虑、不安等真实情绪
-   - 初次提到严重症状时：'医生，我很担心...'、'是不是很严重啊？'
-   - 症状困扰很久：'已经好几天了，一直不见好'
-   - 影响生活：'疼得都睡不着觉'、'都没法正常吃饭了'
-4. **回答长度**：{response_style}回答（一般1-2句话，状态不好时更短）
-5. **不确定性**：对时间、程度等细节可能记不清楚：'大概...'、'好像是...'、'记不太清了'
-6. **主动补充**：如果医生问到相关的，可以自然地补充其他明显症状
+【回答原则】
+1. **非专业特征**：
+   - 你没有医学知识，不知道专业医学术语
+   - 当医生问到具体身体部位的专业名词时（如"淋巴"、"胱骨"、"颈椎"），应回答“医生，我不太懂这个”或“这个专业名词我不太清楚”
+   - 用口语化表达描述症状，不使用医学术语
 
-【示例风格】
-❌ 不好：'我出现上腹部疼痛，呈持续性钝痛，进食后加重。'
-✅ 好：'肚子疼，这里（指上腹），吃完饭就更疼了。'
+2. **口语化特征**：
+   - 使用口语语气词：“唔...”、“我觉得...”、“应该是...”、“我记得...”
+   - 可以用“我也不确定”、“可能是吧”等不确定表达
+   - 有时会用手势指位置：“就这儿（指着XX部位）”
+   - 回答时像在聊天，不是在背书
 
-❌ 不好：'是的，确实存在该症状。'
-✅ 好：'对对对，就是这样。'或'嗯，有的。'
-"""
+3. **信息依赖性**：
+   - 仅根据【真实病情】中的内容回答
+   - 如果病情信息中没有提及，说“这个我不太清楚”或“没注意过”
+   - 不自己编造信息
+
+4. **检查结果回答策略**：
+   - 如果医生直接询问一项完整的医院检查结果（如MRI、免疫组化、CT等）：
+     * 如果病情信息中没有写明存在该检查，回答“我还没做过这个检查”
+     * 如果有，直接如实详细回答，可以使用医学术语，回答应当准确简明
+   - 如果医生问的是具体身体部位的专业名词，你应该不回答
+
+5. **回答风格**：
+   - {response_style}回答医生的问题
+   - 符合第一人称患者口吻，给人交流感
+   - 不要一次说太多，像真实聊天一样一句一句说
+   - 如果不确定，可以表现出犹豫：“唔...这个...”、“我想想...”
+
+6. **特殊情况处理**：
+   - 当医生的问题非常宽泛，内涵多于3个问题时，可以说“医生，你问的太多了，我有点乱，能一个一个来吗？”
+   - 如果医生要求“介绍你的病情情况”这种极度开放的问题，可以说“医生，我也不知道从哪说起，你问吧”
+
+【示例】
+医生：你的颈椎有没有问题？
+患者：唔...颈椎？医生，这个专业名词我不太清楞。你是说脖子吗？脖子倒是没什么不舒服的。
+
+医生：你做过MRI吗？结果怎么样？
+患者：做过，就上个月做的。（然后详细描述MRI结果，可以用专业术语）
+
+医生：你的血细胞比容多少？
+患者：医生，这个我不太懂。是说血常规吗？我有单子，但上面的数据我也看不懂...
+
+医生：请介绍你的病情情况。
+患者：唔...医生，我也不知道从哪儿说起，你问吧，我跟你说。
+
+现在医生问：{doctor_question}
+
+请{response_style}回答医生的问题，记住：你是患者，不是医生。"""
         
         user_prompt = f"医生问：{doctor_question}\n\n患者回答："
         
@@ -175,18 +211,20 @@ class PatientAgent:
         )
         answer = response.strip()
         
-        # 记录对话
-        self.conversation_history.append({
+        # 更新最近上下文（仅保留最近5轮）
+        self._recent_context.append({
             "doctor": doctor_question,
             "patient": answer
         })
+        if len(self._recent_context) > 5:
+            self._recent_context.pop(0)
         
         return answer
     
     def get_conversation_summary(self) -> dict[str, Any]:
-        """获取对话摘要"""
+        """获取对话摘要（简化版）"""
         return {
-            "total_turns": len(self.conversation_history),
-            "conversation": self.conversation_history,
+            "total_turns": len(self._recent_context),
+            "conversation": [],  # 不再保存完整对话历史
             "case_info": self.case_info
         }

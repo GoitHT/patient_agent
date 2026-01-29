@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-import random
 from typing import Any
 
 from utils import now_iso
 
 
 class LabService:
-    def __init__(self, *, rng: random.Random) -> None:
-        self.rng = rng
+    def __init__(self) -> None:
+        pass
 
     def run_tests(self, *, ordered: list[dict[str, Any]]) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for item in ordered:
             name = item.get("name", "")
             if "幽门螺杆菌" in name or "hp" in name.lower():
-                positive = self.rng.random() < 0.5
+                positive = False  # 默认阴性
                 results.append(
                     {
                         "type": "lab",
@@ -32,9 +31,9 @@ class LabService:
                 )
                 continue
             if "肝" in name or "肝功" in name:
-                alt = int(self.rng.normalvariate(35, 12))
-                ast = int(self.rng.normalvariate(30, 10))
-                abnormal = alt > 60 or ast > 60
+                alt = 35  # 固定值
+                ast = 30  # 固定值
+                abnormal = False
                 results.append(
                     {
                         "type": "lab",
@@ -50,9 +49,9 @@ class LabService:
                     }
                 )
             elif "血常规" in name or "血" in name:
-                wbc = round(self.rng.normalvariate(6.5, 2.0), 1)
-                hb = int(self.rng.normalvariate(135, 18))
-                abnormal = wbc > 11.0 or hb < 110
+                wbc = 6.5  # 固定值
+                hb = 135  # 固定值
+                abnormal = False
                 results.append(
                     {
                         "type": "lab",
@@ -68,7 +67,7 @@ class LabService:
                     }
                 )
             elif "便" in name:
-                occult = self.rng.random() < 0.2
+                occult = False  # 默认阴性
                 abnormal = occult
                 results.append(
                     {

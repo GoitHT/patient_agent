@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import random
+import time
 from typing import Any
 
 from utils import now_iso
 
 
 class DocumentService:
-    def __init__(self, *, rng: random.Random) -> None:
-        self.rng = rng
+    def __init__(self) -> None:
+        pass
 
     def generate_emr(self, *, state: Any) -> dict[str, Any]:
         return {
             "doc_type": "EMR",
-            "doc_id": f"EMR-{self.rng.randint(10000, 99999)}",
+            "doc_id": f"EMR-{int(time.time() * 1000) % 100000}",
             "generated_at": now_iso(),
             "content": {
                 "chief_complaint": getattr(state, "chief_complaint", ""),
@@ -28,16 +28,16 @@ class DocumentService:
         dx = getattr(state, "diagnosis", {})
         return {
             "doc_type": "DIAGNOSIS_CERT",
-            "doc_id": f"DX-{self.rng.randint(10000, 99999)}",
+            "doc_id": f"DX-{int(time.time() * 1000) % 100000}",
             "generated_at": now_iso(),
             "content": {"diagnosis": dx.get("final", dx.get("name", "待明确"))},
         }
 
     def sick_leave(self, *, state: Any) -> dict[str, Any]:
-        days = int(self.rng.choice([0, 1, 2, 3]))
+        days = 2  # 固定休息2天
         return {
             "doc_type": "SICK_LEAVE",
-            "doc_id": f"SL-{self.rng.randint(10000, 99999)}",
+            "doc_id": f"SL-{int(time.time() * 1000) % 100000}",
             "generated_at": now_iso(),
             "content": {"days": days, "note": "如症状加重请及时就医"},
         }
@@ -45,8 +45,7 @@ class DocumentService:
     def education_sheet(self, *, state: Any) -> dict[str, Any]:
         return {
             "doc_type": "EDUCATION",
-            "doc_id": f"EDU-{self.rng.randint(10000, 99999)}",
+            "doc_id": f"EDU-{int(time.time() * 1000) % 100000}",
             "generated_at": now_iso(),
-            "content": {"followup_plan": getattr(state, "followup_plan", {})},
-        }
+            "content": {"followup_plan": getattr(state, "followup_plan", {})},        }
 

@@ -36,9 +36,11 @@ def parse_json_with_retry(
 
     Returns: (parsed_dict, used_fallback)
     """
-
+    
+    logger = logging.getLogger("hospital_agent.utils")
     last_err: Exception | None = None
     candidate = (text or "").strip()
+    
     for attempt in range(max_attempts):
         try:
             obj = json.loads(candidate)
@@ -47,10 +49,31 @@ def parse_json_with_retry(
             return obj, False
         except Exception as e:  # noqa: BLE001 - fallback is required by spec
             last_err = e
-            extracted = _extract_json_object(candidate)
-            candidate = extracted.strip() if extracted else candidate
+            if attempt == 0:
+                # 第一次失败，尝试提取JSON对象
+                extracted = _extract_json_object(candidate)
+                if extracted and extracted != candidate:
+                    candidate = extracted.strip()
+                    logger.debug(f"JSON解析失败（尝试{attempt+1}/{max_attempts}），提取JSON对象后重试")
+                else:
+                    logger.debug(f"JSON解析失败（尝试{attempt+1}/{max_attempts}），无法提取有效JSON")
+            else:
+                # 最后一次失败，记录详细错误
+                logger.warning(f"JSON解析失败（所有{max_attempts}次尝试均失败）: {e}")
+                
+                # 尝试定位错误位置并显示上下文
+                if hasattr(e, 'pos') and e.pos:
+                    error_pos = e.pos
+                    # 显示错误位置前后50个字符
+                    start = max(0, error_pos - 50)
+                    end = min(len(candidate), error_pos + 50)
+                    context = candidate[start:end]
+                    logger.warning(f"错误位置附近: ...{context}...")
+                    logger.warning(f"            {' ' * (error_pos - start)}^ 错误在这里")
+                else:
+                    # 没有位置信息，显示前200字符
+                    logger.warning(f"失败的文本预览: {candidate[:200]}...")
 
-    _ = last_err
     return fallback(), True
 
 
@@ -224,13 +247,11 @@ def get_logger(name: str = "hospital_agent") -> logging.Logger:
 
 
 # ============================================================================
-# 随机数和 ID 生成工具 (原 seeds.py)
+# ID 生成工具
 # ============================================================================
 
-def make_rng(seed: int) -> random.Random:
-    return random.Random(seed)
-
-
-def make_run_id(seed: int, dept: str) -> str:
-    raw = f"{dept}:{seed}".encode("utf-8")
+def make_run_id(dept: str) -> str:
+    """生成运行ID"""
+    import time
+    raw = f"{dept}:{time.time()}".encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:12]

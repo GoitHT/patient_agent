@@ -724,18 +724,24 @@ class HospitalWorld:
             'lunch_end': 13,
         }
         
+        # ===== 医生资源池管理 =====
+        # 医生队列：{dept: {doctor_id: {'status': 'available'/'busy', 'current_patient': patient_id, 'queue': [patient_ids]}}}
+        self.doctor_pool: Dict[str, Dict[str, Dict]] = {}
+        # 患者-医生映射
+        self.patient_doctor_map: Dict[str, str] = {}  # patient_id -> doctor_id
+        
         # 初始化医院环境
         self._build_hospital()
     
     def _build_hospital(self):
         """构建医院物理结构"""
-        # 创建位置
+        # 创建位置 - 仅保留神经内科相关位置
         locations = [
             Location(
                 "lobby", 
                 "门诊大厅", 
                 "lobby", 
-                connected_to=["triage", "internal_medicine", "surgery", "gastro", "neuro", "emergency", "pharmacy", "lab", "imaging"],
+                connected_to=["triage", "neuro", "pharmacy", "lab", "imaging"],
                 capacity=50,
                 available_actions=["register", "wait", "move", "look"],
                 devices=["挂号机", "自助缴费机", "导诊台"]
@@ -755,7 +761,7 @@ class HospitalWorld:
                 "waiting_area",
                 "候诊区",
                 "waiting",
-                connected_to=["triage", "lobby", "internal_medicine", "surgery", "gastro", "neuro", "emergency"],
+                connected_to=["triage", "lobby", "neuro"],
                 capacity=30,
                 available_actions=["wait", "move", "look"],
                 devices=["叫号屏", "座椅", "饮水机"]
@@ -772,60 +778,20 @@ class HospitalWorld:
             ),
             
             Location(
-                "internal_medicine", 
-                "内科诊室", 
-                "clinic",
-                connected_to=["lobby", "waiting_area", "lab", "imaging"],
-                capacity=10,  # 增加容量以支持多个患者同时在诊室
-                available_actions=["consult", "examine", "prescribe", "order_test", "move", "look"],
-                devices=["HIS系统", "听诊器", "血压计", "体温计", "血氧仪"]
-            ),
-            
-            Location(
-                "surgery", 
-                "外科诊室", 
-                "clinic",
-                connected_to=["lobby", "waiting_area", "lab", "imaging"],
-                capacity=10,
-                available_actions=["consult", "examine", "prescribe", "order_test", "move", "look"],
-                devices=["HIS系统", "听诊器", "血压计", "检查床", "手术灯"]
-            ),
-            
-            Location(
-                "gastro", 
-                "消化内科诊室", 
-                "clinic",
-                connected_to=["lobby", "waiting_area", "lab", "imaging", "endoscopy"],
-                capacity=10,
-                available_actions=["consult", "examine", "prescribe", "order_test", "move", "look"],
-                devices=["HIS系统", "听诊器", "血压计", "检查床", "腹部触诊工具"]
-            ),
-            
-            Location(
                 "neuro", 
                 "神经内科诊室", 
                 "clinic",
                 connected_to=["lobby", "waiting_area", "lab", "imaging", "neurophysiology"],
-                capacity=2,
+                capacity=10,
                 available_actions=["consult", "examine", "prescribe", "order_test", "move", "look"],
                 devices=["HIS系统", "听诊器", "血压计", "神经检查工具", "反射锤"]
-            ),
-            
-            Location(
-                "emergency", 
-                "急诊科", 
-                "clinic",
-                connected_to=["lobby", "waiting_area", "lab", "imaging"],
-                capacity=15,
-                available_actions=["consult", "examine", "prescribe", "order_test", "move", "look"],
-                devices=["HIS系统", "听诊器", "血压计", "心电监护仪", "除颇仪", "急救车"]
             ),
             
             Location(
                 "lab", 
                 "检验科", 
                 "lab",
-                connected_to=["lobby", "internal_medicine", "surgery", "gastro", "neuro", "emergency"],
+                connected_to=["lobby", "neuro"],
                 capacity=10,
                 available_actions=["blood_test", "wait", "move", "look"],
                 devices=["LIS系统", "血液分析仪", "生化分析仪", "离心机", "采血台"]
@@ -835,20 +801,10 @@ class HospitalWorld:
                 "imaging", 
                 "影像科", 
                 "imaging",
-                connected_to=["lobby", "internal_medicine", "surgery", "gastro", "neuro", "emergency"],
+                connected_to=["lobby", "neuro"],
                 capacity=5,
                 available_actions=["xray", "ct", "mri", "ultrasound", "wait", "move", "look"],
                 devices=["RIS系统", "X光机", "CT机", "MRI机", "B超机"]
-            ),
-            
-            Location(
-                "endoscopy", 
-                "内镜中心", 
-                "endoscopy",
-                connected_to=["gastro"],
-                capacity=3,
-                available_actions=["endoscopy", "colonoscopy", "wait", "move", "look"],
-                devices=["内镜预约系统", "胃镜仪", "肠镜仪", "消毒设备", "检查床"]
             ),
             
             Location(
@@ -892,7 +848,7 @@ class HospitalWorld:
                 if loc.id not in self.allowed_moves[connected_id]:
                     self.allowed_moves[connected_id].append(loc.id)
         
-        # 创建设备
+        # 创建设备 - 仅保留神经内科相关设备
         equipment_list = [
             # 影像科设备
             Equipment("xray_1", "X光机1号", "imaging", "xray", 15),
@@ -904,17 +860,12 @@ class HospitalWorld:
             Equipment("blood_analyzer_1", "血液分析仪1号", "lab", "blood_test", 20),
             Equipment("biochem_analyzer_1", "生化分析仪1号", "lab", "biochemistry", 25),
             
-            # 内镜设备
-            Equipment("endoscope_1", "胃镜1号", "endoscopy", "endoscopy", 30),
-            Equipment("colonoscope_1", "肠镜1号", "endoscopy", "colonoscopy", 45),
-            
             # 神经电生理设备
             Equipment("eeg_1", "脑电图机1号", "neurophysiology", "eeg", 40),
             Equipment("emg_1", "肌电图机1号", "neurophysiology", "emg", 30),
             
-            # 诊室设备
-            Equipment("ecg_1", "心电图机1号", "internal_medicine", "ecg", 10),
-            Equipment("ecg_2", "心电图机2号", "surgery", "ecg", 10),
+            # 神经内科诊室设备
+            Equipment("ecg_neuro_1", "心电图机1号", "neuro", "ecg", 10),
         ]
         
         for eq in equipment_list:
@@ -1850,3 +1801,227 @@ class HospitalWorld:
             })
         return status_list
 
+
+    # ========== 医生资源池管理 ==========
+    
+    def register_doctor(self, doctor_id: str, dept: str):
+        """注册医生到资源池
+        
+        Args:
+            doctor_id: 医生ID
+            dept: 科室
+        """
+        with self._lock:
+            if dept not in self.doctor_pool:
+                self.doctor_pool[dept] = {}
+            
+            self.doctor_pool[dept][doctor_id] = {
+                'status': 'available',  # available/busy
+                'current_patient': None,
+                'queue': [],  # 等待该医生的患者队列
+                'daily_patients': 0,  # 今日已接诊患者数
+                'max_daily_patients': 50,  # 每日最大接诊数
+            }
+    
+    def assign_doctor(self, patient_id: str, dept: str, priority: int = 5) -> tuple[Optional[str], int]:
+        """为患者分配医生（支持排队和优先级）
+        
+        Args:
+            patient_id: 患者ID
+            dept: 科室
+            priority: 优先级 (1-10, 1最高)
+            
+        Returns:
+            (医生ID, 预计等待分钟数)
+        """
+        with self._lock:
+            if dept not in self.doctor_pool or not self.doctor_pool[dept]:
+                return None, 0  # 无可用医生
+            
+            # 查找最佳医生（空闲或队列最短）
+            best_doctor = None
+            min_wait_time = float('inf')
+            
+            for doctor_id, doctor_info in self.doctor_pool[dept].items():
+                # 检查医生是否达到每日接诊上限
+                if doctor_info['daily_patients'] >= doctor_info['max_daily_patients']:
+                    continue
+                
+                # 计算等待时间
+                wait_time = 0
+                if doctor_info['status'] == 'busy':
+                    # 假设每个患者平均需要15分钟
+                    wait_time = 15
+                
+                # 加上队列等待时间
+                wait_time += len(doctor_info['queue']) * 15
+                
+                if wait_time < min_wait_time:
+                    min_wait_time = wait_time
+                    best_doctor = doctor_id
+            
+            if best_doctor is None:
+                return None, 0  # 所有医生都满负荷
+            
+            # 记录患者-医生映射
+            self.patient_doctor_map[patient_id] = best_doctor
+            
+            # 如果医生空闲，直接分配
+            if self.doctor_pool[dept][best_doctor]['status'] == 'available':
+                self.doctor_pool[dept][best_doctor]['status'] = 'busy'
+                self.doctor_pool[dept][best_doctor]['current_patient'] = patient_id
+                self.doctor_pool[dept][best_doctor]['daily_patients'] += 1
+                return best_doctor, 0
+            
+            # 医生忙碌，加入队列（按优先级排序）
+            queue_entry = QueueEntry(patient_id=patient_id, priority=priority, enqueue_time=self.current_time)
+            self.doctor_pool[dept][best_doctor]['queue'].append(queue_entry)
+            self.doctor_pool[dept][best_doctor]['queue'].sort()
+            
+            return best_doctor, int(min_wait_time)
+    
+    def release_doctor(self, patient_id: str) -> bool:
+        """释放医生资源（患者就诊结束）
+        
+        Args:
+            patient_id: 患者ID
+            
+        Returns:
+            是否成功释放
+        """
+        with self._lock:
+            # 查找患者对应的医生
+            if patient_id not in self.patient_doctor_map:
+                return False
+            
+            doctor_id = self.patient_doctor_map[patient_id]
+            del self.patient_doctor_map[patient_id]
+            
+            # 查找医生所在科室
+            for dept, doctors in self.doctor_pool.items():
+                if doctor_id in doctors:
+                    doctor_info = doctors[doctor_id]
+                    
+                    # 清除当前患者
+                    if doctor_info['current_patient'] == patient_id:
+                        doctor_info['current_patient'] = None
+                    
+                    # 从队列中移除（如果在队列中）
+                    doctor_info['queue'] = [entry for entry in doctor_info['queue'] 
+                                           if entry.patient_id != patient_id]
+                    
+                    # 检查是否有等待的患者
+                    if doctor_info['queue']:
+                        # 分配给下一个患者
+                        next_entry = doctor_info['queue'].pop(0)
+                        doctor_info['status'] = 'busy'
+                        doctor_info['current_patient'] = next_entry.patient_id
+                        doctor_info['daily_patients'] += 1
+                        self.patient_doctor_map[next_entry.patient_id] = doctor_id
+                    else:
+                        # 无等待患者，医生变为空闲
+                        doctor_info['status'] = 'available'
+                    
+                    return True
+            
+            return False
+    
+    def get_doctor_status(self, dept: str = None) -> List[Dict]:
+        """获取医生状态
+        
+        Args:
+            dept: 科室（可选，不指定则返回所有科室）
+            
+        Returns:
+            医生状态列表
+        """
+        status_list = []
+        
+        depts = [dept] if dept else self.doctor_pool.keys()
+        
+        for d in depts:
+            if d not in self.doctor_pool:
+                continue
+            
+            for doctor_id, info in self.doctor_pool[d].items():
+                status_list.append({
+                    'doctor_id': doctor_id,
+                    'dept': d,
+                    'status': info['status'],
+                    'current_patient': info['current_patient'],
+                    'queue_length': len(info['queue']),
+                    'queue': [entry.patient_id for entry in info['queue']],
+                    'daily_patients': info['daily_patients'],
+                    'max_daily_patients': info['max_daily_patients'],
+                })
+        
+        return status_list
+    
+    def request_equipment(self, patient_id: str, exam_type: str, priority: int = 5) -> tuple[Optional[str], int]:
+        """请求检查设备（支持排队和优先级）
+        
+        Args:
+            patient_id: 患者ID
+            exam_type: 检查类型
+            priority: 优先级 (1-10, 1最高)
+            
+        Returns:
+            (设备ID, 预计等待分钟数)
+        """
+        with self._lock:
+            # 查找该类型的所有设备
+            available_equipment = [eq for eq in self.equipment.values() 
+                                  if eq.exam_type == exam_type and eq.status != "offline"]
+            
+            if not available_equipment:
+                return None, 0  # 无该类型设备
+            
+            # 查找最佳设备（空闲或队列最短）
+            best_equipment = None
+            min_wait_time = float('inf')
+            
+            for eq in available_equipment:
+                wait_time = eq.get_wait_time(self.current_time, patient_id)
+                if wait_time < min_wait_time:
+                    min_wait_time = wait_time
+                    best_equipment = eq
+            
+            if best_equipment is None:
+                return None, 0
+            
+            # 如果设备空闲，直接分配
+            if best_equipment.can_use(self.current_time):
+                best_equipment.start_exam(patient_id, self.current_time, priority)
+                return best_equipment.id, 0
+            
+            # 设备忙碌，加入队列
+            best_equipment.add_to_queue(patient_id, priority, self.current_time)
+            
+            return best_equipment.id, int(min_wait_time)
+    
+    def release_equipment(self, equipment_id: str) -> bool:
+        """释放设备（检查完成）
+        
+        Args:
+            equipment_id: 设备ID
+            
+        Returns:
+            是否成功释放
+        """
+        with self._lock:
+            if equipment_id not in self.equipment:
+                return False
+            
+            eq = self.equipment[equipment_id]
+            finished_patient = eq.finish_exam(self.current_time)
+            
+            if not finished_patient:
+                return False
+            
+            # 检查是否有等待的患者
+            next_patient = eq.get_next_patient()
+            if next_patient:
+                # 自动分配给下一个患者
+                eq.start_exam(next_patient, self.current_time)
+            
+            return True
