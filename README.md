@@ -442,15 +442,6 @@ llm_calls = [e for e in trace.get("audit_trail", []) if "LLM_USED" in e.get("fla
 print(f"Total LLM calls: {len(llm_calls)}")
 ```
 
-### 批量处理
-
-```bash
-# 处理多个数据集ID
-for i in 1..10 {
-  python src/main.py --dataset-id $i --save-trace "trace_$i.json"
-}
-```
-
 ---
 
 ## 📊 外部系统 Mock
@@ -510,42 +501,6 @@ database:
   enabled: true
   connection_string: "mysql+pymysql://user:password@host:port/dbname"
   backup_to_file: true  # 同时备份到文件
-```
-
----
-
-## 🧪 运行示例
-
-### 示例 1：基础运行
-
-```bash
-python src/main.py
-# 输出完整的诊疗流程日志
-```
-
-### 示例 2：多患者并发
-
-```bash
-python src/main.py --num-patients 3 --patient-interval 60
-# 3个患者，间隔60秒依次进入，系统自动分配医生
-```
-
-### 示例 3：启用LLM增强
-
-```bash
-# 设置API Key
-$env:DEEPSEEK_API_KEY="sk-xxx"
-
-# 运行
-python src/main.py --enable-reports --backend deepseek
-# 使用LLM增强检查报告叙述
-```
-
-### 示例 4：交互模式
-
-```bash
-python src/main.py --interactive
-# 进入交互式命令模式，可实时观察和控制流程
 ```
 
 ---
