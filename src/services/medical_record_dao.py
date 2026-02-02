@@ -1,10 +1,10 @@
 """
-数据库访问层 - 简化版DAO
-Database Access Object - Simplified DAO for medical records
+数据库访问层 - 3表结构（基于门诊号）
+Database Access Object - 3-table structure based on outpatient_no
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 
@@ -12,7 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import QueuePool
 
-from .db_models import Base, Patient, MedicalRecord, Consultation, Examination, SystemLog
+from .db_models import Base, Patient, MedicalCase, Examination
 from utils import get_logger, now_iso
 
 logger = get_logger("hospital_agent.dao")
@@ -21,7 +21,7 @@ logger = get_logger("hospital_agent.dao")
 class MedicalRecordDAO:
     """医疗记录数据访问对象"""
     
-    def __init__(self, connection_string: str, echo: bool = False):
+    def __init__(self, connection_string: str):
         """
         初始化数据库连接
         
@@ -29,14 +29,12 @@ class MedicalRecordDAO:
             connection_string: 数据库连接字符串
                 MySQL: "mysql+pymysql://user:password@host:port/database?charset=utf8mb4"
                 PostgreSQL: "postgresql://user:password@host:port/database"
-            echo: 是否打印SQL语句（调试用）
         """
         self.connection_string = connection_string
         
         # 创建引擎（连接池配置）
         self.engine = create_engine(
             connection_string,
-            echo=echo,
             pool_pre_ping=True,  # 连接前检查有效性
             poolclass=QueuePool,
             pool_size=10,
@@ -72,34 +70,36 @@ class MedicalRecordDAO:
     # ===== 患者操作 =====
     
     def create_patient(self, patient_data: Dict[str, Any]) -> str:
-        """创建或更新患者记录"""
+        """创建患者记录（以门诊号为主键）"""
         with self.get_session() as session:
-            patient_id = patient_data['patient_id']
+            outpatient_no = patient_data['outpatient_no']
             
-            # 检查患者是否已存在
-            existing = session.query(Patient).filter_by(patient_id=patient_id).first()
+            # 检查门诊号是否已存在
+            existing = session.query(Patient).filter_by(outpatient_no=outpatient_no).first()
             if existing:
+                logger.warning(f"门诊号已存在: {outpatient_no}")
                 # 更新患者信息
                 for key, value in patient_data.items():
-                    if hasattr(existing, key) and key != 'patient_id':
+                    if hasattr(existing, key) and key != 'outpatient_no':
                         setattr(existing, key, value)
-                logger.info(f"更新患者信息: {patient_id}")
+                logger.info(f"更新患者信息: {outpatient_no}")
             else:
                 # 创建新患者
                 patient = Patient(**patient_data)
                 session.add(patient)
-                logger.info(f"创建患者记录: {patient_id}")
+                logger.info(f"创建患者记录: {outpatient_no}")
             
-            return patient_id
+            return outpatient_no
     
-    def get_patient(self, patient_id: str) -> Optional[Dict[str, Any]]:
-        """获取患者信息"""
+    def get_patient(self, outpatient_no: str) -> Optional[Dict[str, Any]]:
+        """根据门诊号获取患者信息"""
         with self.get_session() as session:
-            patient = session.query(Patient).filter_by(patient_id=patient_id).first()
+            patient = session.query(Patient).filter_by(outpatient_no=outpatient_no).first()
             if not patient:
                 return None
             
             return {
+                "outpatient_no": patient.outpatient_no,
                 "patient_id": patient.patient_id,
                 "name": patient.name,
                 "age": patient.age,
@@ -109,181 +109,211 @@ class MedicalRecordDAO:
                 "created_at": patient.created_at.isoformat() if patient.created_at else None,
             }
     
-    # ===== 病历操作 =====
-    
-    def create_medical_record(self, record_data: Dict[str, Any]) -> str:
-        """创建病历记录"""
+    def get_patient_by_id(self, patient_id: str) -> List[Dict[str, Any]]:
+        """根据患者ID获取所有门诊记录"""
         with self.get_session() as session:
-            # 确保患者存在
-            patient_id = record_data.get('patient_id')
-            patient = session.query(Patient).filter_by(patient_id=patient_id).first()
+            patients = session.query(Patient).filter_by(patient_id=patient_id).all()
+            
+            return [
+                {
+                    "outpatient_no": p.outpatient_no,
+                    "patient_id": p.patient_id,
+                    "name": p.name,
+                    "age": p.age,
+                    "gender": p.gender,
+                    "created_at": p.created_at.isoformat() if p.created_at else None,
+                }
+                for p in patients
+            ]
+    
+    # ===== 病例操作 =====
+    
+    def create_medical_case(self, case_data: Dict[str, Any]) -> str:
+        """创建病例记录（每次就诊创建新病例，但检查case_id是否重复）"""
+        with self.get_session() as session:
+            # 确保患者（门诊号）存在
+            outpatient_no = case_data.get('outpatient_no')
+            patient = session.query(Patient).filter_by(outpatient_no=outpatient_no).first()
             if not patient:
-                raise ValueError(f"患者不存在: {patient_id}")
+                raise ValueError(f"门诊号不存在: {outpatient_no}")
             
-            # 创建病历
-            record = MedicalRecord(**record_data)
-            session.add(record)
+            # 按case_id检查是否已存在（避免重复创建同一病例）
+            case_id = case_data.get('case_id')
+            existing_case = session.query(MedicalCase).filter_by(case_id=case_id).first()
+            if existing_case:
+                logger.info(f"该病例已存在，跳过创建: {case_id} (门诊号: {outpatient_no})")
+                return existing_case.case_id
             
-            logger.info(f"创建病历: {record.record_id} (患者: {patient_id})")
+            # 创建新病例（同一门诊号可以有多个病例，对应多次就诊）
+            case = MedicalCase(**case_data)
+            session.add(case)
             
-            return record.record_id
+            logger.info(f"创建病例: {case.case_id} (门诊号: {outpatient_no})")
+            
+            return case.case_id
     
-    def get_medical_record(self, record_id: str, include_relations: bool = True) -> Optional[Dict[str, Any]]:
-        """获取完整病历（含关联数据）"""
+    def get_medical_case(self, case_id: str) -> Optional[Dict[str, Any]]:
+        """获取完整病例"""
         with self.get_session() as session:
-            record = session.query(MedicalRecord).filter_by(record_id=record_id).first()
-            if not record:
+            case = session.query(MedicalCase).filter_by(case_id=case_id).first()
+            if not case:
                 return None
             
             result = {
-                "record_id": record.record_id,
-                "patient_id": record.patient_id,
-                "visit_date": record.visit_date.isoformat() if record.visit_date else None,
-                "dept": record.dept,
-                "dept_display_name": record.dept_display_name,
-                "triage_priority": record.triage_priority,
-                "triage_reason": record.triage_reason,
-                "chief_complaint": record.chief_complaint,
-                "original_complaint": record.original_complaint,
-                "diagnosis_name": record.diagnosis_name,
-                "diagnosis_code": record.diagnosis_code,
-                "diagnosis_reasoning": record.diagnosis_reasoning,
-                "differential_diagnoses": record.differential_diagnoses,
-                "treatment_plan": record.treatment_plan,
-                "medications": record.medications,
-                "precautions": record.precautions,
-                "followup_plan": record.followup_plan,
-                "followup_date": record.followup_date.isoformat() if record.followup_date else None,
-                "status": record.status,
-                "run_id": record.run_id,
-                "dataset_id": record.dataset_id,
-                "original_case_id": record.original_case_id,
-                "physical_info": record.physical_info,
-                "created_at": record.created_at.isoformat() if record.created_at else None,
-                "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+                "case_id": case.case_id,
+                "outpatient_no": case.outpatient_no,
+                "visit_date": case.visit_date.isoformat() if case.visit_date else None,
+                "dept": case.dept,
+                "chief_complaint": case.chief_complaint,
+                "present_illness": case.present_illness,
+                "doctor_qa_records": case.doctor_qa_records or [],
+                "diagnosis_name": case.diagnosis_name,
+                "diagnosis_reason": case.diagnosis_reason,
+                "treatment_plan": case.treatment_plan,
+                "medications": case.medications or [],
+                "medical_advice": case.medical_advice,
+                "followup_plan": case.followup_plan,
+                "followup_date": case.followup_date.isoformat() if case.followup_date else None,
+                "outcome": case.outcome,
+                "status": case.status,
+                "case_logs": case.case_logs or [],
+                "run_id": case.run_id,
+                "dataset_id": case.dataset_id,
+                "original_case_id": case.original_case_id,
+                "created_at": case.created_at.isoformat() if case.created_at else None,
+                "updated_at": case.updated_at.isoformat() if case.updated_at else None,
             }
             
-            # 包含关联数据
-            if include_relations:
-                result["consultations"] = [
-                    {
-                        "id": c.id,
-                        "interaction_type": c.interaction_type,
-                        "staff_id": c.staff_id,
-                        "staff_role": c.staff_role,
-                        "question_order": c.question_order,
-                        "question": c.question,
-                        "answer": c.answer,
-                        "node_name": c.node_name,
-                        "asked_at": c.asked_at.isoformat() if c.asked_at else None,
-                    }
-                    for c in record.consultations
-                ]
-                
-                result["examinations"] = [
-                    {
-                        "exam_id": e.exam_id,
-                        "exam_name": e.exam_name,
-                        "exam_type": e.exam_type,
-                        "category": e.category,
-                        "ordered_by": e.ordered_by,
-                        "ordered_at": e.ordered_at.isoformat() if e.ordered_at else None,
-                        "priority": e.priority,
-                        "result_text": e.result_text,
-                        "summary": e.summary,
-                        "is_abnormal": e.is_abnormal,
-                        "key_findings": e.key_findings,
-                        "clinical_significance": e.clinical_significance,
-                        "source": e.source,
-                        "status": e.status,
-                        "reported_at": e.reported_at.isoformat() if e.reported_at else None,
-                    }
-                    for e in record.examinations
-                ]
+            # 获取关联的检查记录
+            examinations = session.query(Examination).filter_by(case_id=case_id).all()
+            result["examinations"] = [
+                {
+                    "exam_id": e.exam_id,
+                    "exam_name": e.exam_name,
+                    "exam_type": e.exam_type,
+                    "ordered_at": e.ordered_at.isoformat() if e.ordered_at else None,
+                    "reported_at": e.reported_at.isoformat() if e.reported_at else None,
+                    "result_text": e.result_text,
+                    "summary": e.summary,
+                    "is_abnormal": e.is_abnormal,
+                    "key_findings": e.key_findings or [],
+                    "status": e.status,
+                }
+                for e in examinations
+            ]
             
             return result
     
-    def update_medical_record(self, record_id: str, update_data: Dict[str, Any]) -> bool:
-        """更新病历信息"""
+    def update_medical_case(self, case_id: str, update_data: Dict[str, Any]) -> bool:
+        """更新病例信息"""
         with self.get_session() as session:
-            record = session.query(MedicalRecord).filter_by(record_id=record_id).first()
-            if not record:
-                logger.warning(f"病历不存在: {record_id}")
+            case = session.query(MedicalCase).filter_by(case_id=case_id).first()
+            if not case:
+                logger.warning(f"病例不存在: {case_id}")
                 return False
             
             # 更新字段
             for key, value in update_data.items():
-                if hasattr(record, key) and key not in ['record_id', 'created_at']:
-                    setattr(record, key, value)
+                if hasattr(case, key) and key not in ['case_id', 'created_at']:
+                    setattr(case, key, value)
             
-            record.updated_at = datetime.now()
+            case.updated_at = datetime.now()
             
-            logger.info(f"更新病历: {record_id}")
+            logger.info(f"更新病例: {case_id}")
             return True
     
-    def get_patient_records(self, patient_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """获取患者的所有病历记录"""
+    def get_cases_by_outpatient_no(self, outpatient_no: str) -> List[Dict[str, Any]]:
+        """获取某门诊号的所有病例"""
         with self.get_session() as session:
-            records = session.query(MedicalRecord)\
-                .filter_by(patient_id=patient_id)\
-                .order_by(MedicalRecord.visit_date.desc())\
-                .limit(limit)\
+            cases = session.query(MedicalCase)\
+                .filter_by(outpatient_no=outpatient_no)\
+                .order_by(MedicalCase.visit_date.desc())\
                 .all()
             
             return [
                 {
-                    "record_id": r.record_id,
-                    "visit_date": r.visit_date.isoformat() if r.visit_date else None,
-                    "dept": r.dept,
-                    "chief_complaint": r.chief_complaint,
-                    "diagnosis_name": r.diagnosis_name,
-                    "status": r.status,
+                    "case_id": c.case_id,
+                    "visit_date": c.visit_date.isoformat() if c.visit_date else None,
+                    "dept": c.dept,
+                    "chief_complaint": c.chief_complaint,
+                    "diagnosis_name": c.diagnosis_name,
+                    "status": c.status,
                 }
-                for r in records
+                for c in cases
             ]
     
-    # ===== 问诊记录操作 =====
+    # ===== 医生问诊记录操作 =====
     
-    def add_consultation(self, consultation_data: Dict[str, Any]) -> int:
-        """添加问诊记录"""
+    def add_doctor_qa(self, case_id: str, qa_record: Dict[str, Any]) -> bool:
+        """添加医生问诊记录到病例的JSON字段"""
         with self.get_session() as session:
-            consultation = Consultation(**consultation_data)
-            session.add(consultation)
-            session.flush()  # 获取自动生成的ID
+            case = session.query(MedicalCase).filter_by(case_id=case_id).first()
+            if not case:
+                logger.warning(f"病例不存在: {case_id}")
+                return False
             
-            logger.debug(f"添加问诊记录: {consultation.record_id}")
-            return consultation.id
+            # 初始化JSON数组
+            if case.doctor_qa_records is None:
+                case.doctor_qa_records = []
+            
+            # 添加问诊记录
+            case.doctor_qa_records.append(qa_record)
+            case.updated_at = datetime.now()
+            
+            # 标记为已修改（SQLAlchemy需要）
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(case, "doctor_qa_records")
+            
+            logger.debug(f"添加问诊记录到病例: {case_id}")
+            return True
     
-    def get_consultations(self, record_id: str) -> List[Dict[str, Any]]:
-        """获取病历的所有问诊记录"""
+    def add_case_log(self, case_id: str, log_entry: Dict[str, Any]) -> bool:
+        """添加日志到病例的JSON字段"""
         with self.get_session() as session:
-            consultations = session.query(Consultation)\
-                .filter_by(record_id=record_id)\
-                .order_by(Consultation.question_order)\
-                .all()
+            case = session.query(MedicalCase).filter_by(case_id=case_id).first()
+            if not case:
+                logger.warning(f"病例不存在: {case_id}")
+                return False
             
-            return [
-                {
-                    "id": c.id,
-                    "interaction_type": c.interaction_type,
-                    "question": c.question,
-                    "answer": c.answer,
-                    "staff_role": c.staff_role,
-                    "asked_at": c.asked_at.isoformat() if c.asked_at else None,
-                }
-                for c in consultations
-            ]
+            # 初始化JSON数组
+            if case.case_logs is None:
+                case.case_logs = []
+            
+            # 添加日志
+            log_entry['log_time'] = log_entry.get('log_time', now_iso())
+            case.case_logs.append(log_entry)
+            case.updated_at = datetime.now()
+            
+            # 标记为已修改
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(case, "case_logs")
+            
+            logger.debug(f"添加日志到病例: {case_id}")
+            return True
     
     # ===== 检查检验操作 =====
     
     def add_examination(self, exam_data: Dict[str, Any]) -> str:
-        """添加检查记录"""
+        """添加检查记录（如果已存在则更新）"""
         with self.get_session() as session:
-            examination = Examination(**exam_data)
-            session.add(examination)
+            exam_id = exam_data.get('exam_id')
             
-            logger.debug(f"添加检查记录: {examination.exam_id}")
-            return examination.exam_id
+            # 检查是否已存在
+            existing_exam = session.query(Examination).filter_by(exam_id=exam_id).first()
+            
+            if existing_exam:
+                # 如果已存在，更新记录
+                logger.debug(f"检查记录已存在，更新: {exam_id}")
+                for key, value in exam_data.items():
+                    if hasattr(existing_exam, key) and key != 'exam_id':
+                        setattr(existing_exam, key, value)
+                return exam_id
+            else:
+                # 如果不存在，插入新记录
+                examination = Examination(**exam_data)
+                session.add(examination)
+                logger.debug(f"添加检查记录: {examination.exam_id}")
+                return examination.exam_id
     
     def update_examination_result(self, exam_id: str, result_data: Dict[str, Any]) -> bool:
         """更新检查结果"""
@@ -302,11 +332,11 @@ class MedicalRecordDAO:
             logger.debug(f"更新检查结果: {exam_id}")
             return True
     
-    def get_examinations(self, record_id: str) -> List[Dict[str, Any]]:
-        """获取病历的所有检查记录"""
+    def get_examinations_by_outpatient_no(self, outpatient_no: str) -> List[Dict[str, Any]]:
+        """获取某门诊号的所有检查记录"""
         with self.get_session() as session:
             exams = session.query(Examination)\
-                .filter_by(record_id=record_id)\
+                .filter_by(outpatient_no=outpatient_no)\
                 .order_by(Examination.ordered_at)\
                 .all()
             
@@ -319,82 +349,86 @@ class MedicalRecordDAO:
                     "summary": e.summary,
                     "is_abnormal": e.is_abnormal,
                     "status": e.status,
+                    "ordered_at": e.ordered_at.isoformat() if e.ordered_at else None,
                 }
                 for e in exams
             ]
     
-    # ===== 系统日志操作 =====
-    
-    def log_event(self, log_data: Dict[str, Any]) -> int:
-        """记录系统事件"""
+    def get_examinations_by_case_id(self, case_id: str) -> List[Dict[str, Any]]:
+        """获取某病例的所有检查记录"""
         with self.get_session() as session:
-            log = SystemLog(**log_data)
-            session.add(log)
-            session.flush()
-            
-            return log.id
-    
-    def get_logs(self, record_id: str = None, log_type: str = None, limit: int = 100) -> List[Dict[str, Any]]:
-        """查询系统日志"""
-        with self.get_session() as session:
-            query = session.query(SystemLog)
-            
-            if record_id:
-                query = query.filter_by(record_id=record_id)
-            if log_type:
-                query = query.filter_by(log_type=log_type)
-            
-            logs = query.order_by(SystemLog.log_time.desc()).limit(limit).all()
+            exams = session.query(Examination)\
+                .filter_by(case_id=case_id)\
+                .order_by(Examination.ordered_at)\
+                .all()
             
             return [
                 {
-                    "id": log.id,
-                    "record_id": log.record_id,
-                    "log_type": log.log_type,
-                    "entity_id": log.entity_id,
-                    "entity_type": log.entity_type,
-                    "log_data": log.log_data,
-                    "log_time": log.log_time.isoformat() if log.log_time else None,
+                    "exam_id": e.exam_id,
+                    "exam_name": e.exam_name,
+                    "exam_type": e.exam_type,
+                    "result_text": e.result_text,
+                    "summary": e.summary,
+                    "is_abnormal": e.is_abnormal,
+                    "key_findings": e.key_findings or [],
+                    "status": e.status,
                 }
-                for log in logs
+                for e in exams
             ]
     
     # ===== 统计查询 =====
     
-    def get_daily_statistics(self, date: datetime = None) -> Dict[str, Any]:
+    def get_daily_statistics(self, target_date: date = None) -> Dict[str, Any]:
         """获取每日统计数据"""
-        if date is None:
-            date = datetime.now()
+        if target_date is None:
+            target_date = date.today()
         
         with self.get_session() as session:
-            # 查询当天的病历
-            start_of_day = date.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_of_day = date.replace(hour=23, minute=59, second=59, microsecond=999999)
-            
-            records = session.query(MedicalRecord)\
-                .filter(MedicalRecord.visit_date >= start_of_day)\
-                .filter(MedicalRecord.visit_date <= end_of_day)\
+            # 查询当天的病例
+            cases = session.query(MedicalCase)\
+                .filter(MedicalCase.visit_date == target_date)\
                 .all()
             
             # 统计
-            total_count = len(records)
-            completed_count = sum(1 for r in records if r.status == 'completed')
+            total_count = len(cases)
+            completed_count = sum(1 for c in cases if c.status == 'completed')
             
             dept_stats = {}
-            for record in records:
-                dept = record.dept or 'unknown'
+            for case in cases:
+                dept = case.dept or 'unknown'
                 if dept not in dept_stats:
                     dept_stats[dept] = 0
                 dept_stats[dept] += 1
             
             return {
-                "date": date.strftime("%Y-%m-%d"),
+                "date": target_date.strftime("%Y-%m-%d"),
                 "total_visits": total_count,
                 "completed_visits": completed_count,
                 "by_department": dept_stats,
             }
     
+    def get_all_patients(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取所有患者列表"""
+        with self.get_session() as session:
+            patients = session.query(Patient)\
+                .order_by(Patient.created_at.desc())\
+                .limit(limit)\
+                .all()
+            
+            return [
+                {
+                    "outpatient_no": p.outpatient_no,
+                    "patient_id": p.patient_id,
+                    "name": p.name,
+                    "age": p.age,
+                    "gender": p.gender,
+                    "created_at": p.created_at.isoformat() if p.created_at else None,
+                }
+                for p in patients
+            ]
+    
     def close(self):
         """关闭数据库连接"""
         self.engine.dispose()
         logger.info("数据库连接已关闭")
+

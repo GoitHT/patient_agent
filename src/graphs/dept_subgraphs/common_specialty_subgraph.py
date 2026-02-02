@@ -7,12 +7,13 @@ from typing import Any
 
 from langgraph.graph import END, StateGraph
 
+from graphs.log_helpers import _log_detail
 from rag import ChromaRetriever
 from services.llm_client import LLMClient
 from state.schema import BaseState, make_audit_entry
 from utils import load_prompt, contains_any_positive, get_logger
 from environment.staff_tracker import StaffTracker  # 导入医护人员状态追踪器
-from output_config import should_log, OutputFilter, SUPPRESS_UNCHECKED_LOGS  # 导入输出配置
+from logging_utils import should_log, OutputFilter, SUPPRESS_UNCHECKED_LOGS  # 导入输出配置
 
 # 初始化logger
 logger = get_logger("hospital_agent.specialty_subgraph")
@@ -100,217 +101,14 @@ def _chunks_for_prompt(chunks: list[dict[str, Any]], *, max_chars: int = 1400) -
     return "\n".join(lines)
 
 
-# 科室配置映射（15个标准科室）
+# 科室配置映射（当前只保留 neurology，其他科室配置已删除以减少冗余）
 DEPT_CONFIG = {
-    "internal_medicine": {
-        "name": "内科",
-        "interview_keys": ["symptom_detail", "duration", "severity", "related_factors", "alarm_symptoms"],
-        "alarm_keywords": ["高热不退", "严重胸痛", "呼吸困难", "意识改变", "剧烈腹痛"],
-        "exam_area": "general_internal",
-        "common_tests": ["血常规", "尿常规", "肝功能", "肾功能", "心电图", "胸片"],
-        "allowed_tests": {
-            "lab": ["血常规", "尿常规", "大便常规", "肝功能", "肾功能", "电解质", "血糖", "血脂", "甲状腺功能", "心肌酶"],
-            "imaging": ["胸片", "腹部B超", "心脏彩超", "胸部CT", "腹部CT"],
-            "endoscopy": ["胃镜", "肠镜"],
-            "neurophysiology": []
-        },
-        "test_body_parts": {
-            "胸片": ["胸部"],
-            "腹部B超": ["腹部"],
-            "心脏彩超": ["心脏"],
-            "胸部CT": ["胸部"],
-            "腹部CT": ["腹部"],
-            "胃镜": ["上消化道"],
-            "肠镜": ["下消化道"]
-        },
-    },
-    "surgery": {
-        "name": "外科",
-        "interview_keys": ["injury_mechanism", "wound_status", "pain_level", "bleeding_status"],
-        "alarm_keywords": ["大出血", "开放性骨折", "腹膜刺激征", "脏器损伤"],
-        "exam_area": "surgical",
-        "common_tests": ["X线", "CT", "B超", "血常规"],
-        "allowed_tests": {
-            "lab": ["血常规", "凝血功能", "肝功能", "肾功能"],
-            "imaging": ["X线", "CT", "B超", "MRI"],
-            "endoscopy": [],
-            "neurophysiology": []
-        },
-        "test_body_parts": {
-            "X线": ["骨骼", "关节", "胸部", "腹部"],
-            "CT": ["全身各部位"],
-            "B超": ["腹部", "软组织"],
-            "MRI": ["全身各部位"]
-        },
-    },
-    "orthopedics": {
-        "name": "骨科",
-        "interview_keys": ["injury_mechanism", "joint_function", "pain_pattern", "mobility"],
-        "alarm_keywords": ["骨折", "关节脱位", "神经损伤", "血管损伤"],
-        "exam_area": "musculoskeletal",
-        "common_tests": ["X线", "CT", "MRI", "骨密度"],
-        "allowed_tests": {
-            "lab": ["血常规", "血沉", "CRP", "类风湿因子"],
-            "imaging": ["X线", "CT", "MRI", "骨密度", "关节B超"],
-            "endoscopy": ["关节镜"],
-            "neurophysiology": ["肌电图"]
-        },
-        "test_body_parts": {
-            "X线": ["骨骼", "关节"],
-            "CT": ["骨骼", "关节"],
-            "MRI": ["骨骼", "关节", "软组织"],
-            "关节镜": ["关节腔"]
-        },
-    },
-    "urology": {
-        "name": "泌尿外科",
-        "interview_keys": ["urination_pattern", "hematuria_detail", "pain_location", "stone_history"],
-        "alarm_keywords": ["无尿", "血尿", "剧烈肾绞痛", "尿潴留"],
-        "exam_area": "urogenital",
-        "common_tests": ["泌尿系B超", "CT泌尿系造影", "尿常规", "肾功能"],
-        "allowed_tests": {
-            "lab": ["尿常规", "肾功能", "前列腺特异抗原"],
-            "imaging": ["泌尿系B超", "CT泌尿系造影", "IVP", "膀胱镜"],
-            "endoscopy": ["膀胱镜", "输尿管镜"],
-            "neurophysiology": []
-        },
-    },
-    "obstetrics_gynecology": {
-        "name": "妇产科",
-        "interview_keys": ["menstrual_history", "pregnancy_status", "vaginal_discharge", "pain_location"],
-        "alarm_keywords": ["阴道大出血", "剧烈腹痛", "先兆流产", "宫外孕"],
-        "exam_area": "gynecological",
-        "common_tests": ["妇科B超", "HCG", "妇科检查", "宫颈涂片"],
-        "allowed_tests": {
-            "lab": ["HCG", "性激素", "白带常规", "宫颈涂片"],
-            "imaging": ["妇科B超", "盆腔MRI"],
-            "endoscopy": ["阴道镜", "宫腔镜", "腹腔镜"],
-            "neurophysiology": []
-        },
-    },
-    "pediatrics": {
-        "name": "儿科",
-        "interview_keys": ["age", "growth_development", "feeding_pattern", "vaccination_history"],
-        "alarm_keywords": ["高热惊厥", "呼吸困难", "脱水", "发育迟缓"],
-        "exam_area": "pediatric",
-        "common_tests": ["血常规", "胸片", "发育评估", "过敏原检测"],
-        "allowed_tests": {
-            "lab": ["血常规", "过敏原检测", "微量元素", "骨龄"],
-            "imaging": ["胸片", "B超"],
-            "endoscopy": [],
-            "neurophysiology": []
-        },
-    },
     "neurology": {
         "name": "神经医学",
         "interview_keys": ["onset_time", "frequency", "severity", "triggers", "relievers", "red_flags"],
         "alarm_keywords": ["突发", "偏瘫", "肢体无力", "言语不清", "意识障碍", "抽搐"],
         "exam_area": "neurological",
         "common_tests": ["头颅CT", "头颅MRI", "脑电图", "肌电图"],
-    },
-    "oncology": {
-        "name": "肿瘤科",
-        "interview_keys": ["tumor_history", "treatment_history", "current_symptoms", "metastasis"],
-        "alarm_keywords": ["恶性肿瘤", "转移", "病理性骨折", "上腔静脉综合征"],
-        "exam_area": "oncological",
-        "common_tests": ["肿瘤标志物", "PET-CT", "病理活检", "全身骨扫描"],
-        "allowed_tests": {
-            "lab": ["肿瘤标志物", "血常规", "肝肾功能"],
-            "imaging": ["PET-CT", "增强CT", "增强MRI", "全身骨扫描"],
-            "endoscopy": ["病理活检"],
-            "neurophysiology": []
-        },
-    },
-    "infectious_disease": {
-        "name": "感染性疾病科",
-        "interview_keys": ["fever_pattern", "exposure_history", "travel_history", "contact_history"],
-        "alarm_keywords": ["高热不退", "脓毒症", "传染病接触史", "免疫缺陷"],
-        "exam_area": "infectious",
-        "common_tests": ["血培养", "病原学检测", "肝功能", "HIV检测"],
-        "allowed_tests": {
-            "lab": ["血培养", "病原学检测", "肝功能", "HIV检测", "血常规", "CRP"],
-            "imaging": ["胸片", "CT"],
-            "endoscopy": [],
-            "neurophysiology": []
-        },
-    },
-    "dermatology_std": {
-        "name": "皮肤性病科",
-        "interview_keys": ["rash_distribution", "itching_severity", "sexual_history", "skin_lesion"],
-        "alarm_keywords": ["全身性皮疹", "严重过敏", "性病史", "皮肤感染"],
-        "exam_area": "dermatological",
-        "common_tests": ["皮肤镜检", "过敏原检测", "性病筛查", "真菌培养"],
-        "allowed_tests": {
-            "lab": ["过敏原检测", "性病筛查", "真菌培养"],
-            "imaging": [],
-            "endoscopy": ["皮肤镜检", "皮肤活检"],
-            "neurophysiology": []
-        },
-    },
-    "ent_ophthalmology_stomatology": {
-        "name": "眼耳鼻喉口腔科",
-        "interview_keys": ["affected_organ", "vision_hearing_changes", "pain_level", "discharge"],
-        "alarm_keywords": ["急性视力下降", "突发性耳聋", "呼吸道梗阻", "严重外伤"],
-        "exam_area": "ent_ophthal",
-        "common_tests": ["视力检查", "听力检查", "鼻咽镜", "口腔检查"],
-        "allowed_tests": {
-            "lab": [],
-            "imaging": ["CT", "MRI"],
-            "endoscopy": ["鼻咽镜", "喉镜", "耳内镜"],
-            "neurophysiology": ["听力检查", "视力检查"]
-        },
-    },
-    "psychiatry": {
-        "name": "精神心理科",
-        "interview_keys": ["mood_changes", "sleep_pattern", "suicidal_ideation", "psychotic_symptoms"],
-        "alarm_keywords": ["自杀倾向", "伤人倾向", "严重幻觉", "严重妄想"],
-        "exam_area": "psychiatric",
-        "common_tests": ["心理量表", "精神状态检查", "认知功能评估"],
-        "allowed_tests": {
-            "lab": [],
-            "imaging": [],
-            "endoscopy": [],
-            "neurophysiology": ["心理量表", "认知功能评估"]
-        },
-    },
-    "emergency": {
-        "name": "急诊医学科",
-        "interview_keys": ["onset_time", "severity", "vital_signs", "trauma_mechanism"],
-        "alarm_keywords": ["休克", "心跳骤停", "大出血", "严重创伤", "中毒", "窒息"],
-        "exam_area": "emergency",
-        "common_tests": ["血气分析", "心电图", "快速床旁检查", "X线"],
-        "allowed_tests": {
-            "lab": ["血气分析", "血常规", "凝血功能", "心肌酶"],
-            "imaging": ["X线", "CT", "B超"],
-            "endoscopy": [],
-            "neurophysiology": ["心电图"]
-        },
-    },
-    "rehabilitation_pain": {
-        "name": "康复疼痛科",
-        "interview_keys": ["pain_duration", "pain_character", "functional_limitation", "treatment_history"],
-        "alarm_keywords": ["神经病理性疼痛", "癌性疼痛", "复杂区域疼痛综合征"],
-        "exam_area": "rehabilitation",
-        "common_tests": ["功能评估", "疼痛评分", "肌电图", "影像学检查"],
-        "allowed_tests": {
-            "lab": [],
-            "imaging": ["X线", "MRI"],
-            "endoscopy": [],
-            "neurophysiology": ["肌电图", "功能评估"]
-        },
-    },
-    "traditional_chinese_medicine": {
-        "name": "中医科",
-        "interview_keys": ["tcm_syndrome", "tongue_pulse", "constitution", "lifestyle"],
-        "alarm_keywords": ["急危重症", "需西医急救"],
-        "exam_area": "tcm",
-        "common_tests": ["中医体质辨识", "舌诊", "脉诊", "经络检测"],
-        "allowed_tests": {
-            "lab": [],
-            "imaging": [],
-            "endoscopy": [],
-            "neurophysiology": ["中医体质辨识", "经络检测"]
-        },
     },
 }
 
@@ -359,7 +157,6 @@ def build_common_specialty_subgraph(
         logger.info(f"🔍 检索{dept_name}知识...")
         chunks = retriever.retrieve(query, filters={"dept": dept}, k=4)
         state.add_retrieved_chunks(chunks)
-        logger.info(f"  ✅ 检索到 {len(chunks)} 个知识片段")
 
         cc = state.chief_complaint
         
@@ -673,6 +470,10 @@ def build_common_specialty_subgraph(
         # 记录节点问答轮数
         node_qa_turns = state.node_qa_counts.get(node_key, 0)
         
+        # ===== 保存问诊记录到数据库 =====
+        if hasattr(state, 'medical_record_integration') and state.medical_record_integration:
+            state.medical_record_integration.on_doctor_consultation(state, doctor_id="doctor_001")
+        
         state.add_audit(
             make_audit_entry(
                 node_name=f"S4 {dept_name} Specialty Interview",
@@ -699,7 +500,7 @@ def build_common_specialty_subgraph(
         detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
         
         if should_log(1, "specialty_subgraph", "S5"):
-            logger.info(f"🔍 S5: {dept_name}体格检查")
+            logger.info(f"� S5: {dept_name}体格检查")
         
         if detail_logger:
             detail_logger.section(f"{dept_name}体格检查")
@@ -779,14 +580,13 @@ def build_common_specialty_subgraph(
         common_tests = dept_config.get("common_tests", ["血常规"])
         
         logger.info("\n" + "="*60)
-        logger.info(f"🔬 S6: {dept_name}初步判断")
+        logger.info(f"� S6: {dept_name}初步判断")
         logger.info("="*60)
         
         query = f"{dept} {dept_name} 检查选择 适应症 {state.chief_complaint}"
         logger.info(f"🔍 检索{dept_name}检查指南...")
         chunks = retriever.retrieve(query, filters={"dept": dept}, k=4)
         state.add_retrieved_chunks(chunks)
-        logger.info(f"  ✅ 检索到 {len(chunks)} 个知识片段")
 
         cc = state.chief_complaint
         
@@ -823,18 +623,33 @@ def build_common_specialty_subgraph(
                 indent=2
             )
             + "\n\n【参考知识】\n" + _chunks_for_prompt(chunks)
-            + "\n\n【输出要求】JSON格式：\n"
-            + "1. need_aux_tests (bool): 是否需要检查\n"
-            + "2. ordered_tests (list): 检查项目列表，每项必须包含：\n"
-            + "   - dept: 科室代码（如\"internal_medicine\"）\n"
-            + "   - type: 检查类型，必须是以下之一：\"lab\"（检验）/\"imaging\"（影像）/\"endoscopy\"（内镜）/\"neurophysiology\"（电生理）\n"
-            + "   - name: 检查名称（具体项目名）\n"
-            + "   - reason: 开具原因\n"
-            + "   - priority: 优先级（\"urgent\"紧急/\"routine\"常规）\n"
-            + "   - need_prep: 是否需要准备（bool）\n"
-            + "   - need_schedule: 是否需要预约（bool）\n"
-            + "3. specialty_summary (dict): 包含problem_list, assessment, plan_direction, red_flags\n\n"
-            + "⚠️ 重要：type字段必须严格使用标准值（lab/imaging/endoscopy/neurophysiology），不要使用中文或其他描述！"
+            + "\n\n【输出要求】必须严格按照以下JSON格式输出（不要遗漏任何逗号或括号）：\n"
+            + "{\n"
+            + "  \"need_aux_tests\": true/false,\n"
+            + "  \"ordered_tests\": [\n"
+            + "    {\n"
+            + "      \"dept\": \"科室代码\",\n"
+            + "      \"type\": \"lab\"/\"imaging\"/\"endoscopy\"/\"neurophysiology\",\n"
+            + "      \"name\": \"检查名称\",\n"
+            + "      \"reason\": \"开具原因\",\n"
+            + "      \"priority\": \"urgent\"/\"routine\",\n"
+            + "      \"need_prep\": true/false,\n"
+            + "      \"need_schedule\": true/false\n"
+            + "    }\n"
+            + "  ],\n"
+            + "  \"specialty_summary\": {\n"
+            + "    \"problem_list\": [\"问题1\", \"问题2\"],\n"
+            + "    \"assessment\": \"评估内容\",\n"
+            + "    \"plan_direction\": \"计划方向\",\n"
+            + "    \"red_flags\": [\"警报信号1\"]\n"
+            + "  }\n"
+            + "}\n\n"
+            + "⚠️ 关键要求：\n"
+            + "1. type字段必须是：lab/imaging/endoscopy/neurophysiology（小写英文）\n"
+            + "2. need_prep和need_schedule必须是布尔值（true/false，小写）\n"
+            + "3. 每个对象内部最后一个字段后面不要加逗号\n"
+            + "4. 数组最后一个元素后面不要加逗号\n"
+            + "5. 确保所有括号和引号正确配对"
         )
         
         # 检查LLM是否可用

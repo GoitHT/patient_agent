@@ -734,7 +734,36 @@ class HospitalWorld:
         self._build_hospital()
     
     def _build_hospital(self):
-        """构建医院物理结构"""
+        """构建医院物理结构 - 神经内科专科配置
+        
+        本系统仅模拟神经内科一个科室，包含以下设施：
+        
+        【检查设备分类】
+        1. 影像科设备:
+           - 头颅CT (2台): 急性卒中、颅内出血、脑外伤的首选检查
+           - 脑MRI (2台): 脑梗死、脱髓鞘病、肿瘤、血管畸形的精确诊断
+        
+        2. 神经电生理室设备:
+           - 脑电图EEG (2台): 癫痫诊断、意识障碍评估、脑炎监测
+           - 肌电图EMG (2台): 周围神经病、肌病、神经肌肉接头疾病诊断
+           - TCD超声 (2台): 脑血管狭窄、栓塞评估、血流动力学监测
+        
+        3. 检验科设备（神经内科常用）:
+           - 血常规 (3台): 感染、贫血、血液病筛查
+           - 基础生化 (3台): 肝肾功能、血糖、血脂、尿酸等代谢指标
+           - 电解质 (2台): 钠、钾、氯、钙、镁等电解质紊乱检测
+           - 凝血功能 (2台): 卒中患者凝血状态、抗凝治疗监测
+           - 炎症/感染指标 (2台): CRP、PCT、ESR等感染标志物
+           - 心脑血管标志物 (2台): 心肌酶、肌钙蛋白、BNP、同型半胱氨酸等卒中风险评估
+           - 自免抗体 (2台): 自免性脑炎、多发性硬化、重症肌无力等自免性疾病检测
+        
+        【资源竞争机制】
+        - 每台设备有独立的队列系统，支持优先级排队
+        - 设备使用时长根据实际检查时间设定（8-55分钟不等）
+        - 每台设备有每日使用次数上限，防止过度使用
+        - 支持设备维护、故障等状态模拟
+        - 自动推进检查流程，检查完成后自动分配给下一位患者
+        """
         # 创建位置 - 仅保留神经内科相关位置
         locations = [
             Location(
@@ -813,8 +842,8 @@ class HospitalWorld:
                 "neurophysiology",
                 connected_to=["neuro"],
                 capacity=3,
-                available_actions=["eeg", "emg", "wait", "move", "look"],
-                devices=["神经电生理预约系统", "脑电图仪", "肌电图仪", "检查床"]
+                available_actions=["eeg", "emg", "tcd", "wait", "move", "look"],
+                devices=["神经电生理预约系统", "脑电图仪", "肌电图仪", "TCD超声仪", "检查床"]
             ),
             
             Location(
@@ -848,24 +877,60 @@ class HospitalWorld:
                 if loc.id not in self.allowed_moves[connected_id]:
                     self.allowed_moves[connected_id].append(loc.id)
         
-        # 创建设备 - 仅保留神经内科相关设备
+        # 创建设备 - 神经内科专科配置
         equipment_list = [
-            # 影像科设备
-            Equipment("xray_1", "X光机1号", "imaging", "xray", 15),
-            Equipment("ct_1", "CT机1号", "imaging", "ct", 30),
-            Equipment("mri_1", "MRI机1号", "imaging", "mri", 45),
-            Equipment("ultrasound_1", "B超机1号", "imaging", "ultrasound", 20),
+            # ========== 影像科设备 ==========
+            # 头颅CT（用于急性卒中、颅内出血、脑外伤等，15-20分钟/例）
+            Equipment("ct_head_1", "头颅CT机1号", "imaging", "ct_head", 20, max_daily_usage=60),
+            Equipment("ct_head_2", "头颅CT机2号", "imaging", "ct_head", 20, max_daily_usage=60),
             
-            # 检验科设备
-            Equipment("blood_analyzer_1", "血液分析仪1号", "lab", "blood_test", 20),
-            Equipment("biochem_analyzer_1", "生化分析仪1号", "lab", "biochemistry", 25),
+            # 脑MRI（用于脑梗死、脱髓鞘、肿瘤、血管畸形等，30-45分钟/例）
+            Equipment("mri_brain_1", "脑MRI机1号", "imaging", "mri_brain", 40, max_daily_usage=35),
+            Equipment("mri_brain_2", "脑MRI机2号", "imaging", "mri_brain", 40, max_daily_usage=35),
             
-            # 神经电生理设备
-            Equipment("eeg_1", "脑电图机1号", "neurophysiology", "eeg", 40),
-            Equipment("emg_1", "肌电图机1号", "neurophysiology", "emg", 30),
+            # ========== 神经电生理室设备 ==========
+            # 脑电图EEG（用于癫痫、意识障碍、脑炎等，30-40分钟/例）
+            Equipment("eeg_1", "脑电图仪1号", "neurophysiology", "eeg", 35, max_daily_usage=25),
+            Equipment("eeg_2", "脑电图仪2号", "neurophysiology", "eeg", 35, max_daily_usage=25),
             
-            # 神经内科诊室设备
-            Equipment("ecg_neuro_1", "心电图机1号", "neuro", "ecg", 10),
+            # 肌电图EMG（用于周围神经病、肌病、神经肌肉接头疾病等，30-50分钟/例）
+            Equipment("emg_1", "肌电图仪1号", "neurophysiology", "emg", 40, max_daily_usage=20),
+            Equipment("emg_2", "肌电图仪2号", "neurophysiology", "emg", 40, max_daily_usage=20),
+            
+            # TCD超声（用于脑血管狭窄、栓塞评估，20-30分钟/例）
+            Equipment("tcd_1", "TCD超声仪1号", "neurophysiology", "tcd", 25, max_daily_usage=30),
+            Equipment("tcd_2", "TCD超声仪2号", "neurophysiology", "tcd", 25, max_daily_usage=30),
+            
+            # ========== 检验科设备（神经内科常用检验项目）==========
+            # 血常规CBC（白细胞、红细胞、血小板、血红蛋白等，10-15分钟/例）
+            Equipment("cbc_analyzer_1", "血常规分析仪1号", "lab", "cbc", 12, max_daily_usage=250),
+            Equipment("cbc_analyzer_2", "血常规分析仪2号", "lab", "cbc", 12, max_daily_usage=250),
+            Equipment("cbc_analyzer_3", "血常规分析仪3号", "lab", "cbc", 12, max_daily_usage=250),
+            
+            # 基础生化（肝肾功能、血糖、血脂、尿酸等，20-30分钟/例）
+            Equipment("biochem_basic_1", "基础生化分析仪1号", "lab", "biochem_basic", 25, max_daily_usage=200),
+            Equipment("biochem_basic_2", "基础生化分析仪2号", "lab", "biochem_basic", 25, max_daily_usage=200),
+            Equipment("biochem_basic_3", "基础生化分析仪3号", "lab", "biochem_basic", 25, max_daily_usage=200),
+            
+            # 电解质分析（钠、钾、氯、钙、镁等，神经系统功能相关，8-12分钟/例）
+            Equipment("electrolyte_1", "电解质分析仪1号", "lab", "electrolyte", 10, max_daily_usage=250),
+            Equipment("electrolyte_2", "电解质分析仪2号", "lab", "electrolyte", 10, max_daily_usage=250),
+            
+            # 凝血功能（PT、APTT、INR、D-二聚体等，卒中患者必查，15-20分钟/例）
+            Equipment("coagulation_1", "凝血分析仪1号", "lab", "coagulation", 18, max_daily_usage=180),
+            Equipment("coagulation_2", "凝血分析仪2号", "lab", "coagulation", 18, max_daily_usage=180),
+            
+            # 炎症/感染指标（CRP、PCT、ESR等，脑炎、脑膜炎必查，15-25分钟/例）
+            Equipment("inflammation_1", "炎症标志物分析仪1号", "lab", "inflammation", 20, max_daily_usage=180),
+            Equipment("inflammation_2", "炎症标志物分析仪2号", "lab", "inflammation", 20, max_daily_usage=180),
+            
+            # 心肌与血管风险指标（心肌酶、肌钙蛋白、BNP、同型半胱氨酸、脂蛋白a等，卒中风险评估，25-35分钟/例）
+            Equipment("cardiac_stroke_1", "心脑血管标志物分析仪1号", "lab", "cardiac_stroke_markers", 30, max_daily_usage=150),
+            Equipment("cardiac_stroke_2", "心脑血管标志物分析仪2号", "lab", "cardiac_stroke_markers", 30, max_daily_usage=150),
+            
+            # 自身免疫抗体（用于自免性脑炎、多发性硬化、重症肌无力等，45-60分钟/例）
+            Equipment("autoimmune_1", "自免抗体检测仪1号", "lab", "autoimmune_antibody", 55, max_daily_usage=60),
+            Equipment("autoimmune_2", "自免抗体检测仪2号", "lab", "autoimmune_antibody", 55, max_daily_usage=60),
         ]
         
         for eq in equipment_list:
@@ -873,6 +938,80 @@ class HospitalWorld:
         
         # 重建位置名称缓存（因为locations被覆盖了）
         self._rebuild_location_cache()
+        
+        # 输出设备初始化统计
+        self._log_equipment_initialization()
+    
+    def _log_equipment_initialization(self):
+        """记录设备初始化统计信息（调试用）"""
+        import logging
+        logger = logging.getLogger('hospital_agent.world')
+        
+        # 按类型统计设备
+        equipment_by_type = {}
+        for eq in self.equipment.values():
+            if eq.exam_type not in equipment_by_type:
+                equipment_by_type[eq.exam_type] = []
+            equipment_by_type[eq.exam_type].append(eq)
+        
+        logger.info("=" * 70)
+        logger.info("🏥 医院物理环境初始化完成 - 神经内科专科配置")
+        logger.info("=" * 70)
+        
+        # 按位置分组展示
+        logger.info("\n【影像科设备】位置: imaging")
+        for exam_type in ["ct_head", "mri_brain"]:
+            if exam_type in equipment_by_type:
+                eq_list = equipment_by_type[exam_type]
+                logger.info(f"  ├─ {eq_list[0].exam_type.upper()}: {len(eq_list)}台设备")
+                for eq in eq_list:
+                    logger.info(f"  │  └─ {eq.name} ({eq.duration_minutes}分钟/例, 最大{eq.max_daily_usage}例/日)")
+        
+        logger.info("\n【神经电生理室设备】位置: neurophysiology")
+        for exam_type in ["eeg", "emg", "tcd"]:
+            if exam_type in equipment_by_type:
+                eq_list = equipment_by_type[exam_type]
+                exam_names = {"eeg": "脑电图", "emg": "肌电图", "tcd": "TCD超声"}
+                logger.info(f"  ├─ {exam_names.get(exam_type, exam_type)}: {len(eq_list)}台设备")
+                for eq in eq_list:
+                    logger.info(f"  │  └─ {eq.name} ({eq.duration_minutes}分钟/例, 最大{eq.max_daily_usage}例/日)")
+        
+        logger.info("\n【检验科设备】位置: lab")
+        lab_types = ["cbc", "biochem_basic", "electrolyte", "coagulation", 
+                     "inflammation", "cardiac_stroke_markers", "autoimmune_antibody"]
+        lab_names = {
+            "cbc": "血常规",
+            "biochem_basic": "基础生化",
+            "electrolyte": "电解质",
+            "coagulation": "凝血功能",
+            "inflammation": "炎症/感染指标",
+            "cardiac_stroke_markers": "心脑血管标志物",
+            "autoimmune_antibody": "自免抗体"
+        }
+        
+        for exam_type in lab_types:
+            if exam_type in equipment_by_type:
+                eq_list = equipment_by_type[exam_type]
+                logger.info(f"  ├─ {lab_names.get(exam_type, exam_type)}: {len(eq_list)}台设备")
+                for eq in eq_list:
+                    logger.info(f"  │  └─ {eq.name} ({eq.duration_minutes}分钟/例, 最大{eq.max_daily_usage}例/日)")
+        
+        # 统计总数
+        total_equipment = len(self.equipment)
+        total_daily_capacity = sum(eq.max_daily_usage for eq in self.equipment.values())
+        
+        logger.info(f"\n📊 设备统计:")
+        logger.info(f"  ├─ 总设备数: {total_equipment}台")
+        logger.info(f"  ├─ 每日总容量: {total_daily_capacity}例")
+        logger.info(f"  └─ 平均处理时间: {sum(eq.duration_minutes for eq in self.equipment.values()) / total_equipment:.1f}分钟/例")
+        
+        logger.info("\n💡 资源竞争机制:")
+        logger.info("  ├─ 优先级队列系统 (1-10级，1最高优先级)")
+        logger.info("  ├─ 设备独立队列，自动流转到下一位患者")
+        logger.info("  ├─ 每日使用次数限制，防止过度使用")
+        logger.info("  └─ 支持设备维护、故障等状态模拟")
+        
+        logger.info("=" * 70 + "\n")
     
     def is_working_hours(self) -> bool:
         """检查是否在工作时间"""
@@ -1781,7 +1920,88 @@ class HospitalWorld:
         
         return "\n".join(lines)
 
-    # ========== Level 2 ǿ: Դ ==========
+    # ========== 神经内科专用设备查询方法 ==========
+    
+    def get_neuro_equipment_summary(self) -> Dict[str, Dict]:
+        """获取神经内科所有设备的摘要信息
+        
+        Returns:
+            按设备类型分组的状态字典，包含设备数量、可用数、队列情况等
+        """
+        summary = {}
+        
+        # 定义神经内科设备类型及其友好名称
+        neuro_equipment_types = {
+            "ct_head": "头颅CT",
+            "mri_brain": "脑MRI",
+            "eeg": "脑电图",
+            "emg": "肌电图",
+            "tcd": "TCD超声",
+            "cbc": "血常规",
+            "biochem_basic": "基础生化",
+            "electrolyte": "电解质",
+            "coagulation": "凝血功能",
+            "inflammation": "炎症/感染指标",
+            "cardiac_stroke_markers": "心脑血管标志物",
+            "autoimmune_antibody": "自免抗体"
+        }
+        
+        for exam_type, display_name in neuro_equipment_types.items():
+            equipment_list = [eq for eq in self.equipment.values() if eq.exam_type == exam_type]
+            
+            if not equipment_list:
+                continue
+            
+            total_count = len(equipment_list)
+            available_count = sum(1 for eq in equipment_list if eq.can_use(self.current_time))
+            total_queue = sum(len(eq.queue) for eq in equipment_list)
+            avg_wait_time = sum(eq.get_wait_time(self.current_time) for eq in equipment_list) / total_count if total_count > 0 else 0
+            
+            summary[exam_type] = {
+                "display_name": display_name,
+                "total_equipment": total_count,
+                "available_equipment": available_count,
+                "busy_equipment": total_count - available_count,
+                "total_queue_length": total_queue,
+                "avg_wait_time_minutes": int(avg_wait_time),
+                "status": "空闲" if available_count > 0 else f"繁忙(排队{total_queue}人)",
+                "equipment_list": [eq.name for eq in equipment_list]
+            }
+        
+        return summary
+    
+    def get_equipment_recommendations(self, exam_types: List[str]) -> Dict[str, str]:
+        """根据检查类型列表推荐最佳设备和时间
+        
+        Args:
+            exam_types: 检查类型列表
+            
+        Returns:
+            推荐字典，包含每个检查类型的最佳时间和预计等待
+        """
+        recommendations = {}
+        
+        for exam_type in exam_types:
+            equipment_list = [eq for eq in self.equipment.values() if eq.exam_type == exam_type]
+            
+            if not equipment_list:
+                recommendations[exam_type] = "❌ 无此类型设备"
+                continue
+            
+            # 找到等待时间最短的设备
+            best_eq = min(equipment_list, key=lambda eq: eq.get_wait_time(self.current_time))
+            wait_time = best_eq.get_wait_time(self.current_time)
+            
+            if wait_time == 0:
+                recommendations[exam_type] = f"✅ 立即可用 - {best_eq.name}"
+            elif wait_time < 30:
+                recommendations[exam_type] = f"⏱️ 短时等待({wait_time}分钟) - {best_eq.name}"
+            else:
+                recommendations[exam_type] = f"⏳ 较长等待({wait_time}分钟) - {best_eq.name}"
+        
+        return recommendations
+
+    # ========== Level 2 强化: 资源管理 ==========
     
     def get_equipment_status(self, exam_type: str = None, location_id: str = None) -> List[Dict]:
         equipment_list = list(self.equipment.values())
@@ -1871,12 +2091,22 @@ class HospitalWorld:
                 self.doctor_pool[dept][best_doctor]['status'] = 'busy'
                 self.doctor_pool[dept][best_doctor]['current_patient'] = patient_id
                 self.doctor_pool[dept][best_doctor]['daily_patients'] += 1
+                # 添加日志
+                import logging
+                logger = logging.getLogger('hospital_agent.world')
+                logger.info(f"✅ [物理世界] 医生分配: {best_doctor} → 患者 {patient_id}（立即可用）")
                 return best_doctor, 0
             
             # 医生忙碌，加入队列（按优先级排序）
             queue_entry = QueueEntry(patient_id=patient_id, priority=priority, enqueue_time=self.current_time)
             self.doctor_pool[dept][best_doctor]['queue'].append(queue_entry)
             self.doctor_pool[dept][best_doctor]['queue'].sort()
+            
+            # 添加日志
+            import logging
+            logger = logging.getLogger('hospital_agent.world')
+            queue_len = len(self.doctor_pool[dept][best_doctor]['queue'])
+            logger.info(f"⏳ [物理世界] 医生忙碌: {best_doctor} 队列+1（当前队列{queue_len}人，预计等待{int(min_wait_time)}分钟）")
             
             return best_doctor, int(min_wait_time)
     
@@ -1918,9 +2148,20 @@ class HospitalWorld:
                         doctor_info['current_patient'] = next_entry.patient_id
                         doctor_info['daily_patients'] += 1
                         self.patient_doctor_map[next_entry.patient_id] = doctor_id
+                        
+                        # 添加日志
+                        import logging
+                        logger = logging.getLogger('hospital_agent.world')
+                        remaining = len(doctor_info['queue'])
+                        logger.info(f"🔄 [物理世界] 医生流转: {doctor_id} 完成 {patient_id}，接诊下一位 {next_entry.patient_id}（队列剩余{remaining}人）")
                     else:
                         # 无等待患者，医生变为空闲
                         doctor_info['status'] = 'available'
+                        
+                        # 添加日志
+                        import logging
+                        logger = logging.getLogger('hospital_agent.world')
+                        logger.info(f"✅ [物理世界] 医生空闲: {doctor_id} 完成 {patient_id}，无队列等待")
                     
                     return True
             
@@ -1989,13 +2230,33 @@ class HospitalWorld:
             if best_equipment is None:
                 return None, 0
             
+            # 检查设备是否已被该患者占用
+            if best_equipment.current_patient == patient_id:
+                # 设备已分配给该患者，无需重复分配
+                import logging
+                logger = logging.getLogger('hospital_agent.world')
+                logger.info(f"♻️  [物理世界] 设备复用: {best_equipment.name} 已被患者 {patient_id} 占用（可继续使用）")
+                return best_equipment.id, 0
+            
             # 如果设备空闲，直接分配
             if best_equipment.can_use(self.current_time):
                 best_equipment.start_exam(patient_id, self.current_time, priority)
+                
+                # 添加日志
+                import logging
+                logger = logging.getLogger('hospital_agent.world')
+                logger.info(f"✅ [物理世界] 设备分配: {best_equipment.name} → 患者 {patient_id}（立即可用）")
+                
                 return best_equipment.id, 0
             
             # 设备忙碌，加入队列
             best_equipment.add_to_queue(patient_id, priority, self.current_time)
+            
+            # 添加日志
+            import logging
+            logger = logging.getLogger('hospital_agent.world')
+            queue_len = len(best_equipment.queue)
+            logger.info(f"⏳ [物理世界] 设备忙碌: {best_equipment.name} 队列+1（当前队列{queue_len}人，预计等待{int(min_wait_time)}分钟）")
             
             return best_equipment.id, int(min_wait_time)
     

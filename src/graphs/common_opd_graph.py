@@ -21,12 +21,13 @@ from typing import Any, Callable
 
 from langgraph.graph import END, StateGraph
 
+from graphs.log_helpers import _log_node_start, _log_node_end, _log_detail, _log_physical_state
 from rag import ChromaRetriever
 from services.appointment import AppointmentService
 from services.billing import BillingService
 from services.llm_client import LLMClient
 from state.schema import BaseState, make_audit_entry
-from output_config import should_log, get_output_level, OutputFilter, SUPPRESS_UNCHECKED_LOGS
+from logging_utils import should_log, get_output_level, OutputFilter, SUPPRESS_UNCHECKED_LOGS
 from utils import (
     parse_json_with_retry,
     get_logger,
@@ -42,83 +43,6 @@ logger = get_logger("hospital_agent.graph")
 # 应用输出过滤器来抑制未被should_log包装的日志
 if SUPPRESS_UNCHECKED_LOGS:
     logger.addFilter(OutputFilter("common_opd_graph"))
-
-
-def _log_node_start(node_name: str, node_desc: str, state: BaseState):
-    """统一的节点开始日志输出"""
-    # 根据配置决定是否输出
-    if should_log(1, "common_opd_graph", node_name):
-        logger.info(f"{node_name}: {node_desc}")
-    
-    # 详细日志总是记录
-    detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
-    if detail_logger:
-        detail_logger.subsection(f"{node_name}: {node_desc}")
-
-
-def _log_node_end(node_name: str, state: BaseState):
-    """统一的节点结束日志输出"""
-    if should_log(1, "common_opd_graph", node_name):
-        logger.info(f"  ✅ {node_name}完成")
-
-
-def _log_detail(message: str, state: BaseState, level: int = 2, node_name: str = ""):
-    """记录详细信息（只在详细日志中）"""
-    # 终端只在高详细级别时输出
-    if should_log(level, "common_opd_graph", node_name):
-        logger.info(message)
-    
-    # 详细日志总是记录
-    detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
-    if detail_logger:
-        detail_logger.info(message)
-
-
-def _log_physical_state(state: BaseState, world: Any, node_name: str = "", level: int = 2):
-    """统一的物理环境状态显示函数
-    
-    Args:
-        state: 当前状态
-        world: 物理世界对象
-        node_name: 节点名称（用于日志标记）
-        level: 日志级别
-    """
-    if not world or not state.patient_id:
-        return
-    
-    detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
-    
-    # 同步物理状态
-    state.sync_physical_state()
-    
-    # 获取当前时间
-    current_time = world.current_time.strftime('%H:%M')
-    
-    # 获取当前位置
-    current_loc = state.current_location or world.get_agent_location(state.patient_id)
-    loc_name = world.get_location_name(current_loc) if current_loc else "未知位置"
-    
-    # 如果有dept_display_name属性，优先使用（用于诊室）
-    if hasattr(state, 'dept_display_name') and state.dept_display_name:
-        loc_name = state.dept_display_name
-    
-    # 输出物理环境信息
-    _log_detail(f"\n🏥 物理环境状态:", state, level, node_name)
-    _log_detail(f"  🕐 时间: {current_time}", state, level, node_name)
-    _log_detail(f"  📍 位置: {loc_name}", state, level, node_name)
-    
-    # 患者状态
-    if state.patient_id in world.physical_states:
-        ps = world.physical_states[state.patient_id]
-        _log_detail(f"  👤 患者: 体力{ps.energy_level:.1f}/10 | 疼痛{ps.pain_level:.1f}/10", state, level, node_name)
-    
-    # 医生状态（如果已分配医生）
-    if hasattr(state, 'assigned_doctor_id') and state.assigned_doctor_id:
-        if state.assigned_doctor_id in world.physical_states:
-            ds = world.physical_states[state.assigned_doctor_id]
-            efficiency = ds.get_work_efficiency() * 100
-            eff_icon = "🟢" if efficiency > 80 else ("🟡" if efficiency > 60 else "🔴")
-            _log_detail(f"  👨‍⚕️ 医生: 体力{ds.energy_level:.1f}/10 | 负荷{ds.work_load:.1f}/10 | 效率{efficiency:.0f}% {eff_icon}", state, level, node_name)
 
 
 
@@ -175,6 +99,95 @@ class CommonOPDGraph:
         self.lab_agent = lab_agent
         self.max_questions = max_questions
         self.world = world
+    
+    def _map_test_to_equipment_type(self, test_name: str, test_type: str) -> str:
+        """
+        映射检查项目名称到物理设备类型（神经内科专科配置）
+        
+        Args:
+            test_name: 检查项目名称（如"头颅CT"、"血常规"）
+            test_type: 检查类型（lab/imaging/exam等）
+            
+        Returns:
+            设备类型字符串，对应 hospital_world.py 中的 exam_type
+        """
+        test_lower = test_name.lower()
+        type_lower = test_type.lower()
+        
+        # ========== 影像检查设备 ==========
+        if any(keyword in test_lower for keyword in ["头颅ct", "颅脑ct", "ct头", "head ct", "头部ct"]):
+            return "ct_head"
+        if any(keyword in test_lower for keyword in ["脑mri", "颅脑mri", "mri脑", "brain mri", "头部mri", "mri头"]):
+            return "mri_brain"
+        
+        # ========== 神经电生理检查设备 ==========
+        if any(keyword in test_lower for keyword in ["脑电图", "eeg", "脑电", "脑波"]):
+            return "eeg"
+        if any(keyword in test_lower for keyword in ["肌电图", "emg", "神经传导", "肌电"]):
+            return "emg"
+        if any(keyword in test_lower for keyword in ["tcd", "经颅多普勒", "脑血流", "颅内多普勒"]):
+            return "tcd"
+        
+        # ========== 检验科检查设备（按检验项目分类）==========
+        # 血常规
+        if any(keyword in test_lower for keyword in ["血常规", "cbc", "血细胞", "血液常规", "全血细胞"]):
+            return "cbc"
+        
+        # 基础生化（肝肾功能、血糖、血脂等）
+        if any(keyword in test_lower for keyword in [
+            "生化", "肝功", "肾功", "血糖", "血脂", "尿酸", "肌酐", "尿素氮", 
+            "转氨酶", "胆红素", "白蛋白", "总蛋白", "甘油三酯", "胆固醇",
+            "biochem", "liver", "kidney", "glucose", "lipid"
+        ]):
+            return "biochem_basic"
+        
+        # 电解质
+        if any(keyword in test_lower for keyword in ["电解质", "钠", "钾", "氯", "钙", "镁", "electrolyte", "na+", "k+"]):
+            return "electrolyte"
+        
+        # 凝血功能
+        if any(keyword in test_lower for keyword in [
+            "凝血", "pt", "aptt", "inr", "d-二聚体", "纤维蛋白", 
+            "凝血酶原", "活化部分凝血活酶", "coagulation", "d-dimer"
+        ]):
+            return "coagulation"
+        
+        # 炎症/感染指标
+        if any(keyword in test_lower for keyword in [
+            "crp", "c反应蛋白", "降钙素原", "pct", "血沉", "esr", 
+            "炎症", "感染", "inflammation", "infection"
+        ]):
+            return "inflammation"
+        
+        # 心肌与血管风险指标（卒中相关）
+        if any(keyword in test_lower for keyword in [
+            "心肌酶", "肌钙蛋白", "troponin", "bnp", "nt-probnp", 
+            "同型半胱氨酸", "脂蛋白", "lp(a)", "homocysteine", 
+            "心脑血管", "卒中标志", "cardiac", "stroke marker"
+        ]):
+            return "cardiac_stroke_markers"
+        
+        # 自身免疫抗体
+        if any(keyword in test_lower for keyword in [
+            "自免", "抗体", "自身免疫", "ana", "抗核抗体", "抗神经", 
+            "抗磷脂", "autoimmune", "antibody", "抗nmda", "抗mog"
+        ]):
+            return "autoimmune_antibody"
+        
+        # ========== 默认映射（根据类型）==========
+        if type_lower == "lab":
+            # 默认检验项目使用基础生化设备（更通用，适合多种检验）
+            # 注：皮肤科、微生物检验等特殊项目也会使用此设备
+            logger.info(f"ℹ️  检查项目 '{test_name}' 使用通用检验设备 (biochem_basic)")
+            return "biochem_basic"
+        elif type_lower == "imaging":
+            # 默认影像检查使用CT
+            logger.info(f"ℹ️  影像检查 '{test_name}' 使用默认CT设备")
+            return "ct_head"
+        else:
+            # 完全未知的情况，使用基础生化设备作为后备
+            logger.warning(f"⚠️  未识别的检查项目 '{test_name}' (类型: {test_type})，默认使用通用检验设备 (biochem_basic)")
+            return "biochem_basic"
 
     def build(self):
         graph = StateGraph(BaseState)
@@ -348,15 +361,12 @@ class CommonOPDGraph:
             return state
 
         def c4_call_in(state: BaseState) -> BaseState:
-            if should_log(1, "common_opd_graph", "C4"):
-                logger.info("\n" + "="*60)
-                logger.info("🔔 C4: 叫号进诊")
-                logger.info("="*60)
+            """C4: 叫号进诊 - 叫号患者并分配医生"""
+            _log_node_start("C4", "叫号进诊", state)
             
             state.appointment = self.services.appointment.call_patient(state.appointment)
             
-            if should_log(1, "common_opd_graph", "C4"):
-                logger.info(f"✅ 叫号成功 - 状态: {state.appointment.get('status')}")
+            _log_detail(f"✅ 叫号成功 - 状态: {state.appointment.get('status')}", state, 2, "C4")
             
             # 【物理环境】将患者从候诊区移动到对应科室诊室
             if self.world and state.patient_id:
@@ -381,8 +391,7 @@ class CommonOPDGraph:
                 success, msg = self.world.move_agent(state.patient_id, target_clinic)
                 if success:
                     # 使用科室的真实名称而不是物理位置的名称
-                    if should_log(2, "common_opd_graph", "C4"):
-                        logger.info(f"  🚶 已从候诊区移动到{dept_display_name}")
+                    _log_detail(f"🚶 已从候诊区移动到{dept_display_name}", state, 2, "C4")
                     
                     # 更新状态中的位置信息
                     state.current_location = target_clinic
@@ -391,7 +400,7 @@ class CommonOPDGraph:
                     # 推进时间（叫号和入诊大约2分钟）
                     self.world.advance_time(minutes=2)
                 else:
-                    logger.warning(f"  ⚠️  患者移动失败: {msg}")
+                    _log_detail(f"⚠️  患者移动失败: {msg}", state, 2, "C4")
                 
                 # 【资源竞争】分配医生
                 if hasattr(state, 'assigned_doctor_id') and state.assigned_doctor_id:
@@ -404,15 +413,17 @@ class CommonOPDGraph:
                     if doctor_id:
                         state.assigned_doctor_id = doctor_id
                         if wait_time > 0:
-                            _log_detail(f"  ⏳ 医生忙碌，预计等待{wait_time}分钟", state, 2, "C4")
+                            _log_detail(f"⏳ 医生忙碌，预计等待{wait_time}分钟", state, 1, "C4")
+                            _log_detail(f"   患者已加入队列，等待医生 {doctor_id} 完成当前就诊", state, 2, "C4")
                             # 真实等待
                             success, msg = self.world.wait(state.patient_id, wait_time)
                             if success:
                                 state.sync_physical_state()
+                                _log_detail(f"✅ 等待完成，开始就诊", state, 2, "C4")
                         else:
-                            _log_detail(f"  ✅ 已分配医生: {doctor_id}", state, 2, "C4")
+                            _log_detail(f"✅ 医生空闲，立即分配: {doctor_id}", state, 1, "C4")
                     else:
-                        _log_detail(f"  ⚠️  暂无可用医生，加入候诊队列", state, 2, "C4")
+                        _log_detail(f"⚠️  暂无可用医生，加入候诊队列", state, 1, "C4")
             
             # 显示物理环境状态
             _log_physical_state(state, self.world, "C4", level=2)
@@ -426,8 +437,7 @@ class CommonOPDGraph:
                     chunks=[],
                 )
             )
-            if should_log(1, "common_opd_graph", "C4"):
-                logger.info("✅ C4节点完成\n")
+            _log_node_end("C4", state)
             return state
 
         def c5_prepare_intake(state: BaseState) -> BaseState:
@@ -778,31 +788,20 @@ class CommonOPDGraph:
                 _log_detail(f"\n🏥 开始{len(state.ordered_tests)}项检查的设备分配...", state, 2, "C10a")
                 total_wait_time = 0
                 
+                # 按设备类型去重：同一类型设备只分配一次
+                allocated_exam_types = set()  # 已分配的设备类型
+                
                 for test in state.ordered_tests:
-                    test_name = test.get("test_name", "")
-                    test_type = test.get("test_type", "lab")
+                    test_name = test.get("test_name", test.get("name", ""))
+                    test_type = test.get("test_type", test.get("type", "lab"))
                     
-                    # 映射检查类型到设备类型
-                    exam_type_map = {
-                        "blood": "blood_test",
-                        "urine": "blood_test",  # 简化，使用同一类设备
-                        "ct": "ct",
-                        "mri": "mri",
-                        "xray": "xray",
-                        "ultrasound": "ultrasound",
-                        "ecg": "ecg",
-                        "endoscopy": "endoscopy",
-                    }
+                    # 映射检查类型到设备类型（神经内科专科配置）
+                    exam_type = self._map_test_to_equipment_type(test_name, test_type)
                     
-                    # 尝试匹配设备类型
-                    exam_type = None
-                    for key in exam_type_map:
-                        if key in test_name.lower() or key in test_type.lower():
-                            exam_type = exam_type_map[key]
-                            break
-                    
-                    if not exam_type:
-                        exam_type = "blood_test"  # 默认
+                    # 如果该设备类型已分配，跳过（避免重复分配）
+                    if exam_type in allocated_exam_types:
+                        _log_detail(f"  ♻️  [{test_name}] 使用已分配的{exam_type}设备（批量检测）", state, 2, "C10a")
+                        continue
                     
                     # 请求设备
                     equipment_id, wait_time = self.world.request_equipment(
@@ -812,6 +811,7 @@ class CommonOPDGraph:
                     )
                     
                     if equipment_id:
+                        allocated_exam_types.add(exam_type)  # 记录已分配的设备类型
                         if wait_time > 0:
                             _log_detail(f"  ⏳ [{test_name}] 设备{equipment_id}忙碌，排队等待{wait_time}分钟", state, 2, "C10a")
                             total_wait_time += wait_time

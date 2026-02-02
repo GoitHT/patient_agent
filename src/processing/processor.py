@@ -19,9 +19,9 @@ from typing import Dict, List, Any, Optional
 from agents import PatientAgent, DoctorAgent, NurseAgent, LabAgent
 from environment import HospitalWorld
 from graphs.router import build_common_graph, build_dept_subgraphs, build_services
-from hospital_coordinator import HospitalCoordinator, PatientStatus
+from coordination import HospitalCoordinator, PatientStatus
 from loaders import load_diagnosis_arena_case
-from patient_detail_logger import create_patient_detail_logger, close_patient_detail_logger, get_patient_detail_logger
+from logging_utils import create_patient_detail_logger, close_patient_detail_logger, get_patient_detail_logger
 from rag import ChromaRetriever
 from services.llm_client import LLMClient
 from services.medical_record import MedicalRecordService
@@ -253,16 +253,27 @@ class LangGraphPatientExecutor:
             # 注入患者详细日志记录器到 state
             state.patient_detail_logger = self.detail_logger
             
-            # 创建病例
+            # 准备患者基本信息
             patient_profile = {
                 "name": state.case_data.get("name", f"患者{self.patient_id}"),
                 "age": state.case_data.get("age", 0),
                 "gender": state.case_data.get("gender", "未知"),
                 "case_id": self.case_id,
+                "dataset_id": state.case_data.get("dataset_id"),
+                "run_id": run_id,
             }
-            record_id = medical_record_integration.on_patient_entry(self.patient_id, patient_profile)
             
-            # 详细日志记录病例创建
+            # 获取已创建的病例（在 coordinator.register_patient 时已创建）
+            existing_record = self.medical_record_service.get_record(self.patient_id)
+            if existing_record:
+                record_id = existing_record.record_id
+                self.detail_logger.info(f"使用已创建的病例: {record_id}")
+            else:
+                # 容错：如果病例不存在（不应发生），则创建
+                record_id = medical_record_integration.on_patient_entry(self.patient_id, patient_profile)
+                self.detail_logger.warning(f"⚠️ 病例不存在，已创建新病例: {record_id}")
+            
+            # 详细日志记录病例信息
             self.detail_logger.info(f"病例已创建: {record_id}")
             self.detail_logger.info(f"患者信息: {patient_profile['name']}, {patient_profile['age']}岁, {patient_profile['gender']}")
             
@@ -343,6 +354,8 @@ class LangGraphPatientExecutor:
                 "age": state.case_data.get("age", 0),
                 "gender": state.case_data.get("gender", "未知"),
                 "case_id": self.case_id,
+                "dataset_id": state.case_data.get("dataset_id"),
+                "run_id": state.run_id,
             }
             
             # 注册患者到 coordinator
@@ -356,9 +369,17 @@ class LangGraphPatientExecutor:
             # 加入等候队列（这会触发自动分配）
             self.coordinator.enqueue_patient(self.patient_id)
             
+            # 显示队列状态
+            queue_size = self.coordinator.get_queue_size(triaged_dept)
+            available_doctors = len(self.coordinator.get_available_doctors(triaged_dept))
+            if queue_size > 0:
+                self.logger.info(f"{fg_color}📊 {patient_tag} {fg_color}| 队列状态: {queue_size}人候诊 | {available_doctors}名医生空闲{Colors.RESET}")
+            
             # 等待医生分配
             self.logger.info(f"{fg_color}⏳ {patient_tag} {fg_color}| 等待医生分配{Colors.RESET}")
             self.detail_logger.subsection("等待医生分配")
+            self.detail_logger.info(f"队列中位置: 第{queue_size}位")
+            self.detail_logger.info(f"可用医生数: {available_doctors}名")
             
             assigned_doctor_id = self._wait_for_doctor_assignment()
             
@@ -366,7 +387,7 @@ class LangGraphPatientExecutor:
                 raise Exception("医生分配超时")
             
             doctor = self.coordinator.get_doctor(assigned_doctor_id)
-            self.logger.info(f"{fg_color}  ✅ 医生: {doctor.name}{Colors.RESET}")
+            self.logger.info(f"{fg_color}✅ {patient_tag} {fg_color}| 分配医生: {doctor.name}{Colors.RESET}")
             
             self.detail_logger.info(f"分配医生: {doctor.name} (ID: {assigned_doctor_id})")
             self.detail_logger.info(f"医生科室: {doctor.dept}")
@@ -537,6 +558,13 @@ class LangGraphPatientExecutor:
             if hasattr(out, 'ordered_tests'):
                 test_coverage = "充分" if len(out.ordered_tests) >= 3 else "一般" if len(out.ordered_tests) >= 1 else "不足"
                 self.detail_logger.info(f"  • 检查覆盖: {test_coverage} ({len(out.ordered_tests)}项)")
+            
+            # 资源使用统计
+            session = self.coordinator.get_patient(self.patient_id)
+            if session and session.assigned_doctor:
+                doctor = self.coordinator.get_doctor(session.assigned_doctor)
+                if doctor:
+                    self.detail_logger.info(f"  • 接诊医生: {doctor.name} (今日第{doctor.total_patients_today}位患者)")
             self.detail_logger.info("")
             
             # 改进建议
@@ -551,9 +579,6 @@ class LangGraphPatientExecutor:
                 self.detail_logger.info("  ✅ 诊疗流程规范，质量良好")
             self.detail_logger.info("")
             
-            # 最后输出详细日志路径
-            self.logger.info(f"{fg_color}📋 详细日志: {self.detail_logger.get_log_file_path()}{Colors.RESET}")
-            
             return result
             
         except Exception as e:
@@ -567,7 +592,7 @@ class LangGraphPatientExecutor:
             try:
                 # 关闭患者详细日志记录器
                 if self.detail_logger:
-                    from patient_detail_logger import close_patient_detail_logger
+                    from logging_utils import close_patient_detail_logger
                     close_patient_detail_logger(self.patient_id)
                 
                 session = self.coordinator.get_patient(self.patient_id)

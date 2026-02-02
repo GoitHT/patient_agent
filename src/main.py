@@ -18,16 +18,16 @@ try:
 except ImportError:
     pass  # 如果没有安装 python-dotenv，跳过
 from environment import HospitalWorld, PhysicalState, InteractiveSession
-from langgraph_multi_patient_processor import LangGraphMultiPatientProcessor
+from processing import LangGraphMultiPatientProcessor
 from services.medical_record import MedicalRecordService
 from services.medical_record_integration import MedicalRecordIntegration
 from graphs.router import build_common_graph, build_dept_subgraphs, build_services, default_retriever
 from services.llm_client import build_llm_client
 from state.schema import BaseState
-from utils import make_run_id, get_logger, setup_dual_logging
+from utils import make_run_id, get_logger, setup_console_logging
 from config import Config
-from hospital_coordinator import HospitalCoordinator
-from output_config import should_log, get_output_level
+from coordination import HospitalCoordinator
+from logging_utils import should_log, get_output_level
 # 微服务集成层
 from integration import get_coordinator, get_medical_record_service
 
@@ -82,41 +82,23 @@ def _render_human_summary(state: BaseState) -> str:
 def main(
     config_file: Annotated[
         Optional[Path],
-        typer.Option("--config", help="配置文件路径 (默认: config.yaml)"),
-    ] = None,
-    dataset_id: Annotated[
-        Optional[int],
-        typer.Option("--dataset-id", help="病例ID (快速覆盖配置文件中的值)"),
+        typer.Option("--config", help="配置文件路径 (默认: src/config.yaml)"),
     ] = None,
 ) -> None:
     """Hospital Agent System - 三智能体医疗诊断系统
     
-    主要配置请在 config.yaml 中修改
-    命令行参数优先级: CLI > 环境变量 > config.yaml > 默认值
+    所有配置请在 config.yaml 中修改
+    配置优先级: CLI --config > 环境变量 > config.yaml > 默认值
     """
-    # 先加载配置以获取日志设置
-    from types import SimpleNamespace
-    temp_args = SimpleNamespace(
-        config=config_file,
-        dataset_id=dataset_id,
-    )
-    config = Config.load(config_file=temp_args.config, cli_args=temp_args)
-    
-    # 从配置读取日志设置
-    log_file = config.system.log_file
-    if log_file is None:
-        log_dir = Path("logs")
-        log_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = str(log_dir / f"hospital_agent_{timestamp}.log")
+    # 加载配置
+    config = Config.load(config_file=config_file)
     
     verbose = config.system.verbose
     
     # 设置日志级别：verbose模式显示所有日志（DEBUG），否则显示INFO及以上
-    # 注意：所有print已改为logger.info，默认在终端显示
     import logging
     console_level = logging.DEBUG if verbose else logging.INFO
-    setup_dual_logging(log_file=log_file, console_level=console_level)
+    setup_console_logging(console_level=console_level)
     
     # 抑制第三方库的冗余警告日志
     logging.getLogger("urllib3").setLevel(logging.ERROR)  # 抑制SSL重试警告
@@ -129,27 +111,30 @@ def main(
     logger.info("="*80)
     
     logger.info("启动系统 ")
-    logger.info(f"📝 日志输出到: {log_file}")
     
     # 显示关键配置信息
     logger.info(f"\n⚙️  核心配置:")
     logger.info(f"  • 医生问诊配额: {config.agent.max_questions} 个问题")
     logger.info(f"  • 护士分诊问题: {config.agent.max_triage_questions} 个问题")
     logger.info(f"  • LLM后端: {config.llm.backend}")
-    logger.info(f"  • 病例数据集: {'本地缓存' if config.dataset.use_local_cache else 'HuggingFace'}")
     logger.info("")
     
-    # 判断运行模式
+    # 统一使用多患者模式（num_patients=1时等同于单体模式）
     if config.mode.multi_patient:
-        logger.info("🏥 启动多患者多医生模式 (LangGraph 集成)")
-        logger.info("="*80)
-        
         # 从config读取参数（CLI参数优先）
         _num_patients = config.mode.num_patients
         _patient_interval = config.mode.patient_interval
         
+        # 判断是单患者还是多患者
+        if _num_patients == 1:
+            logger.info("🏥 启动单患者模式 (基于多患者架构)")
+        else:
+            logger.info(f"🏥 启动多患者并发模式 ({_num_patients}名患者)")
+        
+        logger.info("="*80)
         logger.info(f"患者数量: {_num_patients}")
-        logger.info(f"患者进入间隔: {_patient_interval} 秒")
+        if _num_patients > 1:
+            logger.info(f"患者进入间隔: {_patient_interval} 秒")
         logger.info("="*80 + "\n")
         
         # 初始化 LLM
@@ -242,7 +227,7 @@ def main(
         logger.info("📚 检查可用的真实病例数量...")
         try:
             from loaders import _get_dataset_size
-            max_case_id = _get_dataset_size(config.dataset.cache_dir if config.dataset.use_local_cache else None)
+            max_case_id = _get_dataset_size(None)
             logger.info(f"  ✅ 数据集包含 {max_case_id} 个病例\n")
         except Exception as e:
             logger.warning(f"  ⚠️ 无法获取数据集大小，使用默认范围: {e}")
@@ -255,8 +240,13 @@ def main(
         selected_case_ids = available_case_ids[:_num_patients]
         
         # 使用 threading.Timer 模拟患者按时间间隔到来，每个患者到来时立即启动独立线程
-        interval_display = f"{_patient_interval} 秒" if _patient_interval < 60 else f"{_patient_interval/60:.1f} 分钟"
-        logger.info(f"⏰ 患者将每隔 {interval_display} 进入系统（每个患者启动独立线程，竞争共享资源）\n")
+        if _num_patients == 1:
+            # 单患者模式：简化描述，不显示间隔信息
+            logger.info(f"🏥 准备就诊流程...\n")
+        else:
+            # 多患者模式：显示详细的间隔和并发信息
+            interval_display = f"{_patient_interval} 秒" if _patient_interval < 60 else f"{_patient_interval/60:.1f} 分钟"
+            logger.info(f"⏰ 患者将每隔 {interval_display} 进入系统（每个患者启动独立线程，竞争共享资源）\n")
         logger.info("="*80)
         
         # 定义优先级计算函数
@@ -340,7 +330,12 @@ def main(
             priority_icon = "🚨" if priority >= 9 else "⚠️" if priority >= 7 else "📋"
             
             logger.info(f"\n{color}{'='*80}{COLOR_RESET}")
-            logger.info(format_patient_log(patient_id, f"🚶 患者 {i+1}/{total_patients} 到达医院 [{current_time}]", i))
+            if total_patients == 1:
+                # 单患者模式：简化显示
+                logger.info(format_patient_log(patient_id, f"🚶 患者到达医院 [{current_time}]", i))
+            else:
+                # 多患者模式：显示序号
+                logger.info(format_patient_log(patient_id, f"🚶 患者 {i+1}/{total_patients} 到达医院 [{current_time}]", i))
             logger.info(format_patient_log(patient_id, f"{priority_icon} 数据集索引={dataset_index}, 原始ID={original_case_id}, 优先级={priority}/10", i))
             # 显示主诉摘要（前50个字符）
             chief_complaint_short = chief_complaint[:50] + "..." if len(chief_complaint) > 50 else chief_complaint
@@ -356,7 +351,12 @@ def main(
             )
             task_ids.append(task_id)
             
-            logger.info(format_patient_log(patient_id, f"✅ 线程已启动，开始竞争资源", i))
+            if total_patients == 1:
+                # 单患者模式：简化显示
+                logger.info(format_patient_log(patient_id, f"✅ 开始就诊流程", i))
+            else:
+                # 多患者模式：强调并发竞争
+                logger.info(format_patient_log(patient_id, f"✅ 线程已启动，开始竞争资源", i))
         
         # 为每个患者创建定时器，按指定间隔触发
         for i, case_id in enumerate(selected_case_ids):
@@ -373,9 +373,16 @@ def main(
         for timer in timers:
             timer.join()
         
-        logger.info("\n" + "="*80)
-        logger.info(f"✅ 所有 {len(selected_case_ids)} 名患者已到达，各自线程正在并发执行")
-        logger.info("="*80 + "\n")
+        if _num_patients == 1:
+            # 单患者模式：简化显示
+            logger.info("\n" + "="*80)
+            logger.info(f"✅ 患者已到达，开始就诊")
+            logger.info("="*80 + "\n")
+        else:
+            # 多患者模式：强调并发
+            logger.info("\n" + "="*80)
+            logger.info(f"✅ 所有 {len(selected_case_ids)} 名患者已到达，各自线程正在并发执行")
+            logger.info("="*80 + "\n")
         
         # 启动状态监控线程
         monitoring_active = threading.Event()
@@ -456,7 +463,10 @@ def main(
         monitor_thread.start()
         
         # 等待所有任务完成
-        logger.info("\n⏳ 等待所有患者完成 LangGraph 诊断流程...")
+        if _num_patients == 1:
+            logger.info("\n⏳ 等待患者完成诊断流程...")
+        else:
+            logger.info("\n⏳ 等待所有患者完成 LangGraph 诊断流程...")
         if should_log(2, "main", "monitor"):
             logger.info("💡 提示: 系统每30秒显示一次实时状态（详细模式）")
         else:
@@ -471,7 +481,10 @@ def main(
         
         # 打印结果 - 使用表格格式
         logger.info("\n" + "="*80)
-        logger.info("📊 LangGraph 多患者诊断结果")
+        if _num_patients == 1:
+            logger.info("📊 诊断结果")
+        else:
+            logger.info("📊 LangGraph 多患者诊断结果")
         logger.info("="*80 + "\n")
         
         success_count = 0
@@ -512,28 +525,26 @@ def main(
         logger.info("\n" + "="*80)
         logger.info("📈 最终统计")
         logger.info("="*80)
-        logger.info(f"✅ 成功: {success_count}/{len(results)}")
-        logger.info(f"❌ 失败: {failed_count}/{len(results)}")
-        logger.info(f"📊 总计: {len(results)} 名患者")
+        if _num_patients == 1:
+            # 单患者模式：简化统计
+            logger.info(f"✅ 诊断状态: {'成功' if success_count == 1 else '失败'}")
+        else:
+            # 多患者模式：详细统计
+            logger.info(f"✅ 成功: {success_count}/{len(results)}")
+            logger.info(f"❌ 失败: {failed_count}/{len(results)}")
+            logger.info(f"📊 总计: {len(results)} 名患者")
         
-        # 保存结果到文件
-        results_dir = Path("results")
-        results_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_file = results_dir / f"multi_patient_results_{timestamp}.json"
+        # 集中输出所有日志文件路径
+        logger.info("\n" + "="*80)
+        logger.info("📄 输出文件汇总")
+        logger.info("="*80)
         
-        import json
-        with open(results_file, "w", encoding="utf-8") as f:
-            json.dump({
-                "timestamp": timestamp,
-                "total_patients": len(results),
-                "success_count": success_count,
-                "failed_count": failed_count,
-                "results": results
-            }, f, ensure_ascii=False, indent=2)
-        
-        logger.info(f"\n📁 结果已保存到: {results_file}")
-        logger.info(f"📝 详细日志已保存到: {log_file}")
+        # 输出每个患者的详细日志
+        logger.info("\n📋 患者详细日志:")
+        patient_logs = sorted(Path("logs/patients").glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
+        # 只显示本次运行的日志（最近的N个，N为患者数）
+        for log_path in patient_logs[:len(results)]:
+            logger.info(f"  • {log_path}")
         
         # 关闭处理器
         logger.info("\n" + "="*80)
@@ -541,49 +552,37 @@ def main(
         logger.info("="*80)
         processor.shutdown()
         
-        logger.info("\n✅ LangGraph 多患者模式执行完毕\n")
+        logger.info("\n✅ 多患者模式执行完毕\n")
         
         return
     
-    # 单病例处理模式 - 先加载配置获取默认dataset_id
-    from types import SimpleNamespace
-    temp_args = SimpleNamespace(
-        config=config_file,
-        dataset_id=dataset_id,
-    )
-    temp_config = Config.load(config_file=temp_args.config, cli_args=temp_args)
-    
-    # 使用配置中的dataset_id（如果命令行未指定）
-    final_dataset_id = dataset_id if dataset_id is not None else temp_config.dataset.dataset_id
-    
-    if final_dataset_id is None:
-        logger.info("❌ 错误: 请指定 --dataset-id 或在配置文件中设置 dataset_id，或使用 --batch 模式")
-        logger.error("未指定dataset_id且配置文件中也没有默认值")
+    # ========================================================================
+    # 注意：单体模式已统一到多患者架构中
+    # 只需在 config.yaml 中设置：
+    #   mode:
+    #     multi_patient: true
+    #     num_patients: 1        # 1个患者 = 单体模式
+    #     patient_interval: 0    # 立即开始
+    # ========================================================================
+    else:
+        logger.error("=" * 80)
+        logger.error("⚠️  配置错误：multi_patient 已设为 false")
+        logger.error("=" * 80)
+        logger.error("系统已统一使用多患者架构（更稳定、功能完整）")
+        logger.error("")
+        logger.error("💡 单患者模式请设置：")
+        logger.error("   mode:")
+        logger.error("     multi_patient: true")
+        logger.error("     num_patients: 1        # 1个患者 = 单体模式")
+        logger.error("     patient_interval: 0    # 立即开始")
+        logger.error("")
+        logger.error("💡 多患者并发模式请设置：")
+        logger.error("   mode:")
+        logger.error("     multi_patient: true")
+        logger.error("     num_patients: 3        # 3个患者并发")
+        logger.error("     patient_interval: 60   # 每60秒进入1个")
+        logger.error("=" * 80)
         return
-    
-    logger.info(f"📋 单病例处理模式: 病例 {final_dataset_id}")
-    
-    # 调用单病例处理函数
-    result = process_single_case(
-        case_id=final_dataset_id,
-        config_file=config_file,
-        llm=None,  # 在 process_single_case 中从配置初始化
-        max_questions=None,  # 使用配置文件中的值
-        seed=None,  # 使用配置文件中的值
-        llm_reports=False,  # 使用配置文件中的值
-        save_trace=None,  # 使用配置文件中的值
-        persist=None,  # 使用配置文件中的值
-        collection=None,  # 使用配置文件中的值
-        physical_sim=True,  # 默认启用物理模拟
-        interactive=False,  # 默认非交互模式
-        skip_rag=True,  # 使用配置文件中的值
-        verbose=verbose,
-    )
-    
-    logger.info("\n" + "="*80)
-    logger.info(f"📝 详细日志已保存到: {log_file}")
-    logger.info("✅ 程序执行完毕")
-    logger.info("="*80 + "\n")
 
 
 def process_single_case(
@@ -591,7 +590,6 @@ def process_single_case(
     config_file: Optional[Path] = None,
     llm: Optional[str] = None,
     max_questions: Optional[int] = None,
-    seed: Optional[int] = None,
     llm_reports: bool = False,
     save_trace: Optional[Path] = None,
     persist: Optional[Path] = None,
@@ -617,7 +615,6 @@ def process_single_case(
         dataset_id=case_id,
         llm=llm,
         max_questions=max_questions,
-        seed=seed,
         llm_reports=llm_reports,
         save_trace=save_trace,
         persist=persist,
@@ -634,10 +631,9 @@ def process_single_case(
     
     # 从数据集加载病例
     logger.info("📚 加载病例数据...")
-    logger.info(f"  🔢 数据集索引: {config.dataset.dataset_id}")
     
     # 从Excel文件加载患者数据（默认: patient_text.xlsx）
-    case_bundle = load_diagnosis_arena_case(config.dataset.dataset_id)
+    case_bundle = load_diagnosis_arena_case(case_id)
     known_case = case_bundle["known_case"]
     ground_truth = case_bundle["ground_truth"]
     
@@ -738,17 +734,15 @@ def process_single_case(
     retriever = None
     if not skip_rag:
         try:
-            logger.info(f"\n📂 初始化知识库检索器 (集合名: {config.rag.collection_name})...")
+            logger.info(f"\n📂 初始化知识库...")
             retriever = default_retriever(persist_dir=config.rag.persist_dir, collection_name=config.rag.collection_name)
-            logger.info("  ✅ 知识库检索器初始化成功")
+            logger.info("  ✅ 知识库初始化完成")
         except Exception as e:  # noqa: BLE001
-            logger.info(f"❌ 知识库检索器初始化失败：{e}")
-            logger.info("   请先运行知识库构建脚本")
-            logger.error(f"知识库检索器初始化失败：{e}")
+            logger.error(f"❌ 知识库初始化失败：{e}")
             raise
     else:
         from rag import DummyRetriever
-        logger.info("\n⏭️ 跳过知识库检索器初始化（使用虚拟检索器）")
+        logger.info("\n⏭️ 跳过知识库初始化")
         retriever = DummyRetriever()
 
     logger.info("\n⚙️ 初始化服务组件...")
@@ -770,7 +764,6 @@ def process_single_case(
         "name": state.case_data.get("name", "患者"),
         "age": state.case_data.get("age", 0),
         "gender": state.case_data.get("gender", "未知"),
-        "dataset_id": config.dataset.dataset_id,
     }
     record_id = medical_record_integration.on_patient_entry(patient_id, patient_profile)
     logger.info(f"  ✅ 病例已创建: {record_id}")

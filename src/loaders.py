@@ -171,17 +171,20 @@ def get_cache_info() -> dict[str, Any]:
     }
 
 
-def _get_dataset_size(excel_path: str | Path = DEFAULT_EXCEL_PATH) -> int:
+def _get_dataset_size(excel_path: str | Path | None = None) -> int:
     """
     获取数据集大小（患者数量）
     
     Args:
-        excel_path: Excel文件路径
+        excel_path: Excel文件路径，None表示使用默认路径
     
     Returns:
         数据集中的患者数量
     """
     try:
+        # 如果传入None，使用默认路径
+        if excel_path is None:
+            excel_path = DEFAULT_EXCEL_PATH
         df = _load_excel_data(excel_path)
         return len(df)
     except Exception as e:

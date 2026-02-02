@@ -1,13 +1,13 @@
 """
-数据库模型定义 - 简化版5表结构
-Database Models - Simplified 5-table structure for medical records
+数据库模型定义 - 3表结构（以门诊号为主线）
+Database Models - 3-table structure based on outpatient_no
 """
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, String, Integer, DateTime, Text, Boolean, JSON, ForeignKey, Index
+from sqlalchemy import Column, String, Integer, DateTime, Date, Text, Boolean, JSON, ForeignKey, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
@@ -15,10 +15,11 @@ Base = declarative_base()
 
 
 class Patient(Base):
-    """患者信息表"""
+    """患者基本信息表 - 以门诊号为主键"""
     __tablename__ = 'patients'
     
-    patient_id = Column(String(50), primary_key=True)
+    outpatient_no = Column(String(50), primary_key=True)  # 门诊号（业务主键）
+    patient_id = Column(String(50))  # 患者唯一ID（可跨门诊）
     name = Column(String(100))
     age = Column(Integer)
     gender = Column(String(10))
@@ -27,177 +28,110 @@ class Patient(Base):
     created_at = Column(DateTime, default=datetime.now)
     
     # 关系
-    medical_records = relationship("MedicalRecord", back_populates="patient")
+    medical_cases = relationship("MedicalCase", back_populates="patient")
+    examinations = relationship("Examination", back_populates="patient")
     
     # 索引
     __table_args__ = (
+        Index('idx_patient_id', 'patient_id'),
         Index('idx_name', 'name'),
         Index('idx_phone', 'phone'),
     )
 
 
-class MedicalRecord(Base):
-    """病历主表 - 合并主诉、分诊、诊断、治疗"""
-    __tablename__ = 'medical_records'
+class MedicalCase(Base):
+    """病例表 - 完整就诊过程（集成医生问诊和系统日志）"""
+    __tablename__ = 'medical_cases'
     
-    record_id = Column(String(50), primary_key=True)
-    patient_id = Column(String(50), ForeignKey('patients.patient_id'), nullable=False)
-    visit_date = Column(DateTime, nullable=False, default=datetime.now)
+    case_id = Column(String(50), primary_key=True)
+    outpatient_no = Column(String(50), ForeignKey('patients.outpatient_no'), nullable=False)
     
-    # 分诊信息
+    # 就诊基本信息
+    visit_date = Column(Date, nullable=False, default=datetime.now)
     dept = Column(String(50))
-    dept_display_name = Column(String(100))
-    triage_priority = Column(Integer, default=5)
-    triage_reason = Column(Text)
     
-    # 主诉与症状
+    # 主诉与现病史
     chief_complaint = Column(Text)
-    original_complaint = Column(Text)
+    present_illness = Column(Text)
     
-    # 诊断信息
+    # 医生问诊记录（JSON集中存储）
+    doctor_qa_records = Column(JSON)  # [{question_order, question, answer, asked_at}...]
+    
+    # 诊断信息（已删除 diagnosis_code）
     diagnosis_name = Column(String(200))
-    diagnosis_code = Column(String(50))
-    diagnosis_reasoning = Column(Text)
-    differential_diagnoses = Column(JSON)  # 鉴别诊断列表
+    diagnosis_reason = Column(Text)  # 诊断依据/推理过程
     
-    # 治疗方案
+    # 治疗与处置
     treatment_plan = Column(Text)
     medications = Column(JSON)  # [{name, dosage, frequency}...]
-    precautions = Column(Text)
+    medical_advice = Column(Text)
     
-    # 随访
+    # 随访与转归
     followup_plan = Column(Text)
-    followup_date = Column(DateTime)
+    followup_date = Column(Date)
+    outcome = Column(String(50))
     
-    # 状态与元数据
-    status = Column(String(20), default='ongoing')  # ongoing/completed/cancelled
+    # 状态
+    status = Column(String(20), default='ongoing')  # ongoing/completed
+    
+    # 统一日志与过程记录（JSON集中存储）
+    case_logs = Column(JSON)  # [{log_time, log_type, entity_id, entity_type, log_data}...]
+    
+    # 元数据
     run_id = Column(String(100))
     dataset_id = Column(Integer)
     original_case_id = Column(String(50))
     
-    # 物理环境数据（JSON存储）
-    physical_info = Column(JSON)  # {start_time, end_time, total_minutes, energy_change...}
-    
+    # 时间
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # 关系
-    patient = relationship("Patient", back_populates="medical_records")
-    consultations = relationship("Consultation", back_populates="medical_record", cascade="all, delete-orphan")
-    examinations = relationship("Examination", back_populates="medical_record", cascade="all, delete-orphan")
-    system_logs = relationship("SystemLog", back_populates="medical_record", cascade="all, delete-orphan")
+    patient = relationship("Patient", back_populates="medical_cases")
+    examinations = relationship("Examination", back_populates="medical_case", cascade="all, delete-orphan")
     
     # 索引
     __table_args__ = (
-        Index('idx_patient', 'patient_id'),
+        Index('idx_outpatient_no', 'outpatient_no'),
         Index('idx_visit_date', 'visit_date'),
         Index('idx_dept', 'dept'),
         Index('idx_status', 'status'),
-        Index('idx_patient_visit', 'patient_id', 'visit_date'),
-    )
-
-
-class Consultation(Base):
-    """问诊与交互记录表 - 合并问诊QA、分诊对话、医患交互"""
-    __tablename__ = 'consultations'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    record_id = Column(String(50), ForeignKey('medical_records.record_id'), nullable=False)
-    
-    # 交互类型：triage(分诊), doctor_qa(医生问诊), nurse_qa(护士问诊)
-    interaction_type = Column(String(20))
-    
-    # 参与者
-    staff_id = Column(String(50))  # doctor_id/nurse_id
-    staff_role = Column(String(20))  # doctor/nurse
-    
-    # 对话内容
-    question_order = Column(Integer)
-    question = Column(Text)
-    answer = Column(Text)
-    
-    # 元数据
-    node_name = Column(String(50))
-    asked_at = Column(DateTime, default=datetime.now)
-    
-    # 关系
-    medical_record = relationship("MedicalRecord", back_populates="consultations")
-    
-    # 索引
-    __table_args__ = (
-        Index('idx_record', 'record_id'),
-        Index('idx_type', 'interaction_type'),
-        Index('idx_staff', 'staff_id'),
     )
 
 
 class Examination(Base):
-    """检查检验表 - 合并检查申请和结果"""
+    """检查项目表 - 直接关联门诊号"""
     __tablename__ = 'examinations'
     
-    exam_id = Column(String(50), primary_key=True)
-    record_id = Column(String(50), ForeignKey('medical_records.record_id'), nullable=False)
+    exam_id = Column(String(100), primary_key=True)
+    outpatient_no = Column(String(50), ForeignKey('patients.outpatient_no'), nullable=False)
+    case_id = Column(String(50), ForeignKey('medical_cases.case_id'), nullable=True)  # 可选关联
     
     # 检查基本信息
     exam_name = Column(String(200))
-    exam_type = Column(String(50))  # lab/imaging/functional/endoscopy
-    category = Column(String(100))
+    exam_type = Column(String(50))  # lab/imaging/functional
     
-    # 申请信息
-    ordered_by = Column(String(50))
+    # 时间
     ordered_at = Column(DateTime, default=datetime.now)
-    priority = Column(Integer, default=5)
+    reported_at = Column(DateTime)
     
     # 结果信息
     result_text = Column(Text)
     summary = Column(Text)
     is_abnormal = Column(Boolean, default=False)
     key_findings = Column(JSON)  # ["发现1", "发现2"...]
-    clinical_significance = Column(Text)
-    source = Column(String(50))  # dataset/llm_generated
     
     # 状态
     status = Column(String(20), default='pending')  # pending/completed/cancelled
-    reported_at = Column(DateTime)
     
     # 关系
-    medical_record = relationship("MedicalRecord", back_populates="examinations")
+    patient = relationship("Patient", back_populates="examinations")
+    medical_case = relationship("MedicalCase", back_populates="examinations")
     
     # 索引
     __table_args__ = (
-        Index('idx_record', 'record_id'),
+        Index('idx_outpatient_no', 'outpatient_no'),
+        Index('idx_case_id', 'case_id'),
         Index('idx_status', 'status'),
         Index('idx_type', 'exam_type'),
-    )
-
-
-class SystemLog(Base):
-    """系统日志表 - 合并审计日志、物理状态、转诊记录"""
-    __tablename__ = 'system_logs'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    record_id = Column(String(50), ForeignKey('medical_records.record_id'), nullable=True)
-    
-    # 日志类型：audit(审计), physical(物理状态), referral(转诊), event(事件)
-    log_type = Column(String(20))
-    
-    # 基本信息
-    entity_id = Column(String(50))  # patient_id/doctor_id/nurse_id
-    entity_type = Column(String(20))  # patient/doctor/nurse/system
-    
-    # 日志内容（JSON灵活存储）
-    log_data = Column(JSON)
-    
-    # 时间戳
-    log_time = Column(DateTime, default=datetime.now)
-    
-    # 关系
-    medical_record = relationship("MedicalRecord", back_populates="system_logs")
-    
-    # 索引
-    __table_args__ = (
-        Index('idx_record', 'record_id'),
-        Index('idx_type', 'log_type'),
-        Index('idx_entity', 'entity_id'),
-        Index('idx_time', 'log_time'),
     )

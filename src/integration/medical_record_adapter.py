@@ -39,8 +39,7 @@ def get_medical_record_service(
         return DatabaseMedicalRecordService(
             connection_string=config.database.connection_string,
             storage_dir=storage_dir,
-            backup_to_file=config.database.backup_to_file,
-            echo=config.database.echo
+            backup_to_file=config.database.backup_to_file
         )
     
     elif config.microservices.enabled:

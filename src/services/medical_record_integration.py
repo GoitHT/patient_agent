@@ -6,7 +6,9 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Any, TYPE_CHECKING
 
-from utils import now_iso
+from utils import now_iso, get_logger
+
+logger = get_logger("hospital_agent.medical_record_integration")
 
 if TYPE_CHECKING:
     from environment import HospitalWorld
@@ -118,10 +120,24 @@ class MedicalRecordIntegration:
         """
         patient_id = state.patient_id
         
-        # 提取对话记录
+        # 提取对话记录（兼容两种键名）
         conversation = []
-        if "doctor_patient" in state.agent_interactions:
+        qa_pairs = None
+        
+        # 优先使用 doctor_patient_qa（新版本）
+        if "doctor_patient_qa" in state.agent_interactions:
+            qa_pairs = state.agent_interactions["doctor_patient_qa"]
+            logger.info(f"📝 [Integration] 从agent_interactions['doctor_patient_qa']提取到 {len(qa_pairs)} 轮问诊对话")
+        # 兼容旧版本的 doctor_patient 键名
+        elif "doctor_patient" in state.agent_interactions:
             qa_pairs = state.agent_interactions["doctor_patient"]
+            logger.info(f"📝 [Integration] 从agent_interactions['doctor_patient']提取到 {len(qa_pairs)} 轮问诊对话")
+        else:
+            logger.warning(f"⚠️ [Integration] state.agent_interactions 中没有问诊对话键")
+            logger.debug(f"agent_interactions keys: {list(state.agent_interactions.keys())}")
+        
+        # 转换为conversation格式
+        if qa_pairs:
             for qa in qa_pairs:
                 conversation.append({
                     "role": "doctor",
@@ -132,15 +148,19 @@ class MedicalRecordIntegration:
                     "content": qa.get("answer", "")
                 })
         
-        # 记录问诊
-        self.mrs.add_consultation(
-            patient_id=patient_id,
-            doctor_id=doctor_id,
-            conversation=conversation,
-            history=state.history,
-            exam_findings=state.exam_findings,
-            location=state.dept
-        )
+        # 记录问诊（只有对话不为空时才保存）
+        if conversation:
+            logger.info(f"💾 [Integration] 准备保存 {len(conversation)} 条对话记录到数据库")
+            self.mrs.add_consultation(
+                patient_id=patient_id,
+                doctor_id=doctor_id,
+                conversation=conversation,
+                history=state.history,
+                exam_findings=state.exam_findings,
+                location=state.dept
+            )
+        else:
+            logger.warning(f"⚠️ [Integration] 患者 {patient_id} 问诊对话为空，跳过保存")
         
         # 更新位置
         dept_location = self._map_dept_to_location(state.dept)

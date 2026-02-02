@@ -26,6 +26,51 @@ def _extract_json_object(text: str) -> str | None:
     return text[start : end + 1]
 
 
+def _clean_json_string(text: str) -> str:
+    """清理JSON字符串中的问题字符，确保可以正确解析"""
+    if not text:
+        return text
+    
+    # 移除BOM标记
+    text = text.replace('\ufeff', '')
+    
+    # 处理字符串字段中的换行符：将实际换行符替换为\n转义序列
+    # 这个正则查找 JSON 字符串值中的换行符（不在键名中）
+    result = []
+    in_string = False
+    escape_next = False
+    
+    for i, char in enumerate(text):
+        if escape_next:
+            result.append(char)
+            escape_next = False
+            continue
+            
+        if char == '\\':
+            result.append(char)
+            escape_next = True
+            continue
+            
+        if char == '"':
+            in_string = not in_string
+            result.append(char)
+            continue
+        
+        # 如果在字符串中且遇到换行符，转义它
+        if in_string and char in ('\n', '\r'):
+            if char == '\n':
+                result.append('\\n')
+            elif char == '\r':
+                # 检查是否是\r\n，如果是则跳过\r
+                if i + 1 < len(text) and text[i + 1] == '\n':
+                    continue
+                result.append('\\n')
+        else:
+            result.append(char)
+    
+    return ''.join(result)
+
+
 def parse_json_with_retry(
     text: str,
     *,
@@ -40,6 +85,9 @@ def parse_json_with_retry(
     logger = logging.getLogger("hospital_agent.utils")
     last_err: Exception | None = None
     candidate = (text or "").strip()
+    
+    # 首先清理JSON字符串
+    candidate = _clean_json_string(candidate)
     
     for attempt in range(max_attempts):
         try:
@@ -209,24 +257,13 @@ class ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 
-def setup_dual_logging(log_file: str = "hospital_agent.log", console_level: int = logging.WARNING) -> None:
-    """设置双通道日志系统：详细日志到文件，简洁日志到终端"""
+def setup_console_logging(console_level: int = logging.INFO) -> None:
+    """设置终端日志系统：仅输出到控制台"""
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
     root_logger.handlers.clear()
     
-    # 文件处理器 - 记录所有详细信息
-    log_path = Path(log_file)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    file_handler.setFormatter(file_formatter)
-    
-    # 终端处理器 - 只显示重要信息
+    # 终端处理器 - 显示重要信息
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(console_level)
     console_formatter = ColoredFormatter(
@@ -235,8 +272,13 @@ def setup_dual_logging(log_file: str = "hospital_agent.log", console_level: int 
     )
     console_handler.setFormatter(console_formatter)
     
-    root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
+
+
+# 保留旧函数名作为别名，以保持向后兼容性
+def setup_dual_logging(log_file: str = "hospital_agent.log", console_level: int = logging.WARNING) -> None:
+    """已弃用：使用setup_console_logging代替"""
+    setup_console_logging(console_level=console_level)
 
 
 def get_logger(name: str = "hospital_agent") -> logging.Logger:

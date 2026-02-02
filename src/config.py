@@ -31,14 +31,6 @@ class AgentConfig:
 
 
 @dataclass
-class DatasetConfig:
-    """数据集配置"""
-    dataset_id: int = 68
-    cache_dir: Path = field(default_factory=lambda: Path("./diagnosis_dataset"))
-    use_local_cache: bool = True
-
-
-@dataclass
 class RAGConfig:
     """RAG配置"""
     persist_dir: Path = field(default_factory=lambda: Path(".chroma"))
@@ -50,8 +42,8 @@ class RAGConfig:
 class ModeConfig:
     """运行模式配置"""
     multi_patient: bool = True
-    num_patients: int = 3
-    patient_interval: int = 60
+    num_patients: int = 1
+    patient_interval: int = 0
 
 
 @dataclass
@@ -87,7 +79,6 @@ class DatabaseConfig:
     enabled: bool = False
     connection_string: str = "mysql+pymysql://root:password@localhost:3306/hospital_db?charset=utf8mb4"
     backup_to_file: bool = True
-    echo: bool = False
 
 
 @dataclass
@@ -95,7 +86,6 @@ class Config:
     """主配置类"""
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
     mode: ModeConfig = field(default_factory=ModeConfig)
     physical: PhysicalConfig = field(default_factory=PhysicalConfig)
@@ -155,16 +145,6 @@ class Config:
                     self.agent.max_questions = agent_data["max_questions"]
                 if "max_triage_questions" in agent_data:
                     self.agent.max_triage_questions = agent_data["max_triage_questions"]
-            
-            # Dataset配置
-            if "dataset" in data:
-                dataset_data = data["dataset"]
-                if "dataset_id" in dataset_data:
-                    self.dataset.dataset_id = dataset_data["dataset_id"]
-                if "cache_dir" in dataset_data:
-                    self.dataset.cache_dir = Path(dataset_data["cache_dir"])
-                if "use_local_cache" in dataset_data:
-                    self.dataset.use_local_cache = dataset_data["use_local_cache"]
             
             # RAG配置
             if "rag" in data:
@@ -249,14 +229,6 @@ class Config:
         # Agent配置
         if os.getenv("HOSPITAL_MAX_QUESTIONS"):
             self.agent.max_questions = int(os.getenv("HOSPITAL_MAX_QUESTIONS"))
-        if os.getenv("HOSPITAL_DATASET_ID"):
-            self.dataset.dataset_id = int(os.getenv("HOSPITAL_DATASET_ID"))
-        
-        # Dataset配置
-        if os.getenv("HOSPITAL_DATASET_CACHE_DIR"):
-            self.dataset.cache_dir = Path(os.getenv("HOSPITAL_DATASET_CACHE_DIR"))
-        if os.getenv("HOSPITAL_USE_LOCAL_CACHE"):
-            self.dataset.use_local_cache = os.getenv("HOSPITAL_USE_LOCAL_CACHE").lower() in ("true", "1", "yes")
         
         # RAG配置
         if os.getenv("HOSPITAL_CHROMA_DIR"):
@@ -295,10 +267,6 @@ class Config:
         # Agent配置
         if hasattr(args, "max_questions") and args.max_questions is not None:
             self.agent.max_questions = args.max_questions
-        
-        # Dataset配置
-        if hasattr(args, "dataset_id") and args.dataset_id is not None:
-            self.dataset.dataset_id = args.dataset_id
         
         # RAG配置
         if hasattr(args, "persist") and args.persist:
@@ -347,8 +315,6 @@ class Config:
         if self.mode.multi_patient:
             lines.append(f"  - 患者数量: {self.mode.num_patients}")
             lines.append(f"  - 进入间隔: {self.mode.patient_interval}秒")
-        else:
-            lines.append(f"  - 病例ID: {self.dataset.dataset_id}")
         
         # 微服务配置
         if self.microservices.enabled:

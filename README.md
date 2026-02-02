@@ -17,7 +17,29 @@
 
 ## 📋 项目简介
 
-Hospital Agent System 是一个基于 **LangGraph** 编排的智能医院门诊模拟系统，支持 **15 个标准科室**的完整诊疗流程。项目通过多智能体协作（医生、护士、患者）、本地 RAG 知识库检索和可选的 DeepSeek LLM 增强，实现了高度可追溯、可复现的医疗流程仿真。
+Hospital Agent System 是一个基于 **LangGraph** 编排的智能医院门诊模拟系统，支持 **神经医学科等多个标准科室**的完整诊疗流程。项目通过多智能体协作（医生、护士、患者）、本地 RAG 知识库检索和可选的 DeepSeek LLM 增强，实现了高度可追溯、可复现的医疗流程仿真。
+
+### 🎨 系统架构概览
+
+本系统采用**分层架构**设计，从底层到顶层依次为：
+
+1. **基础设施层**：数据库（MySQL）、向量数据库（ChromaDB）、LLM服务（DeepSeek）
+2. **数据访问层**：DAO模式封装数据库操作，支持三表结构（患者、病例、检查）
+3. **服务层**：医疗记录服务、预约服务、缴费服务、检验检查服务等
+4. **智能体层**：医生Agent、护士Agent、患者Agent、检验Agent实现多智能体协作
+5. **流程编排层**：LangGraph图编排，通用门诊流程（C1-C16）+ 专科子图（S4-S6）
+6. **协调层**：医院协调器（HospitalCoordinator）管理资源调度与并发控制
+7. **物理环境层**：HospitalWorld模拟真实医院物理空间、时间和资源约束
+8. **应用层**：主程序入口、配置管理、日志系统
+
+### 💡 核心设计理念
+
+- **确定性优先**：所有Mock服务基于seed保证可复现，便于测试和调试
+- **可观测性**：完整的审计追踪（audit_trail）记录每个决策节点的输入输出
+- **可扩展性**：通用专科子图支持多科室，新增科室只需配置知识库
+- **并发安全**：支持多医生多患者并发场景，通过协调器统一调度资源
+- **物理约束**：模拟真实医院的物理空间、时间流逝、设备资源等约束
+- **知识驱动**：关键节点强制RAG检索，引用溯源确保决策有据可依
 
 ### 🎯 核心特性
 
@@ -30,9 +52,25 @@ Hospital Agent System 是一个基于 **LangGraph** 编排的智能医院门诊�
 
 ### 🏥 支持的科室
 
-内科、外科、骨科、泌尿外科、妇产科、儿科、神经医学、肿瘤科、感染性疾病科、皮肤性病科、眼耳鼻喉口腔科、精神心理科、急诊医学科、康复疼痛科、中医科
+**当前已实现**：神经医学科（Neurology）
+
+**架构支持扩展**：内科、外科、骨科、泌尿外科、妇产科、儿科、肿瘤科、感染性疾病科、皮肤性病科、眼耳鼻喉口腔科、精神心理科、急诊医学科、康复疼痛科、中医科等（通用专科子图设计，新增科室只需配置知识库和科室参数）
 
 > **⚠️ 免责声明**：本项目仅用于技术演示和教学目的，不构成任何医疗建议。如有健康问题，请咨询专业医疗机构。
+
+### 📊 系统能力矩阵
+
+| 能力维度 | 实现状态 | 说明 |
+|---------|---------|------|
+| **多智能体协作** | ✅ 完整实现 | 医生、护士、患者、检验科四方协作 |
+| **并发患者处理** | ✅ 完整实现 | 支持3医生10患者并发，自动队列调度 |
+| **物理环境模拟** | ✅ 完整实现 | 时间流逝、空间移动、设备排队 |
+| **数据库持久化** | ✅ 完整实现 | MySQL三表结构，支持多次就诊 |
+| **RAG知识检索** | ✅ 完整实现 | ChromaDB向量库，关键节点强制检索 |
+| **LLM增强** | ⚡ 可选启用 | DeepSeek API，报告解读与叙述 |
+| **审计追踪** | ✅ 完整实现 | 每步记录输入输出、RAG引用、决策理由 |
+| **红旗症状识别** | ✅ 完整实现 | 自动触发急诊/住院/会诊/转诊 |
+| **多科室支持** | 🔧 架构就绪 | 当前神经医学科，框架支持扩展 |
 
 ---
 
@@ -492,7 +530,574 @@ pytest --cov=src --cov-report=html
 - ✅ 红旗症状触发
 
 ---
+## 📖 核心API参考
 
+本章节详细介绍系统各模块的核心类和函数。
+
+### 🤖 智能体模块 (`src/agents/`)
+
+#### DoctorAgent - 医生智能体
+
+```python
+class DoctorAgent:
+    """医生智能体：基于RAG知识库进行问诊、开单、诊断"""
+    
+    def __init__(self, dept: str, retriever: ChromaRetriever, 
+                 llm: LLMClient | None, max_questions: int = 10)
+```
+
+**核心方法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `reset()` | 无 | None | 重置医生状态，清空上一患者的问诊历史（多患者场景必调用） |
+| `generate_one_question()` | chief_complaint, context, rag_chunks | str | 生成单个问诊问题（一问一答模式） |
+| `ask_patient()` | patient_agent, chief_complaint, context | dict | 完整问诊流程，返回结构化病史 |
+| `suggest_tests()` | collected_info | list[dict] | 基于问诊结果建议检查项目 |
+| `analyze_and_diagnose()` | collected_info, test_results | dict | 综合分析给出诊断和治疗方案 |
+
+**使用示例**：
+```python
+# 初始化医生
+doctor = DoctorAgent(dept="neurology", retriever=retriever, llm=llm, max_questions=5)
+
+# 问诊患者
+history = doctor.ask_patient(patient_agent, chief_complaint="头痛3天", context="神经科专科问诊")
+
+# 建议检查
+tests = doctor.suggest_tests(doctor.collected_info)
+
+# 重置状态（处理下一个患者前）
+doctor.reset()
+```
+
+---
+
+#### NurseAgent - 护士智能体
+
+```python
+class NurseAgent:
+    """护士智能体：分诊、生命体征测量、健康宣教"""
+    
+    def __init__(self, llm: LLMClient | None, max_triage_questions: int = 3)
+```
+
+**核心方法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `reset()` | 无 | None | 重置护士状态，清空分诊历史 |
+| `triage()` | patient_description | str | 根据患者描述进行科室分诊 |
+| `get_triage_summary()` | 无 | dict | 获取分诊结果摘要 |
+| `explain_test_prep()` | test_name, prep_info | str | 解释检查前准备事项 |
+
+---
+
+#### PatientAgent - 患者智能体
+
+```python
+class PatientAgent:
+    """患者智能体：模拟真实患者症状和回答"""
+    
+    def __init__(self, known_case: dict, llm: LLMClient | None, 
+                 chief_complaint: str = "")
+```
+
+**核心方法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `describe_to_nurse()` | 无 | str | 向护士描述症状（口语化） |
+| `answer_doctor_question()` | question | str | 回答医生问题（基于病例数据） |
+| `report_symptom_change()` | context | str | 报告症状变化 |
+
+---
+
+#### LabAgent - 检验智能体
+
+```python
+class LabAgent:
+    """检验智能体：执行实验室检查，解读结果"""
+    
+    def __init__(self, llm: LLMClient | None)
+```
+
+**核心方法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `interpret_result()` | test_name, result_data | dict | 解读检验结果，生成叙述和异常标记 |
+| `compare_with_reference()` | test_name, value | bool | 对比参考范围判断是否异常 |
+
+---
+
+### 🏥 医院协调器 (`src/hospital_coordinator.py`)
+
+#### HospitalCoordinator - 中央调度系统
+
+```python
+class HospitalCoordinator:
+    """医院协调器：管理多医生多患者的并发场景"""
+    
+    def __init__(self, medical_record_service: MedicalRecordService)
+```
+
+**资源管理**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `register_doctor()` | doctor_id, name, dept | None | 注册医生资源到系统 |
+| `get_available_doctors()` | dept | list[DoctorResource] | 获取指定科室的空闲医生 |
+| `set_doctor_offline()` | doctor_id | None | 设置医生离线状态 |
+
+**患者管理**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `register_patient()` | patient_id, patient_data, dept, priority | str | 患者挂号，创建病例 |
+| `enqueue_patient()` | patient_id | None | 加入等候队列，触发自动分配 |
+| `update_patient_status()` | patient_id, status | None | 更新患者状态 |
+
+**调度算法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `_try_assign_doctor()` | dept | bool | 自动为等候患者分配医生（负载均衡） |
+| `assign_doctor_manually()` | patient_id, doctor_id | bool | 手动指定医生 |
+| `release_doctor()` | doctor_id | None | 释放医生资源，尝试分配下一患者 |
+
+**会诊调度**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `request_consultation()` | patient_id, requesting_doctor_id, target_dept, reason | str\|None | 请求跨科室会诊 |
+| `end_consultation_session()` | patient_id, consulting_doctor_id | None | 结束会诊 |
+
+**统计查询**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `get_doctor_status()` | doctor_id | dict | 获取医生详细状态 |
+| `get_dept_status()` | dept | dict | 获取科室整体状态 |
+| `get_system_stats()` | 无 | dict | 获取系统全局统计 |
+
+**并发特性**：
+- ✅ 线程安全：使用RLock保护共享资源
+- ✅ 优先级队列：按优先级和到达时间排序
+- ✅ 自动重试：分配失败时自动循环尝试
+- ✅ 资源竞争：支持多线程并发患者提交
+
+---
+
+### 🌍 物理环境模拟 (`src/environment/hospital_world.py`)
+
+#### HospitalWorld - 医院物理世界
+
+```python
+class HospitalWorld:
+    """医院世界环境：模拟物理空间、时间和资源"""
+    
+    def __init__(self, start_time: datetime = None)
+```
+
+**核心功能**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `add_agent()` | agent_id, agent_type, initial_location | bool | 添加agent到世界（患者/医生/护士） |
+| `move_agent()` | agent_id, target_location | (bool, str) | 移动agent到指定位置（自动寻路） |
+| `advance_time()` | minutes | None | 推进时间，更新物理状态 |
+| `use_device()` | agent_id, device_name | (bool, str) | 使用医疗设备（自动排队） |
+| `perform_exam()` | patient_id, exam_type, priority | (bool, str) | 执行检查（设备调度） |
+| `get_observation()` | agent_id | dict | 获取agent当前观察（位置、设备、其他人员） |
+
+**物理约束**：
+- 🚪 空间拓扑：14个位置节点，定义连通关系
+- ⏱️ 时间流逝：移动、等待、检查消耗真实时间
+- 🏥 设备资源：CT、MRI、内镜等有数量限制，需排队
+- 👥 人员状态：体力、负荷、效率动态变化
+
+---
+
+### 📊 状态管理 (`src/state/schema.py`)
+
+#### BaseState - 流程状态
+
+```python
+class BaseState(BaseModel):
+    """LangGraph流程的完整状态对象"""
+```
+
+**核心字段分类**：
+
+**基本信息**：
+- `run_id`: 运行ID（唯一标识）
+- `dept`: 就诊科室
+- `patient_id`: 患者ID
+- `chief_complaint`: 主诉
+
+**问诊记录**：
+- `agent_interactions`: 智能体交互记录（问诊对话、分诊记录等）
+- `history`: 病史信息
+- `exam_findings`: 体格检查结果
+
+**检查检验**：
+- `ordered_tests`: 已开具的检查单
+- `test_results`: 检查报告结果
+- `need_aux_tests`: 是否需要辅助检查
+
+**诊断治疗**：
+- `diagnosis`: 诊断结果
+- `treatment_plan`: 治疗方案
+- `medications`: 药物处方
+
+**流程控制**：
+- `escalations`: 升级建议（急诊/住院/会诊/转诊）
+- `audit_trail`: 审计追踪（每步决策记录）
+- `retrieved_chunks`: RAG检索结果
+
+**物理环境**：
+- `world_context`: HospitalWorld实例引用
+- `current_location`: 当前物理位置
+- `physical_state_snapshot`: 物理状态快照
+
+**核心方法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `add_audit()` | entry | None | 添加审计记录 |
+| `add_retrieved_chunks()` | chunks | None | 添加RAG检索结果 |
+| `sync_physical_state()` | 无 | None | 同步物理环境状态到快照 |
+
+---
+
+### 🔎 RAG检索系统 (`src/rag.py`)
+
+#### ChromaRetriever - 向量检索器
+
+```python
+class ChromaRetriever:
+    """基于ChromaDB的向量检索器"""
+    
+    def __init__(self, persist_dir: Path, collection_name: str = "hospital_kb")
+```
+
+**核心方法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `retrieve()` | query, filters, k | list[dict] | 检索相关知识片段（支持dept/type过滤） |
+| `get_collection_stats()` | 无 | dict | 获取知识库统计信息 |
+
+**辅助函数**：
+
+| 函数 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `load_kb_chunks()` | kb_root | list[KBChunk] | 加载知识库文件并分块 |
+| `build_index()` | chunks, persist_dir, collection_name | ChromaRetriever | 构建向量索引 |
+
+**知识库结构**：
+```
+kb/
+├── hospital/         # 通用知识（dept=hospital）
+│   ├── sop_*.md     # 流程规范（type=sop）
+│   └── education_common.md  # 健康教育（type=education）
+├── forms/            # 文书模板（dept=forms, type=template）
+└── neurology/        # 神经科知识（dept=neurology）
+    ├── education_neuro.md   # 健康教育（type=education）
+    ├── guide_redflags.md    # 红旗指南（type=guide）
+    ├── plan_neuro.md        # 诊疗方案（type=plan）
+    └── prep_*.md            # 检查准备（type=prep）
+```
+
+---
+
+### 💾 数据持久化 (`src/services/`)
+
+#### MedicalRecordService - 病例服务（文件模式）
+
+```python
+class MedicalRecordService:
+    """医疗病例库服务：管理患者完整就医记录"""
+    
+    def __init__(self, storage_dir: Path = None)
+```
+
+**核心方法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `create_record()` | patient_id, patient_profile | MedicalRecord | 创建新病例 |
+| `get_record()` | patient_id | MedicalRecord\|None | 获取病例（内存缓存优先） |
+| `add_triage()` | patient_id, dept, chief_complaint, nurse_id, location | bool | 添加分诊记录 |
+| `add_consultation()` | patient_id, doctor_id, conversation, history, exam_findings, location | bool | 添加问诊记录 |
+| `add_lab_test()` | patient_id, test_name, test_results, operator | bool | 添加检验结果 |
+| `add_diagnosis()` | patient_id, doctor_id, diagnosis, location | bool | 添加诊断记录 |
+| `discharge_patient()` | patient_id, discharge_docs, doctor_id | bool | 患者出院 |
+
+---
+
+#### DatabaseMedicalRecordService - 病例服务（数据库模式）
+
+```python
+class DatabaseMedicalRecordService(MedicalRecordService):
+    """基于MySQL的医疗记录服务（双写：数据库+文件备份）"""
+    
+    def __init__(self, connection_string: str, storage_dir: Path, 
+                 backup_to_file: bool = True)
+```
+
+**数据库表结构**：
+
+**Patient表**（患者基本信息）：
+- `outpatient_no` (PK): 门诊号
+- `patient_id`: 患者ID（可重复，同一患者多次就诊）
+- `name`, `age`, `gender`, `phone`, `id_card`
+
+**MedicalCase表**（就诊病例）：
+- `case_id` (PK): 病例ID
+- `outpatient_no` (FK): 关联患者
+- `visit_date`: 就诊日期
+- `dept`: 科室
+- `chief_complaint`: 主诉
+- `diagnosis_name`: 诊断名称
+- `treatment_plan`: 治疗方案
+- `doctor_qa_records` (JSON): 问诊对话
+- `case_logs` (JSON): 流程日志
+
+**Examination表**（检查检验）：
+- `exam_id` (PK): 检查ID
+- `case_id` (FK): 关联病例
+- `exam_name`: 检查名称
+- `exam_type`: 检查类型（lab/imaging/endoscopy/neurophysiology）
+- `result_text`: 结果文本
+- `is_abnormal`: 是否异常
+
+**双写模式**：
+- ✅ 数据库写入失败时保留文件备份
+- ✅ 先更新文件后同步数据库
+- ✅ 异常捕获不影响主流程
+
+---
+
+#### MedicalRecordDAO - 数据访问层
+
+```python
+class MedicalRecordDAO:
+    """数据库访问对象：封装SQL操作"""
+    
+    def __init__(self, connection_string: str)
+```
+
+**核心方法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `create_patient()` | patient_data | str | 创建患者记录（返回门诊号） |
+| `create_medical_case()` | case_data | str | 创建病例记录（返回case_id） |
+| `update_medical_case()` | case_id, update_data | bool | 更新病例信息 |
+| `add_examination()` | exam_data | str | 添加检查记录（返回exam_id） |
+| `get_daily_statistics()` | target_date | dict | 获取每日统计数据 |
+
+---
+
+### 🎨 LangGraph流程编排 (`src/graphs/`)
+
+#### CommonOPDGraph - 通用门诊流程
+
+```python
+class CommonOPDGraph:
+    """通用门诊流程图：C1-C16节点"""
+    
+    def __init__(self, retriever, dept_subgraphs, services, llm, 
+                 world, patient_agent, doctor_agent, nurse_agent, lab_agent,
+                 max_questions: int = 3)
+    
+    def build(self) -> CompiledGraph
+```
+
+**流程节点**（共16个节点）：
+
+| 节点 | 函数 | 功能 | RAG检索 |
+|------|------|------|---------|
+| C1 | `c1_start` | 验证状态、记录开始时间 | ❌ |
+| C2 | `c2_registration` | 挂号预约 | ❌ |
+| C3 | `c3_checkin_waiting` | 签到候诊 | ❌ |
+| C4 | `c4_call_in` | 叫号入诊 | ❌ |
+| C5 | `c5_prepare_intake` | 问诊准备 + 检索通用SOP | ✅ hospital/sop |
+| C6 | `c6_specialty_dispatch` | 调用专科子图（实际问诊） | ➡️ 子图 |
+| C7 | `c7_decide_path` | 判断是否需要辅助检查 | ❌ |
+| C8 | `c8_order_explain_tests` | 开单 + 检索准备说明 | ✅ dept/prep |
+| C9 | `c9_billing_scheduling` | 缴费预约 | ❌ |
+| C10a | `c10a_fetch_test_results` | 获取检查结果 | ❌ |
+| C10b | `c10b_enhance_reports` | LLM增强报告叙述 | ❌ |
+| C11 | `c11_return_visit` | 报告回诊 | ✅ dept/* |
+| C12 | `c12_final_synthesis` | 综合分析诊断 | ✅ dept/plan, forms/template |
+| C13 | `c13_disposition` | 处置决策 | ❌ |
+| C14 | `c14_documents` | 文书生成 | ✅ forms/template |
+| C15 | `c15_education_followup` | 健康宣教 | ✅ dept/education |
+| C16 | `c16_end` | 结束流程 | ❌ |
+
+---
+
+#### build_common_specialty_subgraph - 专科子图
+
+```python
+def build_common_specialty_subgraph(
+    retriever: ChromaRetriever,
+    llm: LLMClient | None,
+    doctor_agent: DoctorAgent,
+    patient_agent: PatientAgent,
+    max_questions: int = 3
+) -> CompiledGraph
+```
+
+**子图节点**（3个节点）：
+
+| 节点 | 函数 | 功能 | RAG检索 |
+|------|------|------|---------|
+| S4 | `s4_specialty_interview` | 专科问诊（Agent模式一问一答） | ✅ dept/* |
+| S5 | `s5_physical_exam` | 体格检查 | ❌ |
+| S6 | `s6_preliminary_judgment` | 初步判断 + 检查建议 | ✅ dept/guide |
+
+---
+
+### 🛠️ 工具函数 (`src/utils.py`)
+
+#### JSON解析
+
+| 函数 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `parse_json_with_retry()` | text, fallback_data, max_retries, temp | dict | 解析JSON，支持重试和降级 |
+| `_clean_json_string()` | text | str | 清理JSON字符串（处理换行符） |
+| `_extract_json_object()` | text | str\|None | 提取JSON对象（支持代码块） |
+
+#### 关键词检测
+
+| 函数 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `contains_positive()` | text, keyword, negations | bool | 检测关键词（排除否定词） |
+| `contains_any_positive()` | text, keywords, negations | bool | 检测多个关键词（OR逻辑） |
+
+#### 安全机制
+
+| 函数 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `apply_safety_rules()` | state | None | 检测红旗症状，触发升级建议 |
+| `disclaimer_text()` | 无 | str | 返回医疗免责声明文本 |
+
+#### 日志系统
+
+| 函数 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `setup_dual_logging()` | log_file, console_level | None | 配置双通道日志（文件+控制台） |
+| `get_logger()` | name | Logger | 获取logger实例（彩色输出） |
+
+#### 其他工具
+
+| 函数 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `now_iso()` | 无 | str | 获取当前时间ISO格式字符串 |
+| `load_prompt()` | filename | str | 加载提示词模板文件 |
+| `make_run_id()` | dept | str | 生成运行ID（包含时间戳） |
+
+---
+
+### 🎯 主程序入口 (`src/main.py`)
+
+#### main() - 主函数
+
+```python
+def main(
+    dataset_id: int = 61,
+    llm_backend: str = "deepseek",
+    enable_reports: bool = False,
+    max_questions: int = 3,
+    num_patients: int = 1,
+    enable_output: bool = True,
+    config_file: str = "config.yaml"
+) -> dict
+```
+
+**参数说明**：
+- `dataset_id`: 诊断竞技场数据集ID
+- `llm_backend`: LLM后端（"mock"或"deepseek"）
+- `enable_reports`: 是否启用LLM增强报告
+- `max_questions`: 医生最多问题数
+- `num_patients`: 并发患者数量
+- `enable_output`: 是否输出结果
+- `config_file`: 配置文件路径
+
+**返回值**：
+```python
+{
+    "status": "completed",
+    "patient_id": "patient_xxx",
+    "diagnosis": {...},
+    "detail_log_file": "logs/patients/patient_xxx.log",
+    "statistics": {...}
+}
+```
+
+---
+
+### 🎛️ 配置管理 (`src/config.py`)
+
+#### Config - 配置类
+
+```python
+@dataclass
+class Config:
+    """系统配置（优先级：CLI > 环境变量 > config.yaml > 默认值）"""
+    llm: LLMConfig                  # LLM配置
+    agent: AgentConfig              # Agent配置
+    rag: RAGConfig                  # RAG配置
+    mode: ModeConfig                # 模式配置
+    physical: PhysicalConfig        # 物理环境配置
+    system: SystemConfig            # 系统配置
+    microservices: MicroservicesConfig  # 微服务配置
+    database: DatabaseConfig        # 数据库配置
+```
+
+**配置加载方式**：
+1. 从 `config.yaml` 读取基础配置
+2. 环境变量覆盖（如`DEEPSEEK_API_KEY`）
+3. CLI参数覆盖（如`--max-questions 5`）
+
+---
+
+### 📝 日志系统 (`src/patient_detail_logger.py`)
+
+#### PatientDetailLogger - 患者详细日志
+
+```python
+class PatientDetailLogger:
+    """为每个患者创建独立的详细日志文件"""
+    
+    def __init__(self, patient_id: str, case_id: int)
+```
+
+**核心方法**：
+
+| 方法 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `section()` | title | None | 写入章节标题（带分隔线） |
+| `subsection()` | title | None | 写入小节标题 |
+| `qa_round()` | round_num, question, answer | None | 记录问答轮次 |
+| `node_start()` | node_name, node_display_name | None | 记录节点开始 |
+| `node_end()` | node_name, node_display_name | None | 记录节点结束 |
+
+**全局函数**：
+
+| 函数 | 参数 | 返回值 | 功能说明 |
+|------|------|--------|---------|
+| `create_patient_detail_logger()` | patient_id, case_id | PatientDetailLogger | 创建患者日志记录器 |
+| `get_patient_detail_logger()` | patient_id, case_id | PatientDetailLogger\|None | 获取已存在的记录器 |
+| `close_patient_detail_logger()` | patient_id | None | 关闭并移除记录器 |
+
+**日志文件路径**：`logs/patients/patient_{case_id}_{timestamp}.log`
+
+---
 ## 📖 使用指南
 
 

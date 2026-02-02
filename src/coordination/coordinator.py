@@ -228,19 +228,25 @@ class HospitalCoordinator:
             )
             self.patients[patient_id] = session
             
-            # 创建病例（注意：此时dept是挂号科室，真实科室需等护士分诊后确定）
-            patient_profile = {
-                "name": patient_data.get("name", "患者"),
-                "age": patient_data.get("age", 0),
-                "gender": patient_data.get("gender", "未知"),
-                "dataset_id": patient_data.get("dataset_id"),
-                # 注意：不在此处设置dept，等护士分诊后再更新
-            }
-            record = self.medical_record_service.create_record(patient_id, patient_profile)
+            # 检查是否已有病例记录
+            existing_record = self.medical_record_service.get_record(patient_id)
+            if existing_record:
+                logger.info(f"✅ 患者挂号: {patient_id} -> {dept}科 (优先级: {priority}, 病例已存在: {existing_record.record_id})")
+            else:
+                # 创建病例（注意：此时dept是挂号科室，真实科室需等护士分诊后确定）
+                patient_profile = {
+                    "name": patient_data.get("name", "患者"),
+                    "age": patient_data.get("age", 0),
+                    "gender": patient_data.get("gender", "未知"),
+                    "dataset_id": patient_data.get("dataset_id"),
+                    "case_id": patient_data.get("case_id"),
+                    "run_id": patient_data.get("run_id"),
+                    # 注意：不在此处设置dept，等护士分诊后再更新
+                }
+                record = self.medical_record_service.create_record(patient_id, patient_profile)
+                logger.info(f"✅ 患者挂号: {patient_id} -> {dept}科 (优先级: {priority}, 病例: {record.record_id})")
             
             self.stats["total_patients"] += 1
-            
-            logger.info(f"✅ 患者挂号: {patient_id} -> {dept}科 (优先级: {priority}, 病例: {record.record_id})")
             
             return patient_id
     
@@ -279,10 +285,12 @@ class HospitalCoordinator:
             self.waiting_queues[dept].put(session)
             
             queue_size = self.waiting_queues[dept].qsize()
-            # 只在资源紧张时显示警告
+            # 显示资源状态
             available_doctors = len([d for d in self.doctors.values() if d.dept == dept and d.is_available()])
             if queue_size > available_doctors:
-                logger.warning(f"⚠️  {dept}科资源紧张: {queue_size}名患者竞争{available_doctors}名医生")
+                logger.warning(f"⚠️  {dept}科资源紧张: {queue_size}名患者竞争{available_doctors}名空闲医生")
+            elif queue_size > 0:
+                logger.info(f"📋 {dept}科: {queue_size}名患者候诊 | {available_doctors}名医生空闲")
         
         # 尝试自动分配医生（如果有空闲医生，立即分配）
         self._try_assign_doctor(dept)
@@ -317,7 +325,7 @@ class HospitalCoordinator:
                 if not available_doctors:
                     waiting_count = self.waiting_queues[dept].qsize() if dept in self.waiting_queues else 0
                     if waiting_count > 0 and assigned_count == 0:
-                        logger.debug(f"⏳ {dept}科暂无空闲医生，{waiting_count}名患者等候中")
+                        logger.info(f"⏳ {dept}科暂无空闲医生，{waiting_count}名患者等候中")
                     break
                 
                 # 从队列取患者
@@ -332,7 +340,7 @@ class HospitalCoordinator:
                 try:
                     session = queue.get_nowait()
                 except Empty:
-                    logger.debug(f"⏳ {dept}科队列为空（并发竞争）")
+                    logger.info(f"⚡ {dept}科队列已空（并发竞争，其他线程已取走）")
                     break
                 
                 patient_id = session.patient_id
@@ -347,11 +355,11 @@ class HospitalCoordinator:
                 
                 doctor.start_consultation(patient_id)
                 
-                # 详细日志改为debug级别
+                # 显示医生分配信息
                 remaining_queue = self.waiting_queues[dept].qsize()
-                logger.debug(f"✅ 分配成功: 患者 {patient_id} -> 医生 {doctor.name}")
+                logger.info(f"✅ 分配: 患者 {patient_id} → {doctor.name}")
                 current_count = 1 if doctor.current_patient else 0
-                logger.debug(f"   📊 资源使用: {doctor.name}当前患者={current_count}, 今日总计={doctor.total_patients_today}, 队列剩余={remaining_queue}")
+                logger.info(f"   📊 {doctor.name}: 当前{current_count}人 | 今日{doctor.total_patients_today}人 | 队列剩余{remaining_queue}人")
                 
                 assigned_count += 1
         

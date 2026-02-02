@@ -10,7 +10,7 @@ from pathlib import Path
 
 if TYPE_CHECKING:
     from config import MicroservicesConfig
-    from hospital_coordinator import HospitalCoordinator
+    from coordination import HospitalCoordinator
     from services.medical_record import MedicalRecordService
 
 
@@ -30,7 +30,7 @@ def get_coordinator(
     Returns:
         HospitalCoordinator实例
     """
-    from hospital_coordinator import HospitalCoordinator
+    from coordination import HospitalCoordinator
     
     if config.enabled:
         # 微服务模式 - 未来实现
