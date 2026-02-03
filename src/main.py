@@ -1,22 +1,17 @@
 from __future__ import annotations
-
 import json
 import threading
+import random
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-
 import typer
+import logging
 from typing_extensions import Annotated
-
 from loaders import load_diagnosis_arena_case
 from agents import PatientAgent, DoctorAgent, NurseAgent, LabAgent
-# 加载 .env 文件
-try:
-    from dotenv import load_dotenv
-    load_dotenv()  # 从当前目录或父目录查找 .env 文件
-except ImportError:
-    pass  # 如果没有安装 python-dotenv，跳过
+from dotenv import load_dotenv
 from environment import HospitalWorld, PhysicalState, InteractiveSession
 from processing import LangGraphMultiPatientProcessor
 from services.medical_record import MedicalRecordService
@@ -28,12 +23,10 @@ from utils import make_run_id, get_logger, setup_console_logging
 from config import Config
 from coordination import HospitalCoordinator
 from logging_utils import should_log, get_output_level
-# 微服务集成层
 from integration import get_coordinator, get_medical_record_service
-
+load_dotenv()
 # 初始化logger
 logger = get_logger("hospital_agent.main")
-
 # 患者颜色映射（用于终端显示区分）
 PATIENT_COLORS = [
     "\033[96m",  # 青色
@@ -96,7 +89,7 @@ def main(
     verbose = config.system.verbose
     
     # 设置日志级别：verbose模式显示所有日志（DEBUG），否则显示INFO及以上
-    import logging
+  
     console_level = logging.DEBUG if verbose else logging.INFO
     setup_console_logging(console_level=console_level)
     
@@ -127,9 +120,9 @@ def main(
         
         # 判断是单患者还是多患者
         if _num_patients == 1:
-            logger.info("🏥 启动单患者模式 (基于多患者架构)")
+            logger.info("🏥 启动单患者模式")
         else:
-            logger.info(f"🏥 启动多患者并发模式 ({_num_patients}名患者)")
+            logger.info(f"🏥 启动多患者并发模式 (共设置{_num_patients}名患者)")
         
         logger.info("="*80)
         logger.info(f"患者数量: {_num_patients}")
@@ -168,7 +161,7 @@ def main(
         services = build_services()
         logger.info("  ✅ 服务组件初始化完成\n")
         
-        # 初始化医疗记录服务（根据配置选择单体/数据库/微服务）
+        # 初始化医疗记录服务
         logger.info("📋 初始化病例库服务...")
         medical_record_service = get_medical_record_service(
             config=config,
@@ -181,15 +174,12 @@ def main(
                 logger.info(f"  💾 同时备份到文件: {Path('./medical_records').absolute()}\n")
             else:
                 logger.info("")
-        elif not config.microservices.enabled:
-            logger.info(f"  📁 病例存储目录: {Path('./medical_records').absolute()}\n")
         else:
-            logger.info(f"  🌐 使用微服务: {config.microservices.record_service_url}\n")
+            logger.info(f"  📁 病例存储目录: {Path('./medical_records').absolute()}\n")
         
-        # 初始化协调器（根据配置选择单体或微服务）
+        # 初始化协调器
         logger.info("🏥 初始化医院协调器...")
         coordinator = get_coordinator(
-            config=config.microservices,
             medical_record_service=medical_record_service
         )
         logger.info("  ✅ 协调器初始化完成\n")
@@ -220,8 +210,6 @@ def main(
         logger.info("  ✅ 处理器初始化完成\n")
         
         # 准备患者数据（使用真实数据集病例，随机选择）
-        import random
-        import time
         
         # 加载真实数据集以获取病例总数
         logger.info("📚 检查可用的真实病例数量...")

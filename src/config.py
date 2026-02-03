@@ -63,17 +63,6 @@ class SystemConfig:
 
 
 @dataclass
-class MicroservicesConfig:
-    """微服务配置"""
-    enabled: bool = False
-    record_service_url: str = "http://localhost:8001"
-    patient_service_url: str = "http://localhost:8002"
-    doctor_service_url: str = "http://localhost:8003"
-    notification_service_url: str = "http://localhost:8006"
-    request_timeout: int = 30
-
-
-@dataclass
 class DatabaseConfig:
     """数据库配置"""
     enabled: bool = False
@@ -90,7 +79,6 @@ class Config:
     mode: ModeConfig = field(default_factory=ModeConfig)
     physical: PhysicalConfig = field(default_factory=PhysicalConfig)
     system: SystemConfig = field(default_factory=SystemConfig)
-    microservices: MicroservicesConfig = field(default_factory=MicroservicesConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     
     @classmethod
@@ -186,22 +174,6 @@ class Config:
                 if "enable_trace" in system_data:
                     self.system.enable_trace = system_data["enable_trace"]
             
-            # 微服务配置
-            if "microservices" in data:
-                ms_data = data["microservices"]
-                if "enabled" in ms_data:
-                    self.microservices.enabled = ms_data["enabled"]
-                if "record_service_url" in ms_data:
-                    self.microservices.record_service_url = ms_data["record_service_url"]
-                if "patient_service_url" in ms_data:
-                    self.microservices.patient_service_url = ms_data["patient_service_url"]
-                if "doctor_service_url" in ms_data:
-                    self.microservices.doctor_service_url = ms_data["doctor_service_url"]
-                if "notification_service_url" in ms_data:
-                    self.microservices.notification_service_url = ms_data["notification_service_url"]
-                if "request_timeout" in ms_data:
-                    self.microservices.request_timeout = ms_data["request_timeout"]
-            
             # 数据库配置
             if "database" in data:
                 db_data = data["database"]
@@ -241,20 +213,6 @@ class Config:
             self.system.save_trace = Path(os.getenv("HOSPITAL_TRACE_FILE"))
         if os.getenv("HOSPITAL_ENABLE_TRACE"):
             self.system.enable_trace = os.getenv("HOSPITAL_ENABLE_TRACE").lower() in ("true", "1", "yes")
-        
-        # 微服务配置
-        if os.getenv("MICROSERVICES_ENABLED"):
-            self.microservices.enabled = os.getenv("MICROSERVICES_ENABLED").lower() in ("true", "1", "yes")
-        if os.getenv("RECORD_SERVICE_URL"):
-            self.microservices.record_service_url = os.getenv("RECORD_SERVICE_URL")
-        if os.getenv("PATIENT_SERVICE_URL"):
-            self.microservices.patient_service_url = os.getenv("PATIENT_SERVICE_URL")
-        if os.getenv("DOCTOR_SERVICE_URL"):
-            self.microservices.doctor_service_url = os.getenv("DOCTOR_SERVICE_URL")
-        if os.getenv("NOTIFICATION_SERVICE_URL"):
-            self.microservices.notification_service_url = os.getenv("NOTIFICATION_SERVICE_URL")
-        if os.getenv("MICROSERVICES_TIMEOUT"):
-            self.microservices.request_timeout = int(os.getenv("MICROSERVICES_TIMEOUT"))
     
     def _load_from_args(self, args) -> None:
         """从CLI参数加载配置（最高优先级）"""
