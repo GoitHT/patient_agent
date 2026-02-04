@@ -18,6 +18,8 @@
 
 患者门诊管理多智能体系统是一个基于 **LangGraph** 编排的医院门诊诊疗流程模拟平台。系统采用多智能体协作模式（医生、护士、患者、检验科），当前支持 **神经医学科**，通过本地 **RAG 知识库**检索和可选的 **DeepSeek LLM** 增强，实现了高度可追踪、可复现的医疗流程仿真。
 
+**v2.0 架构升级**：采用模块化设计，main 函数精简至 150 行纯流程编排，职责清晰分离，易于维护和扩展。
+
 ### 🎯 核心特性
 
 - 🤖 **多智能体协作**：医生、护士、患者、检验科四方智能体紧密协作
@@ -28,6 +30,7 @@
 - 👥 **多患者并发**：支持多医生多患者并发场景，自动负载均衡和队列管理
 - 🌍 **物理环境模拟**：模拟真实医院空间、时间流逝、设备排队等约束
 - 💾 **数据库支持**：支持 MySQL 持久化，完整的患者就诊记录管理
+- ✨ **模块化架构**：职责清晰分离，main 函数仅负责流程编排，易于维护和扩展
 
 ### 🏥 支持的科室
 
@@ -137,7 +140,18 @@ database:
 ```
 patient_agent/
 ├── src/
-│   ├── agents/                      # 智能体实现
+│   ├── main.py                      # 🚀 主程序入口（极简流程编排）
+│   ├── main_backup.py               # 原main.py备份
+│   │
+│   ├── bootstrap/                   # ⚙️ 系统启动模块
+│   │   └── loader.py                # 配置加载器
+│   ├── core/                        # 🏭 核心组件模块
+│   │   └── initializer.py           # SystemInitializer（组件初始化）
+│   ├── display/                     # 📺 显示与格式化模块
+│   │   ├── log_formatter.py         # 日志格式化（颜色标识）
+│   │   └── output_formatter.py      # 输出格式化（表格、统计）
+│   │
+│   ├── agents/                      # 🤖 智能体实现
 │   │   ├── doctor_agent.py          # 医生智能体（问诊、开单、诊断）
 │   │   ├── nurse_agent.py           # 护士智能体（分诊、宣教）
 │   │   ├── patient_agent.py         # 患者智能体（模拟患者回答）
@@ -148,12 +162,15 @@ patient_agent/
 │   │   ├── hospital_world.py        # 物理环境模拟
 │   │   ├── command_system.py        # 交互命令系统
 │   │   └── staff_tracker.py         # 人员跟踪
-│   ├── graphs/                      # LangGraph 流程编排
+│   ├── graphs/                      # 🕸️ LangGraph 流程编排
 │   │   ├── common_opd_graph.py      # 通用门诊流程（C1-C16）
 │   │   ├── router.py                # 图构建器
 │   │   └── dept_subgraphs/
 │   │       └── common_specialty_subgraph.py  # 通用专科子图（S4-S6）
-│   ├── services/                    # 外部系统 Mock
+│   ├── services/                    # 🔧 服务层
+│   │   ├── workflow/                # 工作流控制
+│   │   │   ├── multi_patient.py     # MultiPatientWorkflow（多患者流程）
+│   │   │   └── single_case.py       # 单病例处理（已废弃）
 │   │   ├── appointment.py           # 预约服务
 │   │   ├── billing.py               # 缴费服务
 │   │   ├── lab.py                   # 实验室检查
@@ -165,11 +182,13 @@ patient_agent/
 │   │   └── medical_record_db_service.py  # 病例管理（数据库存储）
 │   ├── state/
 │   │   └── schema.py                # BaseState 定义
+│   ├── integration/                 # 集成适配层
+│   ├── processing/                  # 多患者处理器
+│   ├── logging_utils/               # 日志工具
 │   ├── rag.py                       # RAG 检索器（ChromaDB）
 │   ├── loaders.py                   # 数据加载器（诊断数据集）
 │   ├── utils.py                     # 工具函数（JSON解析、日志等）
 │   ├── config.py                    # 配置管理
-│   ├── main.py                      # CLI 主程序
 │   └── prompts/                     # LLM 提示词模板
 ├── kb/                              # 知识库
 │   ├── hospital/                    # 医院通用知识
@@ -251,7 +270,72 @@ patient_agent/
 
 ## 🧪 核心模块详解
 
-### 1. 医生智能体 (`doctor_agent.py`)
+### 架构设计
+
+系统采用**模块化分层架构**，职责清晰分离：
+
+- **入口层** (`main.py`)：极简流程编排（150行），11步清晰流程
+- **启动层** (`bootstrap/`)：配置加载与系统初始化
+- **核心层** (`core/`)：组件初始化器，统一管理所有核心组件
+- **显示层** (`display/`)：日志格式化和输出展示
+- **业务层** (`services/workflow/`)：工作流控制和业务逻辑
+- **智能体层** (`agents/`)：医生、护士、患者、检验科智能体
+- **编排层** (`graphs/`)：LangGraph 流程图定义
+
+### 1. 系统初始化器 (`core/initializer.py`)
+
+**职责**：统一管理所有核心组件的初始化
+
+```python
+class SystemInitializer:
+    def initialize_logging(self) -> None:
+        """初始化日志系统"""
+    
+    def initialize_llm(self) -> Any:
+        """初始化大语言模型"""
+    
+    def initialize_rag(self) -> Any:
+        """初始化知识库检索器"""
+    
+    def initialize_services(self) -> Any:
+        """初始化服务组件"""
+    
+    def initialize_medical_record(self, storage_dir: Path) -> Any:
+        """初始化病例库服务"""
+    
+    def initialize_coordinator(self, medical_record_service: Any) -> Any:
+        """初始化医院协调器"""
+```
+
+### 2. 多患者工作流 (`services/workflow/multi_patient.py`)
+
+**职责**：多患者并发诊断流程控制
+
+```python
+class MultiPatientWorkflow:
+    def register_doctors(self, num_doctors: int) -> None:
+        """注册医生到协调器"""
+    
+    def initialize_processor(self, num_patients: int) -> None:
+        """初始化多患者处理器"""
+    
+    def select_patient_cases(self, num_patients: int) -> List[int]:
+        """从数据集随机选择患者病例"""
+    
+    def schedule_patients(self, case_ids: List[int], interval: float) -> List[str]:
+        """按时间间隔调度患者"""
+    
+    def start_monitoring(self) -> threading.Thread:
+        """启动状态监控线程"""
+    
+    def wait_for_completion(self, num_patients: int, timeout: int) -> List[Dict]:
+        """等待所有患者完成"""
+    
+    def shutdown(self) -> None:
+        """关闭处理器"""
+```
+
+### 3. 医生智能体 (`agents/doctor_agent.py`)
 
 **职责**：问诊、检查建议、诊断制定
 
@@ -275,7 +359,7 @@ class DoctorAgent:
         """综合分析给出诊断"""
 ```
 
-### 2. 护士智能体 (`nurse_agent.py`)
+### 4. 护士智能体 (`agents/nurse_agent.py`)
 
 **职责**：分诊、生命体征测量、宣教
 
@@ -288,7 +372,7 @@ class NurseAgent:
         """解释检查前准备"""
 ```
 
-### 3. 患者智能体 (`patient_agent.py`)
+### 5. 患者智能体 (`agents/patient_agent.py`)
 
 **职责**：模拟真实患者症状和回答
 
@@ -301,7 +385,7 @@ class PatientAgent:
         """回答医生问题（基于病例数据）"""
 ```
 
-### 4. 医院协调器 (`coordination/coordinator.py`)
+### 6. 医院协调器 (`coordination/coordinator.py`)
 
 **职责**：多患者并发管理、医生资源调度
 
@@ -320,7 +404,7 @@ class HospitalCoordinator:
         """手动指定医生"""
 ```
 
-### 5. 物理环境模拟 (`environment/hospital_world.py`)
+### 7. 物理环境模拟 (`environment/hospital_world.py`)
 
 **职责**：模拟医院物理空间、时间、资源
 
@@ -342,7 +426,7 @@ class HospitalWorld:
         """执行检查"""
 ```
 
-### 6. RAG 检索系统 (`rag.py`)
+### 8. RAG 检索系统 (`rag.py`)
 
 **向量数据库**：ChromaDB
 **嵌入模型**：HashEmbeddingFunction（完全本地、确定性）
@@ -372,7 +456,7 @@ kb/
     └── prep_mri.md (type=prep)
 ```
 
-### 7. 状态管理 (`state/schema.py`)
+### 9. 状态管理 (`state/schema.py`)
 
 **BaseState** 包含完整的就诊状态：
 
@@ -411,6 +495,42 @@ class BaseState(BaseModel):
   "flags": ["LLM_USED", "RAG_RETRIEVED"]
 }
 ```
+
+---
+
+## 🏛️ 架构优势
+
+### v2.0 模块化重构
+
+系统经过全面重构，采用职责清晰的模块化架构：
+
+#### 重构前（v1.0）
+- ❌ main.py 超过 1500 行
+- ❌ 业务逻辑、初始化、格式化代码混杂
+- ❌ 难以维护和测试
+
+#### 重构后（v2.0）
+- ✅ main.py 仅 150 行（11步清晰流程）
+- ✅ 职责分离：配置、初始化、业务、显示各司其职
+- ✅ 易于维护：修改某功能只需修改对应模块
+- ✅ 易于测试：每个模块可独立测试
+- ✅ 易于扩展：新增功能不影响主流程
+
+#### 新增模块
+
+| 模块 | 职责 | 行数 |
+|------|------|------|
+| `bootstrap/` | 配置加载 | ~20 |
+| `core/` | 组件初始化 | ~150 |
+| `display/` | 格式化输出 | ~200 |
+| `services/workflow/` | 工作流控制 | ~400 |
+| `main.py` | 流程编排 | ~150 |
+
+**设计原则**：
+- 单一职责原则（SRP）
+- 开闭原则（OCP）
+- 依赖注入（DI）
+- 关注点分离（SoC）
 
 ---
 
@@ -563,7 +683,9 @@ logs/patients/
 | **数据库持久化** | ✅ 完整 | MySQL支持 |
 | **LLM增强** | ⚡ 可选 | DeepSeek集成 |
 | **红旗症状识别** | ✅ 完整 | 自动升级触发 |
-| **多科室支持** | ✅ 可扩展 | 当前神经科，框架支持扩展新增 |
+| **多科室支持** | ✅ 可扩展 | 当前神经科，框架支持扩展 |
+| **模块化架构** | ✅ v2.0 | 职责清晰，易维护扩展 |
+| **流程编排** | ✅ 极简 | main函数150行纯流程编排 |
 
 ---
 
