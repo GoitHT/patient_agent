@@ -1,4 +1,4 @@
-"""医院智能体系统 - 主入口（极简流程编排）"""
+"""医院智能体系统 """
 
 from pathlib import Path
 from typing import Optional
@@ -63,7 +63,7 @@ def main(
     # 6. 初始化核心组件
     llm = initializer.initialize_llm()
     retriever = initializer.initialize_rag()
-    services = initializer.initialize_services()
+    services = initializer.initialize_business_services()
     medical_record_service = initializer.initialize_medical_record(Path("./medical_records"))
     coordinator = initializer.initialize_coordinator(medical_record_service)
     

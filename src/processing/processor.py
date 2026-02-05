@@ -108,6 +108,129 @@ class LangGraphPatientExecutor:
         # 创建患者详细日志记录器
         self.detail_logger = None  # 延迟到execute时创建（需要case_id）
     
+    def _generate_appointment_info(self) -> dict:
+        """
+        根据当前时间和患者特征动态生成预约信息
+        
+        Returns:
+            包含 channel, timeslot 的字典
+        """
+        import random
+        from datetime import datetime
+        
+        # 根据当前时间判断时段
+        current_hour = datetime.now().hour
+        if 6 <= current_hour < 12:
+            timeslot = "上午"
+        elif 12 <= current_hour < 18:
+            timeslot = "下午"
+        else:
+            timeslot = "晚上"  # 18:00-次日06:00 都算晚上
+        
+        # 根据优先级和时段选择就诊渠道
+        if self.priority >= 9:
+            # 高优先级：更可能是现场挂号
+            channel = random.choices(
+                ["线下", "APP", "电话"],
+                weights=[0.6, 0.2, 0.2]
+            )[0]
+        elif self.priority >= 7:
+            # 中高优先级：混合渠道
+            channel = random.choices(
+                ["APP", "线下", "微信小程序", "电话"],
+                weights=[0.4, 0.3, 0.2, 0.1]
+            )[0]
+        else:
+            # 普通优先级：主要通过线上预约
+            channel = random.choices(
+                ["APP", "微信小程序", "电话", "线下"],
+                weights=[0.5, 0.3, 0.1, 0.1]
+            )[0]
+        
+        return {
+            "channel": channel,
+            "timeslot": timeslot
+        }
+    
+    def _extract_patient_info_from_case(self, case_info: str, case_data: dict) -> dict:
+        """
+        从病例文本中提取患者基本信息（姓名、年龄、性别）
+        
+        Args:
+            case_info: 病例文本信息
+            case_data: 原始病例数据
+        
+        Returns:
+            包含 name, age, gender 的字典
+        """
+        import re
+        
+        # 优先从 case_data 字段中获取
+        name = case_data.get("name") or case_data.get("patient_name")
+        age = case_data.get("age")
+        gender = case_data.get("gender") or case_data.get("sex")
+        
+        # 如果 case_data 中没有，尝试从文本中解析
+        if not name or not age or not gender:
+            # 模式1: "患者，女性，45岁" 或 "患者，男，60岁"
+            pattern1 = r'患者[，,]\s*([男女])[性]?[，,]\s*(\d+)岁'
+            match1 = re.search(pattern1, case_info)
+            if match1:
+                if not gender:
+                    gender = match1.group(1)
+                if not age:
+                    age = int(match1.group(2))
+            
+            # 模式2: "姓名：张三" "年龄：50" "性别：男"
+            if not name:
+                name_match = re.search(r'姓名[：:]\s*([^，,\s]+)', case_info)
+                if name_match:
+                    name = name_match.group(1)
+            
+            if not age:
+                age_match = re.search(r'年龄[：:]\s*(\d+)', case_info)
+                if age_match:
+                    age = int(age_match.group(1))
+            
+            if not gender:
+                gender_match = re.search(r'性别[：:]\s*([男女])', case_info)
+                if gender_match:
+                    gender = gender_match.group(1)
+            
+            # 模式3: "45岁女性" 或 "60岁男性患者"
+            if not age or not gender:
+                pattern3 = r'(\d+)岁([男女])性'
+                match3 = re.search(pattern3, case_info)
+                if match3:
+                    if not age:
+                        age = int(match3.group(1))
+                    if not gender:
+                        gender = match3.group(2)
+        
+        # 如果仍然没有提取到，使用合理的默认值
+        if not name:
+            name = f"患者{self.patient_id}"
+        if not age or age == 0:
+            # 尝试提取任何年龄数字（作为最后手段）
+            age_match = re.search(r'(\d{1,3})岁', case_info)
+            if age_match:
+                extracted_age = int(age_match.group(1))
+                # 合理性检查：年龄应该在 0-120 之间
+                if 0 < extracted_age <= 120:
+                    age = extracted_age
+                else:
+                    age = 0  # 不合理的年龄，保持为0
+            else:
+                age = 0
+        if not gender:
+            gender = "未知"
+        
+        return {
+            "name": name,
+            "age": age,
+            "gender": gender
+        }
+    
     def _wait_for_doctor_assignment(self, timeout: int = 600) -> Optional[str]:
         """
         等待 coordinator 分配医生（优化：主动重试）
@@ -223,16 +346,18 @@ class LangGraphPatientExecutor:
             # 2. 使用共享物理环境
             world = self.world  # 使用传入的共享 world
             
-            # 患者已在 submit_patient 时添加到 world，无需重复添加
-            # world.add_agent(self.patient_id, ...)  # ❌ 删除
-            
+            # 患者已在 submit_patient 时添加到 world
             # 3. 初始化 State
             run_id = make_run_id(self.dept)
+            
+            # 动态生成预约信息
+            appointment_info = self._generate_appointment_info()
+            
             state = BaseState(
                 run_id=run_id,
                 dept=self.dept,
                 patient_profile={"case_text": case_info},
-                appointment={"channel": "APP", "timeslot": "上午"},
+                appointment=appointment_info,  # 使用动态生成的预约信息
                 original_chief_complaint=original_chief_complaint,
                 chief_complaint="",
                 case_data=known_case,
@@ -245,6 +370,9 @@ class LangGraphPatientExecutor:
                 },
             )
             
+            # 详细日志记录预约信息
+            self.detail_logger.info(f"预约渠道: {appointment_info['channel']}, 就诊时段: {appointment_info['timeslot']}")
+            
             # 集成物理环境和病例库
             state.world_context = world
             medical_record_integration = MedicalRecordIntegration(self.medical_record_service, world)
@@ -253,15 +381,19 @@ class LangGraphPatientExecutor:
             # 注入患者详细日志记录器到 state
             state.patient_detail_logger = self.detail_logger
             
-            # 准备患者基本信息
+            # 准备患者基本信息（从病例文本中智能提取）
+            extracted_info = self._extract_patient_info_from_case(case_info, state.case_data)
             patient_profile = {
-                "name": state.case_data.get("name", f"患者{self.patient_id}"),
-                "age": state.case_data.get("age", 0),
-                "gender": state.case_data.get("gender", "未知"),
+                "name": extracted_info["name"],
+                "age": extracted_info["age"],
+                "gender": extracted_info["gender"],
                 "case_id": self.case_id,
                 "dataset_id": state.case_data.get("dataset_id"),
                 "run_id": run_id,
             }
+            
+            # 详细日志中记录提取结果
+            self.detail_logger.info(f"智能提取患者信息: {extracted_info['name']}, {extracted_info['age']}岁, {extracted_info['gender']}")
             
             # 获取已创建的病例（在 coordinator.register_patient 时已创建）
             existing_record = self.medical_record_service.get_record(self.patient_id)
@@ -327,7 +459,11 @@ class LangGraphPatientExecutor:
                 self.detail_logger.info(f"LLM分诊分析: {triage_reason}")
             
             if state.medical_record_integration:
-                state.medical_record_integration.on_triage(state, nurse_id="nurse_001")
+                state.medical_record_integration.on_triage(
+                    state, 
+                    nurse_id="nurse_001",
+                    nurse_name="分诊护士"
+                )
             
             # 终端显示分诊结果（包括理由）
             dept_cn_names = {
@@ -348,11 +484,11 @@ class LangGraphPatientExecutor:
             
             # ===== 6. 通过 Coordinator 注册患者并等待医生分配 =====
             
-            # 准备患者数据
+            # 准备患者数据（复用已提取的信息）
             patient_data = {
-                "name": state.case_data.get("name", f"患者{self.patient_id}"),
-                "age": state.case_data.get("age", 0),
-                "gender": state.case_data.get("gender", "未知"),
+                "name": patient_profile["name"],
+                "age": patient_profile["age"],
+                "gender": patient_profile["gender"],
                 "case_id": self.case_id,
                 "dataset_id": state.case_data.get("dataset_id"),
                 "run_id": state.run_id,
@@ -391,6 +527,13 @@ class LangGraphPatientExecutor:
             
             self.detail_logger.info(f"分配医生: {doctor.name} (ID: {assigned_doctor_id})")
             self.detail_logger.info(f"医生科室: {doctor.dept}")
+            
+            # 更新病例中的医生信息
+            record = self.medical_record_service.get_record(self.patient_id)
+            if record:
+                record.patient_profile["attending_doctor_id"] = assigned_doctor_id
+                record.patient_profile["attending_doctor_name"] = doctor.name
+                self.medical_record_service._save_record(record)
             
             # ===== 7. 使用分配的医生 Agent =====
             

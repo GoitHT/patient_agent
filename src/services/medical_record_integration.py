@@ -65,13 +65,14 @@ class MedicalRecordIntegration:
         
         return record.record_id
     
-    def on_triage(self, state: 'BaseState', nurse_id: str = "nurse_001"):
+    def on_triage(self, state: 'BaseState', nurse_id: str = "nurse_001", nurse_name: str = "分诊护士"):
         """
         分诊节点 - 更新病例
         
         Args:
             state: 图状态
             nurse_id: 护士ID
+            nurse_name: 护士姓名
         """
         patient_id = state.patient_id
         
@@ -80,6 +81,8 @@ class MedicalRecordIntegration:
         if record:
             record.patient_profile["dept"] = state.dept
             record.current_dept = state.dept  # 同时更新current_dept字段
+            record.patient_profile["triage_nurse_id"] = nurse_id  # 记录分诊护士ID
+            record.patient_profile["triage_nurse_name"] = nurse_name  # 记录分诊护士姓名
             record.last_updated = now_iso()  # 更新时间戳
             self.mrs._save_record(record)  # 调用私有方法保存更新后的病例
         
@@ -232,21 +235,23 @@ class MedicalRecordIntegration:
                     operator=radiology_tech_id
                 )
     
-    def on_diagnosis(self, state: 'BaseState', doctor_id: str = "doctor_001"):
+    def on_diagnosis(self, state: 'BaseState', doctor_id: str = "doctor_001", doctor_name: str = "主治医生"):
         """
         诊断节点 - 更新病例
         
         Args:
             state: 图状态
             doctor_id: 医生ID
+            doctor_name: 医生姓名
         """
         patient_id = state.patient_id
         
-        # 记录诊断
+        # 记录诊断（传递医生姓名）
         self.mrs.add_diagnosis(
             patient_id=patient_id,
             doctor_id=doctor_id,
             diagnosis=state.diagnosis,
+            doctor_name=doctor_name,
             location=state.dept
         )
     

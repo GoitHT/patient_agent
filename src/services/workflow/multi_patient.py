@@ -3,11 +3,7 @@
 import random
 import threading
 import time
-from pathlib import Path
-from typing import List, Dict, Any, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from typing import Any
+from typing import List, Dict, Any
 
 from utils import get_logger
 from loaders import load_diagnosis_arena_case, _get_dataset_size
@@ -142,7 +138,7 @@ class MultiPatientWorkflow:
             known_case = case_bundle["known_case"]
             case_info = known_case.get("Case Information", "")
             dataset_index = known_case.get('id', 'unknown')
-            original_case_id = known_case.get('original_id', 'N/A')
+            original_case_id = known_case.get('Patient-SN', 'N/A')
             
             # 提取主诉
             if "主诉：" in case_info:
@@ -245,12 +241,15 @@ class MultiPatientWorkflow:
         while self.monitoring_active.is_set():
             time.sleep(60)
             iteration += 1
-            if not self.monitoring_active.is_set():
-                break
             
+            # 检查是否有活跃患者，但要考虑患者可能还在路上
             active_count = self.processor.get_active_count()
             if active_count == 0:
-                break
+                # 等待一段时间，防止患者还未到达就退出
+                time.sleep(10)
+                active_count = self.processor.get_active_count()
+                if active_count == 0:
+                    break
             
             if not should_log(2, "main", "monitor") and iteration % 4 != 0:
                 continue

@@ -406,7 +406,8 @@ class MedicalRecordService:
         return True
     
     def add_diagnosis(self, patient_id: str, doctor_id: str,
-                     diagnosis: Dict[str, Any], location: str = "internal_medicine") -> bool:
+                     diagnosis: Dict[str, Any], doctor_name: str = "主治医生", 
+                     location: str = "internal_medicine") -> bool:
         """
         添加诊断记录
         
@@ -414,6 +415,7 @@ class MedicalRecordService:
             patient_id: 患者ID
             doctor_id: 医生ID
             diagnosis: 诊断信息
+            doctor_name: 医生姓名
             location: 诊室位置
             
         Returns:
@@ -427,6 +429,7 @@ class MedicalRecordService:
             "timestamp": now_iso(),
             "diagnosis": diagnosis,
             "doctor": doctor_id,
+            "doctor_name": doctor_name,
             "location": location,
         }
         

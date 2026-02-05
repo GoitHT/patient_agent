@@ -9,7 +9,6 @@ from graphs.router import default_retriever, build_services
 from rag import DummyRetriever
 from utils import get_logger
 from config import Config
-from services.medical_record import MedicalRecordService
 from integration import get_coordinator, get_medical_record_service
 
 
@@ -76,15 +75,15 @@ class SystemInitializer:
             self.components['retriever'] = retriever
             return retriever
     
-    def initialize_services(self) -> Any:
-        """初始化服务组件
+    def initialize_business_services(self) -> Any:
+        """初始化业务服务（预约、计费）
         
         Returns:
-            服务集合
+            业务服务集合
         """
-        logger.info("⚙️ 初始化服务组件...")
+        logger.info("💼 初始化业务服务（预约、计费）...")
         services = build_services()
-        logger.info("  ✅ 服务组件初始化完成\n")
+        logger.info("  ✅ 业务服务初始化完成\n")
         self.components['services'] = services
         return services
     

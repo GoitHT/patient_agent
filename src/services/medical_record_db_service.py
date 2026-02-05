@@ -215,7 +215,8 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         return True
     
     def add_lab_test(self, patient_id: str, test_name: str, 
-                    test_results: Dict[str, Any], operator: str = "lab_tech_001") -> bool:
+                    test_results: Dict[str, Any], operator: str = "lab_tech_001", 
+                    operator_name: str = "检验科医生") -> bool:
         """添加检验结果（数据库 + 文件）"""
         success = super().add_lab_test(patient_id, test_name, test_results, operator)
         
@@ -240,6 +241,13 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                 
                 if not db_case:
                     logger.warning(f"⚠️  [数据库] 病例 {record.record_id} 在数据库中不存在，case_id设为NULL")
+                
+                # 更新病例中的检验科医生信息
+                if db_case:
+                    self.dao.update_medical_case(record.record_id, {
+                        "lab_doctor_id": operator,
+                        "lab_doctor_name": operator_name,
+                    })
                 
                 self.dao.add_examination({
                     "exam_id": exam_id,

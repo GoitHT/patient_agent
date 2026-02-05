@@ -50,6 +50,14 @@ class MedicalCase(Base):
     visit_date = Column(Date, nullable=False, default=datetime.now)
     dept = Column(String(50))
     
+    # 接诊医护人员信息
+    attending_doctor_id = Column(String(50))  # 接诊医生ID
+    attending_doctor_name = Column(String(100))  # 接诊医生姓名
+    triage_nurse_id = Column(String(50))  # 分诊护士ID
+    triage_nurse_name = Column(String(100))  # 分诊护士姓名
+    lab_doctor_id = Column(String(50))  # 检验科医生ID（如有检验）
+    lab_doctor_name = Column(String(100))  # 检验科医生姓名
+    
     # 主诉与现病史
     chief_complaint = Column(Text)
     present_illness = Column(Text)
