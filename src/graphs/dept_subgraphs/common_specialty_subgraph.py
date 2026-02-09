@@ -67,6 +67,11 @@ def _validate_and_normalize_test(test: dict[str, Any], dept: str, dept_config: d
         logger.warning(f"  ⚠️  检查项目名称为空，跳过")
         return None
     
+    # 限制检查名称长度，避免JSON解析问题
+    if len(test_name) > 100:
+        logger.warning(f"  ⚠️  检查名称过长({len(test_name)}字符)，截断: {test_name[:50]}...")
+        test_name = test_name[:100]
+    
     # 如果type不是标准值，尝试映射
     if test_type not in ["lab", "imaging", "endoscopy", "neurophysiology"]:
         test_type = TEST_TYPE_MAPPING.get(test_type, "lab")  # 默认为lab
@@ -128,8 +133,8 @@ def build_common_specialty_subgraph(
     """
     graph = StateGraph(BaseState)
     
-    # 判断是否启用Agent模式
-    use_agents = doctor_agent is not None and patient_agent is not None
+    # 注意：不在这里判断 use_agents，而是在节点执行时动态判断
+    # 因为 doctor_agent 是在 C4 节点中动态分配到 state 的
 
     def s4_specialty_interview(state: BaseState) -> BaseState:
         """S4: 通用专科问诊节点"""
@@ -146,10 +151,29 @@ def build_common_specialty_subgraph(
         if detail_logger:
             detail_logger.section(f"{dept_name}专科问诊")
         
+        # 动态判断是否启用Agent模式（检查state中是否有Agent）
+        use_agents = (hasattr(state, 'doctor_agent') and state.doctor_agent is not None and
+                     hasattr(state, 'patient_agent') and state.patient_agent is not None)
+        
+        # 从 state 中获取医生 Agent（C4 节点中分配的）
+        doctor_agent = None
+        patient_agent = None
+        if use_agents:
+            doctor_agent = state.doctor_agent
+            patient_agent = state.patient_agent
+            if hasattr(state, 'assigned_doctor_name'):
+                logger.info(f"  👨‍⚕️ 使用 C4 分配的医生 Agent: {state.assigned_doctor_name}")
+            else:
+                logger.info(f"  👨‍⚕️ 使用医生 Agent 进行问诊")
+        else:
+            logger.info(f"  ℹ️  Agent模式未启用，将使用LLM模式")
+            if detail_logger:
+                detail_logger.info("未检测到Doctor Agent或Patient Agent，使用LLM模式提取信息")
+        
         # 如果是Agent模式，确保医生智能体的科室设置正确
         if use_agents and doctor_agent:
             doctor_agent.dept = dept
-            logger.info(f"  👨‍⚕️ 设置医生为{dept_name}专科医生")
+            logger.info(f"  🏥 医生科室: {dept_name}")
         
         # 检索该科室的专科知识
         # 注意：此时chief_complaint还未设置（医生尚未从患者处获得），使用科室信息检索
@@ -184,38 +208,19 @@ def build_common_specialty_subgraph(
             
             # ===== 物理环境集成：问诊前检查患者状态 =====
             if state.world_context:
+                # 检查物理状态影响（静默处理，仅记录紧急情况）
                 impact = state.get_physical_impact_on_diagnosis()
                 if impact.get("has_impact"):
-                    logger.info("\n" + "="*60)
-                    logger.info("⚠️  物理状态影响诊断")
-                    logger.info("="*60)
-                    
-                    # 显示严重警告
-                    warnings = impact.get("warnings", [])
-                    if warnings:
-                        for warning in warnings:
-                            logger.warning(warning)
-                    
-                    # 显示建议
-                    for suggestion in impact.get("suggestions", []):
-                        logger.info(f"  💡 {suggestion}")
-                    
-                    logger.info("="*60)
-                    
-                    # 根据体力限制问诊轮数
+                    # 调整问诊轮数（内部逻辑，不显示）
                     physical_max_questions = impact.get("max_questions", max_qs)
                     if physical_max_questions < max_qs:
-                        logger.info(f"  ⚙️  根据患者状态，问诊轮数调整为 {physical_max_questions}")
                         max_qs = physical_max_questions
                     
-                    # 如果患者意识异常，标记为紧急
+                    # 仅记录紧急情况（意识异常）
                     if impact.get("emergency"):
-                        logger.error("  🚨🚨 紧急情况：患者意识异常，建议立即转急诊！")
+                        logger.error("🚨 紧急情况：患者意识异常，建议立即转急诊")
                         state.escalations.append("患者意识异常，建议急诊评估")
-                        # 不应继续常规问诊
-                        if max_qs > 0:
-                            logger.warning("  ⚠️  由于紧急情况，跳过常规问诊")
-                            max_qs = 0
+                        max_qs = 0
             
             # 使用全局共享计数器
             global_qa_count = state.node_qa_counts.get("global_total", 0)
@@ -227,6 +232,19 @@ def build_common_specialty_subgraph(
             
             if detail_logger:
                 detail_logger.info(f"全局已问 {global_qa_count} 个，本节点已问 {questions_asked_this_node} 个，本节点剩余 {remaining_questions} 个")
+            
+            # 如果剩余问题数为0，记录原因
+            if remaining_questions == 0:
+                reason = ""
+                if max_qs == 0:
+                    reason = "max_questions配置为0或因紧急情况跳过问诊"
+                elif questions_asked_this_node >= max_qs:
+                    reason = f"本节点已完成全部 {max_qs} 轮问诊"
+                
+                logger.info(f"  ℹ️  跳过问诊：{reason}")
+                if detail_logger:
+                    detail_logger.info(f"⚠️ 跳过问诊：{reason}")
+
             
             # 逐个生成问题并获取回答
             qa_list = state.agent_interactions.get("doctor_patient_qa", [])
@@ -244,12 +262,13 @@ def build_common_specialty_subgraph(
                 if alarm_keywords:
                     context_desc += f"，警报症状：{', '.join(alarm_keywords)}"
                 
-                # 第一个问题：如果chief_complaint为空，先问患者主诉是什么
-                if i == 0 and not state.chief_complaint and not doctor_agent.questions_asked:
-                    question = "您好，请问您哪里不舒服？主要是什么症状？"
+                # 第一个问题：医生总是先用开放式问题询问患者哪里不舒服
+                # 这符合真实医疗场景：医生首先让患者自己描述主要症状
+                if i == 0 and not doctor_agent.questions_asked:
+                    question = "您好，请问您哪里不舒服？"
                 else:
-                    # 使用收集到的信息（如果有的话）或者患者的描述生成问题
-                    # 注意：不使用state.chief_complaint，因为它还未确定
+                    # 后续问题：使用收集到的信息生成针对性问题
+                    # 注意：不直接使用state.chief_complaint，而是使用doctor_agent已收集的信息
                     question = doctor_agent.generate_one_question(
                         chief_complaint=doctor_agent.collected_info.get("chief_complaint", ""),
                         context=context_desc,
@@ -329,8 +348,6 @@ def build_common_specialty_subgraph(
                     logger.info(f"💬 问诊轮数: {qa_count}轮")
                     logger.info(f"⏱️  总耗时: {duration}分钟")
                     logger.info(f"🕐 时间: {start_time} → {end_time}")
-                    logger.info(f"💪 体力: {result['physical_state']['energy_level']:.1f}/10 {'🟢' if result['physical_state']['energy_level'] > 7 else '🟡' if result['physical_state']['energy_level'] > 4 else '🔴'}")
-                    logger.info(f"😣 疼痛: {result['physical_state']['pain_level']:.1f}/10 {'🟢' if result['physical_state']['pain_level'] < 3 else '🟡' if result['physical_state']['pain_level'] < 6 else '🔴'}")
                     logger.info(f"{'─'*60}")
                     
                     # 如果出现危急警报
@@ -354,6 +371,14 @@ def build_common_specialty_subgraph(
                 # 更新为医生总结的专业主诉
                 state.chief_complaint = summarized_cc
                 logger.info(f"\n  📋 医生总结主诉（专业版）: {summarized_cc}")
+                
+                # 更新数据库中的chief_complaint字段
+                if hasattr(state, 'medical_record_integration') and state.medical_record_integration:
+                    record = state.medical_record_integration.mrs.get_record(state.patient_id)
+                    if record:
+                        state.medical_record_integration.mrs.dao.update_medical_case(record.record_id, {
+                            "chief_complaint": summarized_cc
+                        })
             
             # ===== 新增：问诊质量评估 =====
             # 只有在实际问了问题时才显示评估
@@ -462,7 +487,8 @@ def build_common_specialty_subgraph(
             alarm_list = []  # 忽略其他无效值
         
         if alarm_list:
-            detail_logger.warning(f"⚠️  发现警报症状: {', '.join(str(a) for a in alarm_list)}")
+            if detail_logger:
+                detail_logger.warning(f"⚠️  发现警报症状: {', '.join(str(a) for a in alarm_list)}")
             # 终端输出（需要output level >= 2）
             if should_log(2, "specialty_subgraph", "S4"):
                 logger.warning(f"  ⚠️  发现警报症状: {', '.join(str(a) for a in alarm_list)}")
@@ -484,6 +510,23 @@ def build_common_specialty_subgraph(
                 flags=["AGENT_MODE"] if use_agents else (["LLM_PARSE_FALLBACK"] if used_fallback else ["LLM_USED"]),
             )
         )
+        
+        # 详细日志输出节点执行摘要
+        if detail_logger:
+            detail_logger.info("")
+            detail_logger.info("📤 S4 专科问诊输出:")
+            detail_logger.info(f"  • 问诊轮数: {node_qa_turns}轮")
+            if alarm_list:
+                detail_logger.info(f"  • 危险症状: {', '.join(alarm_list)}")
+            if use_agents and doctor_agent:
+                collected = doctor_agent.collected_info
+                if collected.get('chief_complaint'):
+                    detail_logger.info(f"  • 主诉: {collected['chief_complaint']}")
+                if collected.get('history', {}).get('duration'):
+                    detail_logger.info(f"  • 病程: {collected['history']['duration']}")
+            detail_logger.info(f"✅ S4 专科问诊完成")
+            detail_logger.info("")
+        
         if should_log(1, "specialty_subgraph", "S4"):
             logger.info(f"  ✅ S4完成\n")
         return state
@@ -518,15 +561,44 @@ def build_common_specialty_subgraph(
         interview_info = state.dept_payload.get(dept, {}).get("interview", {})
         interview_str = json.dumps(interview_info, ensure_ascii=False) if interview_info else "无"
         
+        # 获取问诊对话历史以提供更多上下文
+        qa_history = ""
+        if state.agent_interactions.get("doctor_patient_qa"):
+            qa_list = [qa for qa in state.agent_interactions["doctor_patient_qa"] if qa.get('stage') == f"{dept}_specialty"]
+            if qa_list:
+                qa_history = "\n【问诊对话】\n"
+                for i, qa in enumerate(qa_list[:3], 1):  # 最多显示3轮对话
+                    qa_history += f"Q{i}: {qa.get('question', '')}\n"
+                    qa_history += f"A{i}: {qa.get('answer', '')}\n"
+        
         user_prompt = (
-                f"根据{dept_name}科室特点，生成合理的体格检查结果。\n\n"
+                f"根据{dept_name}科室特点和患者主诉，生成符合临床实际的体格检查结果。\n\n"
                 + f"【主诉】{state.chief_complaint}\n"
-                + f"【专科问诊】{interview_str}\n\n"
-                + f"【要求】\n"
-                + f"1. 包含vital_signs（生命体征）和general（一般情况）\n"
-                + f"2. 根据{exam_area}添加专科体检项目\n"
-                + f"3. 结果应与主诉相符，考虑警报症状：{', '.join(alarm_keywords)}\n\n"
-                + "【输出】JSON格式：{\"exam\": {...}}"
+                + f"【专科问诊】{interview_str}\n"
+                + qa_history
+                + f"\n【要求】\n"
+                + f"1. 生命体征（vital_signs）：体温、脉搏、血压、呼吸频率等，给出具体数值\n"
+                + f"2. 一般情况（general）：神志、精神状态、营养状况、体型等，描述具体\n"
+                + f"3. {exam_area}专科体检：根据主诉和科室特点，生成相关阳性或阴性体征\n"
+                + f"4. 阳性体征与主诉相符，阴性体征用于排除相关疾病\n"
+                + f"5. 考虑警报症状：{', '.join(alarm_keywords)}\n"
+                + f"6. 体检结果应真实可信，符合医学常识\n\n"
+                + "【输出】JSON格式：\n"
+                + "{\n"
+                + "  \"exam\": {\n"
+                + "    \"vital_signs\": {\n"
+                + "      \"temperature\": \"36.5°C\",\n"
+                + "      \"pulse\": \"78次/分\",\n"
+                + "      \"blood_pressure\": \"120/80mmHg\",\n"
+                + "      \"respiration\": \"18次/分\"\n"
+                + "    },\n"
+                + "    \"general\": \"神志清楚，精神可，营养中等，体型正常\",\n"
+                + f"    \"{exam_area}_exam\": {{具体专科体检项目及结果}},\n"
+                + "    \"positive_signs\": [\"阳性体征1\", \"阳性体征2\"],\n"
+                + "    \"negative_signs\": [\"阴性体征1\", \"阴性体征2\"]\n"
+                + "  }\n"
+                + "}\n\n"
+                + "⚠️ 注意：所有数值和描述应基于主诉合理推测，不要生成不相关的异常"
         )
         fallback_data = {
             "exam": {
@@ -543,6 +615,14 @@ def build_common_specialty_subgraph(
             exam = fallback_data["exam"]
             exam["source"] = "no_llm"
             used_fallback = True
+            
+            # 使用fallback时也输出到患者日志
+            if detail_logger:
+                detail_logger.warning("⚠️  LLM不可用，使用默认体检结果")
+                detail_logger.info("\n📋 体格检查结果:")
+                detail_logger.info(f"  【一般情况】{exam.get('general', '无')}")
+                if exam.get('vital_signs'):
+                    detail_logger.info(f"  【生命体征】正常范围")
         else:
             # 执行LLM调用
             obj, used_fallback, _raw = llm.generate_json(
@@ -554,9 +634,54 @@ def build_common_specialty_subgraph(
             exam = dict(obj.get("exam") or {})
             exam["source"] = data_source
             logger.info("  ✅ 体格检查处理完成")
+            
+            # 输出体检结果到患者日志
+            if detail_logger and exam:
+                detail_logger.info("\n📋 体格检查结果:")
+                
+                # 生命体征
+                vital_signs = exam.get("vital_signs", {})
+                if vital_signs:
+                    detail_logger.info("  【生命体征】")
+                    for key, value in vital_signs.items():
+                        detail_logger.info(f"    • {key}: {value}")
+                
+                # 一般情况
+                general = exam.get("general")
+                if general:
+                    detail_logger.info(f"  【一般情况】{general}")
+                
+                # 专科体检
+                specialty_exam = exam.get(f"{exam_area}_exam")
+                if specialty_exam:
+                    detail_logger.info(f"  【{dept_name}专科体检】")
+                    if isinstance(specialty_exam, dict):
+                        for key, value in specialty_exam.items():
+                            detail_logger.info(f"    • {key}: {value}")
+                    else:
+                        detail_logger.info(f"    {specialty_exam}")
+                
+                # 阳性体征
+                positive_signs = exam.get("positive_signs", [])
+                if positive_signs:
+                    detail_logger.info("  【阳性体征】")
+                    for sign in positive_signs:
+                        detail_logger.info(f"    ✓ {sign}")
+                
+                # 阴性体征
+                negative_signs = exam.get("negative_signs", [])
+                if negative_signs:
+                    detail_logger.info("  【阴性体征】")
+                    for sign in negative_signs:  # 显示所有阴性体征
+                        detail_logger.info(f"    - {sign}")
         
         state.exam_findings.setdefault(exam_area, {})
         state.exam_findings[exam_area] = exam
+        
+        # 推进时间（体格检查约5分钟）
+        if state.world_context:
+            state.world_context.advance_time(minutes=5)
+            state.sync_physical_state()
 
         state.add_audit(
             make_audit_entry(
@@ -568,6 +693,12 @@ def build_common_specialty_subgraph(
                 flags=["REAL_DATA"] if real_physical_exam else (["LLM_PARSE_FALLBACK"] if used_fallback else ["LLM_USED"]),
             )
         )
+        
+        # 患者日志总结
+        if detail_logger:
+            detail_logger.info(f"✅ S5 {dept_name}体格检查完成")
+            detail_logger.info("")
+        
         logger.info("✅ S5节点完成\n")
         return state
 
@@ -578,7 +709,8 @@ def build_common_specialty_subgraph(
         dept_name = dept_config.get("name", "通用")
         alarm_keywords = dept_config.get("alarm_keywords", [])
         common_tests = dept_config.get("common_tests", ["血常规"])
-        
+                # 获取详细日志记录器
+        detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
         logger.info("\n" + "="*60)
         logger.info(f"� S6: {dept_name}初步判断")
         logger.info("="*60)
@@ -601,16 +733,30 @@ def build_common_specialty_subgraph(
         except:
             specialty_prompt = f"请根据{dept_name}症状制定检查方案。"
         
-        # 强化提示词：明确type标准，完全由LLM判断检查合理性
+        # 强化提示词：明确type标准，精准开具关键检查
         user_prompt = (
             specialty_prompt
             + "\n\n【任务】根据患者情况，判断是否需要辅助检查并给出初步评估。\n\n"
-            + "【指导原则】\n"
-            + f"- 警报症状：{', '.join(alarm_keywords)}\n"
-            + f"- 常规检查参考：{', '.join(common_tests)}\n"
-            + "- 症状轻微且明确：可不开检查，给予建议\n"
-            + "- 症状复杂或有警报信号：开具必要检查\n"
-            + "- 你完全自主判断哪些检查合理，不受限于列表\n\n"
+            + "【核心原则：精准开单，避免过度检查】\n"
+            + "1. 优先级评估：\n"
+            + "   - 仅开具对明确诊断和治疗方案有实质性帮助的检查\n"
+            + "   - 每项检查都应有清晰的临床目的和诊断价值\n"
+            + "   - 避免「预防性」或「以防万一」的检查\n\n"
+            + "2. 检查数量控制：\n"
+            + "   - 首次就诊通常1-3项核心检查即可\n"
+            + "   - 症状明确且轻微：可不开检查，给予对症建议\n"
+            + "   - 症状复杂或有警报信号：开具2-4项针对性检查\n"
+            + "   - 避免「检查套餐」式的大规模筛查\n\n"
+            + "3. 临床决策逻辑：\n"
+            + f"   - 警报症状（必须重视）：{', '.join(alarm_keywords)}\n"
+            + f"   - 常规基础检查参考：{', '.join(common_tests[:2])}（仅在必要时开具）\n"
+            + "   - 影像学检查（CT/MRI）：仅在高度怀疑结构性病变时开具\n"
+            + "   - 电生理检查（EEG/EMG）：仅在明确神经功能评估需求时开具\n\n"
+            + "4. 决策示例：\n"
+            + "   - 轻度头痛，无警报症状 → 不开检查，观察随访\n"
+            + "   - 头痛伴呕吐、视物模糊 → 血常规+头颅CT（排除颅内病变）\n"
+            + "   - 癫痫发作史 → EEG（评估异常放电）\n"
+            + "   - 四肢麻木无力 → 肌电图（评估周围神经）\n\n"
             + "【患者信息】\n"
             + json.dumps(
                 {
@@ -649,7 +795,8 @@ def build_common_specialty_subgraph(
             + "2. need_prep和need_schedule必须是布尔值（true/false，小写）\n"
             + "3. 每个对象内部最后一个字段后面不要加逗号\n"
             + "4. 数组最后一个元素后面不要加逗号\n"
-            + "5. 确保所有括号和引号正确配对"
+            + "5. 确保所有括号和引号正确配对\n"
+            + "6. 检查name应简洁明了，不超过50个字符（如：\"血常规\"、\"头颅MRI\"、\"抗核抗体\"）"
         )
         
         # 检查LLM是否可用
@@ -688,6 +835,11 @@ def build_common_specialty_subgraph(
         ordered = list(obj.get("ordered_tests") or [])
         summary = dict(obj.get("specialty_summary") or {})
         logger.info("  ✅ 检查方案生成完成")
+        
+        # 推进时间（医生初步判断与开单约5分钟）
+        if state.world_context:
+            state.world_context.advance_time(minutes=5)
+            state.sync_physical_state()
 
         # 标准化检查项目（不做白名单过滤，完全信任LLM判断）
         normalized: list[dict[str, Any]] = []
@@ -739,6 +891,26 @@ def build_common_specialty_subgraph(
                 flags=["LLM_PARSE_FALLBACK"] if used_fallback else ["LLM_USED"],
             )
         )
+        
+        # 详细日志输出节点执行摘要
+        if detail_logger:
+            detail_logger.info("")
+            detail_logger.info("📤 S6 初步判断输出:")
+            detail_logger.info(f"  • 需要辅助检查: {'是' if need_aux_tests else '否'}")
+            if ordered:
+                detail_logger.info(f"  • 开具检查: {len(ordered)}项")
+                for test in ordered[:3]:  # 最多显示3项
+                    detail_logger.info(f"      - {test['name']} ({test['type']})")
+                if len(ordered) > 3:
+                    detail_logger.info(f"      ... 还有 {len(ordered) - 3} 项")
+            if summary:
+                if summary.get('problem_list'):
+                    detail_logger.info(f"  • 问题列表: {', '.join(summary['problem_list'][:3])}")
+                if summary.get('assessment'):
+                    detail_logger.info(f"  • 评估: {summary['assessment'][:80]}...")
+            detail_logger.info(f"✅ S6 初步判断完成")
+            detail_logger.info("")
+        
         logger.info("✅ S6节点完成\n")
         return state
 

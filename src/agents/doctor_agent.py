@@ -622,6 +622,139 @@ class DoctorAgent:
                 return "看到检查结果有些异常，您最近身体还有其他不适吗？"
             return ""
     
+    def generate_clarification_question(
+        self,
+        diagnosis_info: dict[str, Any],
+        collected_info: dict[str, Any]
+    ) -> str:
+        """基于诊断不确定性生成澄清问题
+        
+        Args:
+            diagnosis_info: 诊断信息，包括current_diagnosis, uncertainty_reason, test_results, rule_out等
+            collected_info: 已收集的信息
+            
+        Returns:
+            单个问题字符串，如果不需要继续问则返回空字符串
+        """
+        
+        if not self._llm:
+            return ""
+        
+        # 构建已问问题列表
+        asked_summary = "\n".join([f"Q{i+1}: {q}" for i, q in enumerate(self.questions_asked)])
+        
+        current_diagnosis = diagnosis_info.get("current_diagnosis", "未明确")
+        uncertainty_reason = diagnosis_info.get("uncertainty_reason", "")
+        test_results_summary = diagnosis_info.get("test_results", [])
+        rule_out_list = diagnosis_info.get("rule_out", [])
+        
+        system_prompt = f"""你是一名经验丰富的{self._dept_name()}医生，当前面临诊断不确定的情况，需要通过补充问诊来明确诊断。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【当前诊断】
+{current_diagnosis}
+
+【不确定原因】
+{uncertainty_reason}
+
+【检查结果摘要】
+{json.dumps(test_results_summary, ensure_ascii=False, indent=2)}
+
+【需要鉴别的诊断】
+{json.dumps(rule_out_list, ensure_ascii=False, indent=2)}
+
+【已收集的信息】
+{json.dumps(collected_info, ensure_ascii=False, indent=2)}
+
+【之前的提问】
+{asked_summary if asked_summary else "（尚未提问）"}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【临床思维流程】
+
+1️⃣ **诊断不确定性分析**
+   - 为什么当前诊断不确定？缺少哪些关键信息？
+   - 有哪些鉴别诊断需要排除？
+   - 哪些症状、体征或病史能够帮助鉴别？
+
+2️⃣ **鉴别诊断的关键点**
+   - A诊断和B诊断的主要区别是什么？
+   - 有哪些特征性症状或病史可以帮助鉴别？
+   - 患者是否有未提及但对诊断有价值的信息？
+
+3️⃣ **病程和伴随症状**
+   - 症状的时间顺序和演变过程
+   - 是否有伴随症状或诱发因素
+   - 既往类似发作的情况
+
+4️⃣ **治疗和用药史**
+   - 之前是否接受过治疗？效果如何？
+   - 是否服用过相关药物？
+   - 有无过敏史或禁忌症？
+
+【决策指南】
+
+✅ **需要追问**（满足以下任一条件）：
+- 有助于在多个鉴别诊断中明确主要诊断
+- 能够排除重要的鉴别诊断
+- 补充关键的病史、症状细节或伴随症状
+- 了解治疗史或用药史，有助于评估病情
+- 与当前诊断的不确定性直接相关
+
+🛑 **无需追问**（满足以下情况）：
+- 已有足够信息支持当前诊断
+- 鉴别诊断已基本排除
+- 该信息对诊断决策无实质影响
+- 需要进一步检查而非问诊来明确
+- 与之前问题重复
+
+【输出要求】
+生成一个问题，满足：
+1. **针对性强**：直接针对诊断不确定性或鉴别诊断
+2. **简洁易懂**：用患者能理解的语言
+3. **临床价值**：对明确诊断有直接帮助
+4. **不重复**：与之前问题不重复
+
+如果不需要追问，返回空字符串 ""
+
+【优秀提问示例】
+
+场景1：鉴别紧张性头痛 vs 偏头痛
+✅ "头痛的时候，是整个头都疼，还是一侧疼得更明显？"
+✅ "头疼的时候，有没有恶心想吐的感觉？"
+✅ "光线或声音会让头疼加重吗？"
+
+场景2：鉴别病毒性感染 vs 细菌性感染
+✅ "咳出来的痰是什么颜色的？是清的还是黄绿色的？"
+✅ "鼻涕是清水样的还是浓稠的？"
+
+场景3：鉴别功能性 vs 器质性疾病
+✅ "这个症状是最近才出现的，还是很多年了？"
+✅ "之前做过什么检查吗？结果怎么样？"
+✅ "有没有治疗过？用了什么药？效果如何？"
+
+❌ 避免泛泛的问题："您还有其他症状吗？"
+"""
+        
+        user_prompt = '请生成一个问题，输出JSON格式：{"question": "问题内容"} 或 {"question": ""} 表示无需继续提问'
+        
+        try:
+            obj, _, _ = self._llm.generate_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                fallback=lambda: {"question": ""},
+                temperature=0.3
+            )
+            question = str(obj.get("question", ""))
+            
+            # 检查是否与之前的问题重复
+            if question and self._is_duplicate_question(question):
+                return ""
+            
+            return question
+        except Exception:
+            return ""
+    
     def _is_duplicate_question(self, new_question: str) -> bool:
         """检测新问题是否与已问问题重复
         

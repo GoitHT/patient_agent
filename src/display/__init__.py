@@ -1,6 +1,6 @@
 """显示模块 - 日志格式化和输出展示"""
 
-from .log_formatter import get_patient_color, format_patient_log
+from .log_formatter import get_patient_color, format_patient_log, COLOR_RESET
 from .output_formatter import (
     render_summary,
     display_startup_banner,
@@ -13,6 +13,7 @@ from .output_formatter import (
 __all__ = [
     "get_patient_color",
     "format_patient_log",
+    "COLOR_RESET",
     "render_summary",
     "display_startup_banner",
     "display_mode_info",

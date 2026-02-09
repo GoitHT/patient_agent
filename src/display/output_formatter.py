@@ -41,12 +41,7 @@ def display_startup_banner(config: Any) -> None:
     logger.info("\n" + "="*80)
     logger.info("🏥 医院智能体系统 - Hospital Agent System")
     logger.info("="*80)
-    logger.info("启动系统 ")
-    logger.info(f"\n⚙️  核心配置:")
-    logger.info(f"  • 医生问诊配额: {config.agent.max_questions} 个问题")
-    logger.info(f"  • 护士分诊问题: {config.agent.max_triage_questions} 个问题")
-    logger.info(f"  • LLM后端: {config.llm.backend}")
-    logger.info("")
+    logger.info(f"⚙️  配置: 问诊{config.agent.max_questions}轮 | 分诊{config.agent.max_triage_questions}轮 | LLM={config.llm.backend}")
 
 
 def display_mode_info(num_patients: int, patient_interval: float) -> None:
@@ -57,14 +52,9 @@ def display_mode_info(num_patients: int, patient_interval: float) -> None:
         patient_interval: 患者间隔
     """
     if num_patients == 1:
-        logger.info("🏥 启动单患者模式")
+        logger.info("🏥 单患者模式")
     else:
-        logger.info(f"🏥 启动多患者并发模式 (共设置{num_patients}名患者)")
-    
-    logger.info("="*80)
-    logger.info(f"患者数量: {num_patients}")
-    if num_patients > 1:
-        logger.info(f"患者进入间隔: {patient_interval} 秒")
+        logger.info(f"🏥 多患者模式: {num_patients}名患者 | 间隔{patient_interval}秒")
     logger.info("="*80 + "\n")
 
 
@@ -106,18 +96,14 @@ def display_final_statistics(results: List[Dict[str, Any]], num_patients: int) -
         num_patients: 患者总数
     """
     success_count = sum(1 for r in results if r.get("status") == "completed")
-    failed_count = len(results) - success_count
-    
-    logger.info("\n" + "="*80)
-    logger.info("📈 最终统计")
-    logger.info("="*80)
     
     if num_patients == 1:
-        logger.info(f"✅ 诊断状态: {'成功' if success_count == 1 else '失败'}")
+        status_emoji = "✅" if success_count == 1 else "❌"
+        status_text = "成功" if success_count == 1 else "失败"
+        logger.info(f"\n{status_emoji} 诊断状态: {status_text}")
     else:
-        logger.info(f"✅ 成功: {success_count}/{len(results)}")
-        logger.info(f"❌ 失败: {failed_count}/{len(results)}")
-        logger.info(f"📊 总计: {len(results)} 名患者")
+        failed_count = len(results) - success_count
+        logger.info(f"\n✅ 成功: {success_count}/{len(results)} | ❌ 失败: {failed_count}/{len(results)}")
 
 
 def display_log_files(num_results: int) -> None:
@@ -126,15 +112,12 @@ def display_log_files(num_results: int) -> None:
     Args:
         num_results: 结果数量
     """
-    logger.info("\n" + "="*80)
-    logger.info("📄 输出文件汇总")
-    logger.info("="*80)
-    logger.info("\n📋 患者详细日志:")
-    
     patient_logs = sorted(
         Path("logs/patients").glob("*.log"),
         key=lambda x: x.stat().st_mtime,
         reverse=True
     )
-    for log_path in patient_logs[:num_results]:
-        logger.info(f"  • {log_path}")
+    if patient_logs:
+        logger.info(f"📋 详细日志: {patient_logs[0].name}")
+        if num_results > 1:
+            logger.info(f"   (+{num_results-1} 个其他文件)")

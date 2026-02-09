@@ -18,7 +18,7 @@
 
 患者门诊管理多智能体系统是一个基于 **LangGraph** 编排的医院门诊诊疗流程模拟平台。系统采用多智能体协作模式（医生、护士、患者、检验科），当前支持 **神经医学科**，通过本地 **RAG 知识库**检索和可选的 **DeepSeek LLM** 增强，实现了高度可追踪、可复现的医疗流程仿真。
 
-**v2.0 架构升级**：采用模块化设计，main 函数精简至 150 行纯流程编排，职责清晰分离，易于维护和扩展。
+**v2.0 架构升级**：采用模块化设计，main 函数精简至 160 行纯流程编排（11步清晰流程），职责清晰分离，易于维护和扩展。配置管理直接整合到 Config 类，无需额外的加载器层。
 
 ### 🎯 核心特性
 
@@ -101,37 +101,18 @@ python src/main.py --enable-reports
 
 ### 配置管理
 
-项目支持通过 `config.yaml` 进行配置，优先级从高到低：
+项目支持多层级配置，优先级从高到低：**CLI参数** > **环境变量** > **config.yaml** > **代码默认值**
 
-1. 命令行参数
-2. 环境变量
-3. `config.yaml` 配置文件
-4. 代码默认值
+**核心配置项**：
+- **LLM配置**：backend（mock/deepseek）、enable_reports
+- **智能体配置**：max_questions、max_triage_questions
+- **RAG配置**：persist_dir、collection_name、skip_rag
+- **运行模式**：multi_patient、num_patients、patient_interval
+- **物理环境**：enable_simulation、interactive、use_sim_clock
+- **数据库**：enabled、connection_string、backup_to_file
+- **系统**：verbose、log_file、save_trace、enable_trace
 
-```yaml
-# src/config.yaml - 关键配置项
-
-llm:
-  backend: deepseek        # mock 或 deepseek
-  enable_reports: false    # 使用LLM增强检查报告
-
-agent:
-  max_questions: 3         # 医生最多问题数
-  max_triage_questions: 3  # 护士分诊最多问题数
-
-mode:
-  multi_patient: true      # 启用多患者模式
-  num_patients: 1          # 患者数量
-  patient_interval: 60     # 患者进入间隔（秒）
-
-physical:
-  enable_simulation: true  # 启用物理环境模拟
-  interactive: false       # 交互式命令模式
-
-database:
-  enabled: true
-  connection_string: "mysql+pymysql://root:123456@localhost:3306/agent"
-```
+> 📄 完整配置示例请参考 `src/config.yaml` 文件
 
 ---
 
@@ -141,10 +122,9 @@ database:
 patient_agent/
 ├── src/
 │   ├── main.py                      # 🚀 主程序入口（极简流程编排）
-│   ├── main_backup.py               # 原main.py备份
+│   ├── config.py                    # ⚙️ 配置管理（支持多层级配置加载）
+│   ├── config.yaml                  # 📝 配置文件
 │   │
-│   ├── bootstrap/                   # ⚙️ 系统启动模块
-│   │   └── loader.py                # 配置加载器
 │   ├── core/                        # 🏭 核心组件模块
 │   │   └── initializer.py           # SystemInitializer（组件初始化）
 │   ├── display/                     # 📺 显示与格式化模块
@@ -169,17 +149,17 @@ patient_agent/
 │   │       └── common_specialty_subgraph.py  # 通用专科子图（S4-S6）
 │   ├── services/                    # 🔧 服务层
 │   │   ├── workflow/                # 工作流控制
-│   │   │   ├── multi_patient.py     # MultiPatientWorkflow（多患者流程）
-│   │   │   └── single_case.py       # 单病例处理（已废弃）
+│   │   │   └── multi_patient.py     # MultiPatientWorkflow（多患者流程）
 │   │   ├── appointment.py           # 预约服务
 │   │   ├── billing.py               # 缴费服务
 │   │   ├── lab.py                   # 实验室检查
 │   │   ├── imaging.py               # 影像检查
-│   │   ├── endoscopy.py             # 内镜检查
-│   │   ├── neurophysiology.py       # 神经生理检查
 │   │   ├── llm_client.py            # LLM 客户端
 │   │   ├── medical_record.py        # 病例管理（文件存储）
-│   │   └── medical_record_db_service.py  # 病例管理（数据库存储）
+│   │   ├── medical_record_db_service.py  # 病例管理（数据库存储）
+│   │   ├── medical_record_dao.py    # 病例数据访问对象
+│   │   ├── medical_record_integration.py  # 病例集成
+│   │   └── db_models.py             # 数据库模型
 │   ├── state/
 │   │   └── schema.py                # BaseState 定义
 │   ├── integration/                 # 集成适配层
@@ -211,8 +191,8 @@ patient_agent/
 │   ├── build_index.py               # 构建向量索引
 │   └── seed_kb_examples.py          # 初始化示例数据
 ├── tests/                           # 测试用例
-├── config.yaml                      # 全局配置文件
 ├── requirements.txt                 # 依赖清单
+├── config.yaml                      # 全局配置文件
 └── README.md
 ```
 
@@ -221,6 +201,8 @@ patient_agent/
 ## 🏗️ 流程设计
 
 ### 门诊流程图（C1-C16）
+
+#### 文本流程图
 
 ```
 患者挂号登记 (C1-C4)
@@ -232,23 +214,56 @@ patient_agent/
 判断是否需要辅助检查 (C7)
     ├─→ 是 → 开单准备说明 (C8) [RAG: 检查准备]
     │         ↓
-    │     缴费和预约 (C9)
+    │     缴费和预约 (C9) [Mock: 预约系统]
     │         ↓
-    │     获取检查结果 (C10a) [Mock/LLM生成]
-    │         ↓
-    │     增强报告叙述 (C10b) [LLM可选]
+    │     执行检查并增强报告 (C10) [Lab Agent生成 + LLM增强]
     │         ↓
     │     报告回诊 (C11) [RAG: 诊疗方案]
     │         ↓
     └─────→ 综合分析诊断 (C12) [RAG: 诊疗方案/文书]
             ↓
-        处置决策 (C13) [检查升级建议]
+        处置决策 (C13) [升级建议]
             ↓
-        生成诊疗文书 (C14)
+        生成诊疗文书 (C14) [RAG: 文书模板]
             ↓
         健康宣教与随访 (C15) [RAG: 健康教育]
             ↓
-        完成流程 (C16)
+        完成流程 (C16) [统计与评估]
+```
+
+#### Mermaid 流程图
+
+```mermaid
+graph TD
+    C1[C1: 开始门诊] --> C2[C2: 预约挂号]
+    C2 --> C3[C3: 签到候诊]
+    C3 --> C4[C4: 叫号入诊]
+    C4 --> C5[C5: 问诊准备<br/>RAG: 通用SOP]
+    C5 --> C6[C6: 专科流程调度]
+    C6 --> S4[S4: 专科问诊<br/>一问一答]
+    S4 --> S5[S5: 体格检查]
+    S5 --> S6[S6: 初步判断]
+    S6 --> C7{C7: 需要检查?}
+    
+    C7 -->|是| C8[C8: 开单准备说明<br/>RAG: 检查准备]
+    C8 --> C9[C9: 缴费与预约]
+    C9 --> C10[C10: 执行检查<br/>Lab Agent + LLM]
+    C10 --> C11[C11: 报告回诊<br/>RAG: 诊疗方案]
+    
+    C7 -->|否| C12[C12: 综合分析诊断<br/>RAG: 诊疗方案/文书]
+    C11 --> C12
+    
+    C12 --> C13[C13: 处置决策<br/>升级建议]
+    C13 --> C14[C14: 生成文书<br/>RAG: 文书模板]
+    C14 --> C15[C15: 健康宣教<br/>RAG: 健康教育]
+    C15 --> C16[C16: 完成流程<br/>统计与评估]
+    
+    style C6 fill:#e1f5ff
+    style S4 fill:#e1f5ff
+    style S5 fill:#e1f5ff
+    style S6 fill:#e1f5ff
+    style C10 fill:#fff3e0
+    style C12 fill:#e8f5e9
 ```
 
 ### 专科子图（S4-S6）
@@ -266,6 +281,37 @@ patient_agent/
 - 综合分析决定是否需要辅助检查
 - RAG 检索诊疗指南确定检查建议
 
+### 完整节点说明
+
+#### 通用门诊流程（C1-C16）
+
+| 节点 | 名称 | 职责 | 关键技术 |
+|------|------|------|---------|
+| C1 | 开始门诊流程 | 验证状态、记录开始时间 | 状态初始化 |
+| C2 | 预约挂号 | 挂号、生成就诊号 | AppointmentService |
+| C3 | 签到候诊 | 患者签到、进入候诊队列 | 队列管理 |
+| C4 | 叫号入诊 | 医生叫号、分配诊室 | 医生资源调度 |
+| C5 | 问诊准备 | 检索通用SOP、初始化问诊记录 | RAG检索 |
+| C6 | 专科流程调度 | 调用专科子图（S4-S6） | 子图调度 |
+| C7 | 路径决策 | 判断是否需要辅助检查 | 条件分支 |
+| C8 | 开单与准备说明 | 开具检查单、检索准备知识 | RAG检索 |
+| C9 | 缴费与预约 | 生成订单、预约检查时间 | BillingService |
+| C10 | 执行检查 | 执行检查、生成结果、LLM增强报告 | Lab Agent + LLM |
+| C11 | 报告回诊 | 医生解读报告、复诊评估 | RAG检索诊疗方案 |
+| C12 | 综合分析诊断 | 明确诊断、制定治疗方案 | RAG检索 + 三智能体 |
+| C13 | 处置决策 | 升级建议（急诊/住院/会诊/转诊） | 规则引擎 |
+| C14 | 生成文书 | 生成病历、诊断证明、病假条 | RAG检索模板 |
+| C15 | 健康宣教与随访 | 健康教育、随访安排 | RAG检索宣教内容 |
+| C16 | 完成流程 | 记录结束时间、统计、评估 | 流程统计 |
+
+#### 专科子图（S4-S6）
+
+| 节点 | 名称 | 职责 | 关键技术 |
+|------|------|------|---------|
+| S4 | 专科问诊 | 一问一答模式问诊、收集病史 | Doctor Agent + Patient Agent + RAG |
+| S5 | 体格检查 | 模拟体格检查、记录体征 | 基于病例数据模拟 |
+| S6 | 初步判断 | 分析是否需要辅助检查、开具检查单 | Doctor Agent + RAG |
+
 ---
 
 ## 🧪 核心模块详解
@@ -274,227 +320,51 @@ patient_agent/
 
 系统采用**模块化分层架构**，职责清晰分离：
 
-- **入口层** (`main.py`)：极简流程编排（150行），11步清晰流程
-- **启动层** (`bootstrap/`)：配置加载与系统初始化
+- **入口层** (`main.py`)：极简流程编排（160行），11步清晰流程
+- **配置层** (`config.py`)：多层级配置管理（CLI > 环境变量 > YAML > 默认值）
 - **核心层** (`core/`)：组件初始化器，统一管理所有核心组件
-- **显示层** (`display/`)：日志格式化和输出展示
-- **业务层** (`services/workflow/`)：工作流控制和业务逻辑
+- **显示层** (`display/`)：日志格式化和输出展示（共164行）
+- **业务层** (`services/workflow/`)：工作流控制和业务逻辑（共282行）
 - **智能体层** (`agents/`)：医生、护士、患者、检验科智能体
 - **编排层** (`graphs/`)：LangGraph 流程图定义
 
 ### 1. 系统初始化器 (`core/initializer.py`)
 
-**职责**：统一管理所有核心组件的初始化
-
-```python
-class SystemInitializer:
-    def initialize_logging(self) -> None:
-        """初始化日志系统"""
-    
-    def initialize_llm(self) -> Any:
-        """初始化大语言模型"""
-    
-    def initialize_rag(self) -> Any:
-        """初始化知识库检索器"""
-    
-    def initialize_services(self) -> Any:
-        """初始化服务组件"""
-    
-    def initialize_medical_record(self, storage_dir: Path) -> Any:
-        """初始化病例库服务"""
-    
-    def initialize_coordinator(self, medical_record_service: Any) -> Any:
-        """初始化医院协调器"""
-```
+统一管理所有核心组件的初始化，包括日志系统、大语言模型、知识库检索器、业务服务（预约、计费）、病例库服务和医院协调器的初始化。
 
 ### 2. 多患者工作流 (`services/workflow/multi_patient.py`)
 
-**职责**：多患者并发诊断流程控制
-
-```python
-class MultiPatientWorkflow:
-    def register_doctors(self, num_doctors: int) -> None:
-        """注册医生到协调器"""
-    
-    def initialize_processor(self, num_patients: int) -> None:
-        """初始化多患者处理器"""
-    
-    def select_patient_cases(self, num_patients: int) -> List[int]:
-        """从数据集随机选择患者病例"""
-    
-    def schedule_patients(self, case_ids: List[int], interval: float) -> List[str]:
-        """按时间间隔调度患者"""
-    
-    def start_monitoring(self) -> threading.Thread:
-        """启动状态监控线程"""
-    
-    def wait_for_completion(self, num_patients: int, timeout: int) -> List[Dict]:
-        """等待所有患者完成"""
-    
-    def shutdown(self) -> None:
-        """关闭处理器"""
-```
+负责多患者并发诊断流程控制，包括医生注册、患者处理器初始化、病例选择、患者调度、状态监控、完成等待和系统关闭等功能。
 
 ### 3. 医生智能体 (`agents/doctor_agent.py`)
 
-**职责**：问诊、检查建议、诊断制定
-
-**关键方法**：
-
-```python
-class DoctorAgent:
-    def reset(self) -> None:
-        """重置医生状态（处理新患者前必须调用）"""
-    
-    def generate_one_question(self, chief_complaint: str, context: str) -> str:
-        """生成单个问题（一问一答模式）"""
-    
-    def ask_patient(self, patient_agent, chief_complaint: str, context: str) -> dict:
-        """完整问诊流程"""
-    
-    def suggest_tests(self, collected_info: dict) -> list[dict]:
-        """建议检查项目"""
-    
-    def analyze_and_diagnose(self, collected_info: dict, test_results: list) -> dict:
-        """综合分析给出诊断"""
-```
+负责问诊、检查建议、诊断制定。支持状态重置、一问一答模式问诊、完整问诊流程、检查项目建议、综合分析诊断等核心医疗决策功能。
 
 ### 4. 护士智能体 (`agents/nurse_agent.py`)
 
-**职责**：分诊、生命体征测量、宣教
-
-```python
-class NurseAgent:
-    def triage(self, patient_description: str) -> str:
-        """科室分诊"""
-    
-    def explain_test_prep(self, test_name: str, prep_info: dict) -> str:
-        """解释检查前准备"""
-```
+负责科室分诊、生命体征测量、健康宣教、检查前准备说明等护理工作。
 
 ### 5. 患者智能体 (`agents/patient_agent.py`)
 
-**职责**：模拟真实患者症状和回答
-
-```python
-class PatientAgent:
-    def describe_to_nurse(self) -> str:
-        """向护士描述症状"""
-    
-    def answer_doctor_question(self, question: str) -> str:
-        """回答医生问题（基于病例数据）"""
-```
+模拟真实患者症状和回答，基于病例数据向护士描述症状、回答医生问题，实现逼真的患者交互。
 
 ### 6. 医院协调器 (`coordination/coordinator.py`)
 
-**职责**：多患者并发管理、医生资源调度
-
-```python
-class HospitalCoordinator:
-    def register_doctor(self, doctor_id: str, name: str, dept: str) -> None:
-        """注册医生"""
-    
-    def register_patient(self, patient_id: str, patient_data: dict, dept: str) -> str:
-        """患者挂号"""
-    
-    def get_available_doctors(self, dept: str) -> list:
-        """获取空闲医生"""
-    
-    def assign_doctor_manually(self, patient_id: str, doctor_id: str) -> bool:
-        """手动指定医生"""
-```
+多患者并发管理和医生资源调度中心，负责医生注册、患者挂号、医生分配、空闲医生查询等协调工作。
 
 ### 7. 物理环境模拟 (`environment/hospital_world.py`)
 
-**职责**：模拟医院物理空间、时间、资源
-
-```python
-class HospitalWorld:
-    def add_agent(self, agent_id: str, agent_type: str, initial_location: str) -> bool:
-        """添加agent到环境"""
-    
-    def move_agent(self, agent_id: str, target_location: str) -> (bool, str):
-        """移动agent（自动寻路）"""
-    
-    def advance_time(self, minutes: int) -> None:
-        """推进时间"""
-    
-    def use_device(self, agent_id: str, device_name: str) -> (bool, str):
-        """使用医疗设备（自动排队）"""
-    
-    def perform_exam(self, patient_id: str, exam_type: str, priority: int) -> (bool, str):
-        """执行检查"""
-```
+模拟医院物理空间、时间流逝、设备资源等真实约束，支持 agent 添加、移动、设备使用、检查执行等物理世界交互。
 
 ### 8. RAG 检索系统 (`rag.py`)
 
-**向量数据库**：ChromaDB
-**嵌入模型**：HashEmbeddingFunction（完全本地、确定性）
-**支持过滤**：按 dept 和 type 过滤
+基于 ChromaDB 向量数据库和 HashEmbeddingFunction 嵌入模型的本地知识检索系统，支持按科室和类型过滤，自动包含文档信息、相关度评分等元数据。
 
-```python
-class ChromaRetriever:
-    def retrieve(self, query: str, filters: dict = None, k: int = 3) -> list[dict]:
-        """检索知识片段"""
-        # 自动包含 doc_id, chunk_id, source, score 等元数据
-```
-
-**知识库结构**：
-
-```
-kb/
-├── hospital/dept=hospital
-│   ├── sop_intake.md (type=sop)
-│   └── education_common.md (type=education)
-├── forms/dept=forms
-│   ├── template_emr.md (type=template)
-│   └── template_diagnosis_cert.md
-└── neuro/dept=neuro
-    ├── education_neuro.md (type=education)
-    ├── guide_redflags.md (type=guide)
-    ├── plan_neuro.md (type=plan)
-    └── prep_mri.md (type=prep)
-```
+**知识库结构**：按科室和类型组织，包括医院通用知识（SOP、通用教育）、文书模板（病历、诊断证明）和专科知识（神经科教育、红旗症状指南、诊疗方案、检查准备）。
 
 ### 9. 状态管理 (`state/schema.py`)
 
-**BaseState** 包含完整的就诊状态：
-
-```python
-class BaseState(BaseModel):
-    run_id: str                    # 运行ID
-    dept: str                      # 科室
-    patient_id: str                # 患者ID
-    chief_complaint: str           # 主诉
-    history_present_illness: dict  # 现病史
-    ordered_tests: List[dict]      # 检查/检验单
-    test_results: List[dict]       # 检查报告
-    diagnosis: dict                # 诊断
-    treatment_plan: dict           # 治疗方案
-    escalations: List[str]         # 升级建议
-    audit_trail: List[dict]        # 审计追踪
-    retrieved_chunks: List[dict]   # RAG检索结果
-```
-
-**审计追踪格式**：
-
-```json
-{
-  "ts": "2026-02-02T10:30:00Z",
-  "node_name": "C5_common_intake",
-  "inputs_summary": {...},
-  "outputs_summary": {...},
-  "decision": "proceed_to_specialty",
-  "citations": [
-    {
-      "doc_id": "hospital_sop_001",
-      "chunk_id": "ch_003",
-      "score": 0.89
-    }
-  ],
-  "flags": ["LLM_USED", "RAG_RETRIEVED"]
-}
-```
+BaseState 包含完整的就诊状态信息：运行ID、科室、患者ID、主诉、现病史、检查单、检查报告、诊断、治疗方案、升级建议、审计追踪、RAG检索结果等核心数据。审计追踪记录每个节点的时间戳、输入输出摘要、决策依据、引用文献和标志位（LLM使用、RAG检索等）。
 
 ---
 
@@ -502,29 +372,23 @@ class BaseState(BaseModel):
 
 ### v2.0 模块化重构
 
-系统经过全面重构，采用职责清晰的模块化架构：
-
-#### 重构前（v1.0）
-- ❌ main.py 超过 1500 行
-- ❌ 业务逻辑、初始化、格式化代码混杂
-- ❌ 难以维护和测试
-
 #### 重构后（v2.0）
-- ✅ main.py 仅 150 行（11步清晰流程）
+- ✅ main.py 仅 160 行（11步清晰流程）
 - ✅ 职责分离：配置、初始化、业务、显示各司其职
 - ✅ 易于维护：修改某功能只需修改对应模块
 - ✅ 易于测试：每个模块可独立测试
 - ✅ 易于扩展：新增功能不影响主流程
+- ✅ 配置直接整合：Config.load() 统一管理配置加载
 
-#### 新增模块
+#### 核心模块
 
 | 模块 | 职责 | 行数 |
 |------|------|------|
-| `bootstrap/` | 配置加载 | ~20 |
-| `core/` | 组件初始化 | ~150 |
-| `display/` | 格式化输出 | ~200 |
-| `services/workflow/` | 工作流控制 | ~400 |
-| `main.py` | 流程编排 | ~150 |
+| `config.py` | 配置管理 | ~287 |
+| `core/` | 组件初始化 | ~134 |
+| `display/` | 格式化输出 | ~164 |
+| `services/workflow/` | 工作流控制 | ~282 |
+| `main.py` | 流程编排 | ~160 |
 
 **设计原则**：
 - 单一职责原则（SRP）
@@ -534,33 +398,19 @@ class BaseState(BaseModel):
 
 ---
 
-## 🔧 高级用法
+## 🔧 高级功能
 
 ### 自定义配置
 
-```bash
-# 使用自定义配置文件
-python src/main.py --config my_config.yaml
-```
+使用 `--config` 参数指定自定义配置文件，或通过环境变量覆盖特定配置项。
 
 ### 审计追踪分析
 
-```python
-import json
-
-# 加载保存的追踪
-with open("trace.json") as f:
-    trace = json.load(f)
-
-# 分析RAG引用
-for entry in trace.get("audit_trail", []):
-    if entry.get("citations"):
-        print(f"{entry['node_name']}: {len(entry['citations'])} citations")
-
-# 检查LLM调用
-llm_calls = [e for e in trace.get("audit_trail", []) if "LLM_USED" in e.get("flags", [])]
-print(f"Total LLM calls: {len(llm_calls)}")
-```
+系统自动记录完整的追踪日志（`agent_trace.json`），包含：
+- **RAG引用溯源**：每个节点的知识库检索记录和引用文献
+- **LLM调用统计**：LLM使用标记和调用次数
+- **决策路径**：每步的输入输出摘要和决策依据
+- **时间戳**：精确到毫秒的流程时间线
 
 ---
 
@@ -574,8 +424,6 @@ print(f"Total LLM calls: {len(llm_calls)}")
 | 缴费服务 | `billing.py` | 费用计算、记录 | ✅ Seed-based |
 | 实验室 | `lab.py` | 血常规、肝功能等 | ✅ Mock数据 |
 | 影像检查 | `imaging.py` | CT、MRI、超声 | ✅ Mock数据 |
-| 内镜检查 | `endoscopy.py` | 胃镜、肠镜 | ✅ Mock数据 |
-| 神经生理 | `neurophysiology.py` | EEG、EMG、NCV | ✅ Mock数据 |
 
 ---
 
@@ -583,12 +431,16 @@ print(f"Total LLM calls: {len(llm_calls)}")
 
 ### 红旗症状识别
 
-系统自动检测危重症状并触发升级：
+系统在 C12（综合分析诊断）节点通过 `apply_safety_rules()` 自动检测危重症状并触发升级：
 
-- 🚨 **急诊**：生命体征异常、急性胸痛等
-- 🏥 **住院**：严重并发症、需要住院治疗
-- 👥 **会诊**：疑难病例、多学科协作
-- ➡️ **转诊**：超出本科室诊疗范围
+**自动触发急诊**：
+- 🚨 神经系统红旗：意识障碍、昏迷、偏瘫、肢体无力、言语不清
+
+**自动触发会诊**：
+- 👥 影像检查异常需进一步评估
+- 👥 实验室检查异常需结合临床处理
+
+> 💡 升级建议记录在 `state.escalations` 字段，并在随访计划中提示应急处理
 
 ---
 
@@ -596,32 +448,16 @@ print(f"Total LLM calls: {len(llm_calls)}")
 
 ### 文件存储模式
 
-病例数据存储在 `medical_records/` 目录：
-
-```
-medical_records/
-├── patient_001.json
-├── patient_002.json
-└── ...
-```
+病例数据以 JSON 格式存储在 `medical_records/` 目录，每个患者一个独立文件。
 
 ### 数据库存储模式
 
-支持 MySQL 持久化，表结构：
+支持 MySQL 持久化，包含三个核心表：
+- **Patient 表**：患者基本信息
+- **MedicalCase 表**：就诊病例（支持多次就诊）
+- **Examination 表**：检查检验结果
 
-**Patient 表**：患者基本信息
-**MedicalCase 表**：就诊病例（支持多次就诊）
-**Examination 表**：检查检验结果
-
-配置数据库：
-
-```yaml
-# config.yaml
-database:
-  enabled: true
-  connection_string: "mysql+pymysql://user:password@host:port/dbname"
-  backup_to_file: true  # 同时备份到文件
-```
+在 `config.yaml` 中配置 `database.enabled: true` 并设置连接字符串即可启用。
 
 ---
 
@@ -639,21 +475,9 @@ database:
 
 ## 📝 日志系统
 
-系统为每个患者生成详细的日志文件：
+系统为每个患者在 `logs/patients/` 目录生成独立日志文件（格式：`patient_XXX_日期_时间.log`）。
 
-```
-logs/patients/
-├── patient_001_20260202_103000.log
-├── patient_002_20260202_103100.log
-└── ...
-```
-
-**日志包含**：
-- ✅ 完整的诊疗流程记录
-- ✅ 医生问诊对话
-- ✅ RAG 检索结果与引用
-- ✅ 检查报告和诊断结果
-- ✅ 审计追踪和决策理由
+**日志内容**：完整诊疗流程、问诊对话、RAG检索结果、检查报告、诊断结果、审计追踪和决策依据。
 
 ---
 
@@ -668,6 +492,8 @@ logs/patients/
 | PyMySQL | 1.1.1 | MySQL 驱动 |
 | Typer | 0.21.1 | CLI 框架 |
 | Rich | 14.3.0 | 彩色输出 |
+| NumPy | 2.4.1 | 数值计算 |
+| Pandas | 2.2.0 | 数据处理 |
 
 ---
 
@@ -685,7 +511,7 @@ logs/patients/
 | **红旗症状识别** | ✅ 完整 | 自动升级触发 |
 | **多科室支持** | ✅ 可扩展 | 当前神经科，框架支持扩展 |
 | **模块化架构** | ✅ v2.0 | 职责清晰，易维护扩展 |
-| **流程编排** | ✅ 极简 | main函数150行纯流程编排 |
+| **流程编排** | ✅ 极简 | main函数160行(11步清晰流程) |
 
 ---
 

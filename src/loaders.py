@@ -115,8 +115,7 @@ def load_diagnosis_arena_case(case_id: int | None = None, excel_path: str | Path
             "treatment_plan": str(row.get('treatment_plan', '')) if 'treatment_plan' in row else '',
         }
         
-        logger.info(f"✅ 加载患者 {full_case['Patient-SN']} (索引: {actual_case_id})")
-        logger.debug(f"   患者信息长度: {len(full_case['Case Information'])} 字符")
+        # 不显示加载提示，避免重复
         
         # 患者可见部分（模拟真实场景：患者只知道自己的症状）
         known_case = {

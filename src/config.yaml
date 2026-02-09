@@ -39,11 +39,14 @@ mode:
 physical:
   enable_simulation: true        # 启用物理环境模拟
   interactive: false             # 启用交互式命令模式
+  use_sim_clock: false           # 启用仿真时钟（true=性能分析模式，false=实时模式）
+                                 # 仿真模式优势：秒级完成模拟、自动统计、可复现、资源优化分析
 
 # 数据库配置
 database:
   enabled: true                                     # 是否启用数据库（false则使用文件存储）
   connection_string: "mysql+pymysql://root:123456@10.11.169.21:3306/agent?charset=utf8mb4"
+  # connection_string: "mysql+pymysql://root:123456@101.42.36.8:3306/agent?charset=utf8mb4"
   backup_to_file: false                               # 数据库模式下是否同时备份到文件
 
 # 系统配置

@@ -39,7 +39,7 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         # 门诊号映射 (patient_id -> outpatient_no)
         self._outpatient_map: Dict[str, str] = {}
         
-        logger.info(f"数据库医疗记录服务已初始化 (备份到文件: {backup_to_file})")
+        # 不显示初始化提示，由initializer统一管理
     
     def _save_record(self, record: MedicalRecord):
         """覆盖父类方法：仅在启用备份时才保存到文件"""
@@ -109,7 +109,8 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         return super().get_record(patient_id)
     
     def add_triage(self, patient_id: str, dept: str, chief_complaint: str, 
-                   nurse_id: str = "nurse_001", location: str = "triage") -> bool:
+                   nurse_id: str = "nurse_001", location: str = "triage",
+                   nurse_name: str = "分诊护士") -> bool:
         """添加分诊记录（数据库 + 文件）"""
         # 先更新内存和文件
         success = super().add_triage(patient_id, dept, chief_complaint, nurse_id, location)
@@ -126,9 +127,12 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                 if record.chief_complaints:
                     latest_complaint = record.chief_complaints[-1].get('complaint', chief_complaint)
                 
+                # 分诊时将患者描述保存到present_illness，chief_complaint留给医生总结
                 self.dao.update_medical_case(record.record_id, {
                     "dept": dept,
-                    "chief_complaint": latest_complaint,
+                    "present_illness": latest_complaint,  # 患者的详细口语化描述
+                    "triage_nurse_id": nurse_id,
+                    "triage_nurse_name": nurse_name,
                 })
                 
                 # 记录分诊日志到case_logs
@@ -138,7 +142,7 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                     "entity_type": "nurse",
                     "log_data": {
                         "dept": dept,
-                        "chief_complaint": latest_complaint,
+                        "present_illness": latest_complaint,  # 使用present_illness而不是chief_complaint
                         "location": location,
                     }
                 })
@@ -180,22 +184,24 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                         })
                 
                 # 保存每一轮问答到doctor_qa_records JSON字段
+                # 使用明确的字段顺序：先问题后回答，更符合对话逻辑
                 for i, qa in enumerate(qa_pairs, start=1):
-                    qa_record = {
-                        "question_order": i,
-                        "question": qa.get("question", ""),
-                        "answer": qa.get("answer", ""),
-                        "staff_id": doctor_id,
-                        "staff_role": "doctor",
-                        "asked_at": now_iso(),
-                        "location": location,
-                    }
+                    from collections import OrderedDict
+                    qa_record = OrderedDict([
+                        ("question_order", i),
+                        ("question", qa.get("question", "")),
+                        ("answer", qa.get("answer", "")),
+                        ("staff_id", doctor_id),
+                        ("staff_role", "doctor"),
+                        ("asked_at", now_iso()),
+                        ("location", location),
+                    ])
                     self.dao.add_doctor_qa(record.record_id, qa_record)
                 
                 # 更新现病史和主诉
                 update_data = {}
-                if history:
-                    update_data["present_illness"] = json.dumps(history, ensure_ascii=False)
+                # 注意：不要覆盖present_illness，它应该保持为护士记录的患者原始描述
+                # history是结构化的症状信息，不应该存入present_illness字段
                 
                 # 从第一轮患者回答中提取主诉（如果chief_complaint为空）
                 if qa_pairs and not record.chief_complaints:
@@ -258,9 +264,11 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                     "result_text": json.dumps(test_results, ensure_ascii=False),
                     "summary": test_results.get("summary", ""),
                     "is_abnormal": test_results.get("abnormal", False),
-                    "key_findings": test_results.get("findings", []),
+                    "key_findings": test_results.get("key_findings", test_results.get("findings", [])),
                     "status": "completed",
                     "reported_at": datetime.now(),
+                    "lab_doctor_id": operator,
+                    "lab_doctor_name": operator_name,
                 })
                 
         except Exception as e:
@@ -306,7 +314,7 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                     "result_text": json.dumps(imaging_results, ensure_ascii=False),
                     "summary": imaging_results.get("summary", ""),
                     "is_abnormal": imaging_results.get("abnormal", False),
-                    "key_findings": imaging_results.get("findings", []),
+                    "key_findings": imaging_results.get("key_findings", imaging_results.get("findings", [])),
                     "status": "completed",
                     "reported_at": datetime.now(),
                 })
@@ -319,7 +327,8 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         return True
     
     def add_diagnosis(self, patient_id: str, doctor_id: str,
-                     diagnosis: Dict[str, Any], location: str = "internal_medicine") -> bool:
+                     diagnosis: Dict[str, Any], location: str = "internal_medicine",
+                     doctor_name: str = "主治医生") -> bool:
         """添加诊断记录（数据库 + 文件）
         
         方案一优化：将完整诊断信息存储为JSON格式到diagnosis_reason字段
@@ -345,6 +354,8 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                     "diagnosis_name": diagnosis.get("name"),
                     # 存储完整诊断信息（JSON字符串）
                     "diagnosis_reason": json.dumps(diagnosis_full_info, ensure_ascii=False),
+                    "attending_doctor_id": doctor_id,
+                    "attending_doctor_name": doctor_name,
                 }
                 
                 # 如果诊断中包含治疗计划，一并保存

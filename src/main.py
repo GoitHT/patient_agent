@@ -6,7 +6,7 @@ import typer
 from typing_extensions import Annotated
 from dotenv import load_dotenv
 
-from bootstrap.loader import load_system_config
+from config import Config
 from core import SystemInitializer
 from services.workflow import MultiPatientWorkflow
 from display import (
@@ -41,7 +41,7 @@ def main(
     配置优先级: CLI --config > 环境变量 > config.yaml > 默认值
     """
     # 1. 加载配置
-    config = load_system_config(config_file)
+    config = Config.load(config_file=config_file)
     
     # 2. 初始化系统
     initializer = SystemInitializer(config)
@@ -110,19 +110,16 @@ def main(
         logger.info("\n⏳ 等待所有患者完成 LangGraph 诊断流程...")
     
     if should_log(2, "main", "monitor"):
-        logger.info("💡 提示: 系统每30秒显示一次实时状态（详细模式）")
+        logger.info("💡 提示: 系统每30秒显示一次实时状态（详细模式）\n")
     else:
-        logger.info("💡 提示: 系统每2分钟显示一次简要状态（使用 --output-level 2 查看详细监控）\n")
+        logger.info("💡 提示: 系统每2分钟显示一次简要状态（详情见各患者日志文件）\n")
     
     results = workflow.wait_for_completion(num_patients)
     workflow.stop_monitoring(monitor_thread)
     
     # 10. 显示结果
     logger.info("\n" + "="*80)
-    if num_patients == 1:
-        logger.info("📊 诊断结果")
-    else:
-        logger.info("📊 LangGraph 多患者诊断结果")
+    logger.info("📊 诊断结果" if num_patients == 1 else "📊 LangGraph 多患者诊断结果")
     logger.info("="*80 + "\n")
     
     display_results_table(results)

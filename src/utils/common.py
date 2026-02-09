@@ -34,11 +34,11 @@ def _clean_json_string(text: str) -> str:
     # 移除BOM标记
     text = text.replace('\ufeff', '')
     
-    # 处理字符串字段中的换行符：将实际换行符替换为\n转义序列
-    # 这个正则查找 JSON 字符串值中的换行符（不在键名中）
+    # 处理字符串字段中的换行符和未转义的引号
     result = []
     in_string = False
     escape_next = False
+    string_start_quote = None  # 记录字符串开始时的引号类型
     
     for i, char in enumerate(text):
         if escape_next:
@@ -52,19 +52,43 @@ def _clean_json_string(text: str) -> str:
             continue
             
         if char == '"':
-            in_string = not in_string
-            result.append(char)
+            if not in_string:
+                # 开始一个字符串
+                in_string = True
+                string_start_quote = i
+                result.append(char)
+            else:
+                # 可能是字符串结束
+                # 检查下一个非空白字符，判断是否真的结束
+                next_meaningful = None
+                for j in range(i + 1, min(i + 10, len(text))):
+                    if text[j] not in ' \t\n\r':
+                        next_meaningful = text[j]
+                        break
+                
+                # 如果后面是逗号、冒号、}、]，说明是真正的字符串结束
+                if next_meaningful in (',', ':', '}', ']', None):
+                    in_string = False
+                    result.append(char)
+                else:
+                    # 可能是字符串内部的引号，需要转义
+                    result.append('\\"')
             continue
         
-        # 如果在字符串中且遇到换行符，转义它
-        if in_string and char in ('\n', '\r'):
-            if char == '\n':
-                result.append('\\n')
-            elif char == '\r':
-                # 检查是否是\r\n，如果是则跳过\r
-                if i + 1 < len(text) and text[i + 1] == '\n':
-                    continue
-                result.append('\\n')
+        # 如果在字符串中且遇到特殊字符，转义它
+        if in_string:
+            if char in ('\n', '\r'):
+                if char == '\n':
+                    result.append('\\n')
+                elif char == '\r':
+                    # 检查是否是\r\n，如果是则跳过\r
+                    if i + 1 < len(text) and text[i + 1] == '\n':
+                        continue
+                    result.append('\\n')
+            elif char == '\t':
+                result.append('\\t')
+            else:
+                result.append(char)
         else:
             result.append(char)
     
@@ -222,8 +246,8 @@ def now_iso() -> str:
 # ============================================================================
 
 def prompt_dir() -> Path:
-    # src/utils.py -> src/prompts
-    return Path(__file__).resolve().parent / "prompts"
+    # src/utils/common.py -> src/utils -> src -> src/prompts
+    return Path(__file__).resolve().parent.parent / "prompts"
 
 
 def load_prompt(filename: str) -> str:

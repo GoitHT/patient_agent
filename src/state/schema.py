@@ -98,6 +98,7 @@ class BaseState(BaseModel):
     patient_id: str = "patient_001"  # 患者在物理环境中的ID
     current_location: str = "lobby"  # 当前物理位置
     physical_state_snapshot: dict[str, Any] = Field(default_factory=dict)  # 物理状态快照（可序列化）
+    movement_history: list[dict[str, Any]] = Field(default_factory=list)  # 移动轨迹记录
     
     # 病例库集成字段
     medical_record_integration: Optional[Any] = Field(default=None, exclude=True)  # 病例库集成器（不序列化）
@@ -105,6 +106,19 @@ class BaseState(BaseModel):
     
     # 患者详细日志记录器（不序列化）
     patient_detail_logger: Optional[Any] = Field(default=None, exclude=True)
+    
+    # 多智能体系统：Agent实例（不序列化）
+    coordinator: Optional[Any] = Field(default=None, exclude=True)  # HospitalCoordinator实例
+    doctor_agents: dict[str, Any] = Field(default_factory=dict, exclude=True)  # 医生Agent字典
+    doctor_agent: Optional[Any] = Field(default=None, exclude=True)  # 当前分配的医生Agent
+    patient_agent: Optional[Any] = Field(default=None, exclude=True)  # 患者Agent实例
+    assigned_doctor_id: str = ""  # 分配的医生ID（可序列化）
+    assigned_doctor_name: str = ""  # 分配的医生姓名（可序列化）
+    
+    @property
+    def world(self) -> Optional[Any]:
+        """简洁的world访问器，指向world_context"""
+        return self.world_context
 
     def model_post_init(self, __context: Any) -> None:  # noqa: D401
         # LangGraph may serialize Pydantic state with `exclude_unset=True`.
@@ -136,6 +150,7 @@ class BaseState(BaseModel):
             "case_data",
             "node_qa_counts",
             "physical_state_snapshot",
+            "movement_history",
         }
         try:
             self.__pydantic_fields_set__.update(fields)
@@ -281,28 +296,9 @@ class BaseState(BaseModel):
         # 根据状态给出建议
         suggestions = []
         warnings = []  # 严重警告
+        impact["max_questions"] = 10  # 默认最大问诊轮数
         
-        if impact["energy_level"] < 3:
-            warnings.append("⚠️ 患者体力严重不足")
-            suggestions.append("患者体力严重不足，建议立即缩短问诊或安排休息")
-            impact["max_questions"] = 2
-        elif impact["energy_level"] < 6:
-            suggestions.append("患者体力较弱，问诊应适度，建议限制在5轮以内")
-            impact["max_questions"] = 5
-        else:
-            impact["max_questions"] = 10
-        
-        if impact["pain_level"] > 7:
-            warnings.append("🚨 患者疼痛剧烈")
-            suggestions.append("患者疼痛剧烈，可能严重影响问诊质量，建议先止痛处理")
-            impact["answer_quality"] = "poor"
-            impact["priority"] = "pain_relief"
-        elif impact["pain_level"] > 4:
-            suggestions.append("患者有中度疼痛，可能影响回答准确性")
-            impact["answer_quality"] = "moderate"
-        else:
-            impact["answer_quality"] = "good"
-        
+        # 只保留意识异常的严重警告
         if impact["consciousness"] != "alert":
             warnings.append("🚨🚨 患者意识异常")
             suggestions.append(f"患者意识状态异常（{impact['consciousness']}），需立即紧急处理！")

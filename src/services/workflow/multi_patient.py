@@ -43,12 +43,11 @@ class MultiPatientWorkflow:
         Args:
             num_doctors: 医生数量
         """
-        logger.info("🏥 注册神经内科医生...")
+        logger.info(f"🏥 注册医生: {num_doctors}名")
         for i in range(num_doctors):
             doc_id = f"DOC{i+1:03d}"
             doc_name = f"神经内科医生{i+1}"
             self.coordinator.register_doctor(doc_id, doc_name, "neurology")
-        logger.info(f"  ✅ 已注册 {num_doctors} 名神经内科医生\n")
     
     def initialize_processor(self, num_patients: int) -> None:
         """初始化多患者处理器
@@ -56,7 +55,7 @@ class MultiPatientWorkflow:
         Args:
             num_patients: 患者数量
         """
-        logger.info("🚀 初始化 LangGraph 多患者处理器...")
+        logger.info("⚙️  初始化处理器")
         self.processor = LangGraphMultiPatientProcessor(
             coordinator=self.coordinator,
             retriever=self.retriever,
@@ -66,7 +65,6 @@ class MultiPatientWorkflow:
             max_questions=self.config.agent.max_questions,
             max_workers=num_patients,
         )
-        logger.info("  ✅ 处理器初始化完成\n")
     
     def select_patient_cases(self, num_patients: int) -> List[int]:
         """从数据集随机选择患者病例
@@ -77,15 +75,13 @@ class MultiPatientWorkflow:
         Returns:
             病例ID列表
         """
-        logger.info("📚 检查可用的真实病例数量...")
         try:
             max_case_id = _get_dataset_size(None)
-            logger.info(f"  ✅ 数据集包含 {max_case_id} 个病例\n")
         except Exception as e:
-            logger.warning(f"  ⚠️ 无法获取数据集大小，使用默认范围: {e}")
+            logger.warning(f"⚠️  无法获取数据集: {e}")
             max_case_id = 100
         
-        logger.info(f"🎲 从 {max_case_id} 个病例中随机选择 {num_patients} 名患者...\n")
+        logger.info(f"🎲 选择 {num_patients} 个病例 (from {max_case_id})")
         available_case_ids = list(range(max_case_id))
         random.shuffle(available_case_ids)
         return available_case_ids[:num_patients]
@@ -130,15 +126,19 @@ class MultiPatientWorkflow:
         Returns:
             任务ID
         """
-        patient_id = f"patient_{case_id:03d}"
-        
-        # 加载病例获取主诉
+        # 加载病例获取主诉和 Patient-SN
         try:
             case_bundle = load_diagnosis_arena_case(case_id)
             known_case = case_bundle["known_case"]
             case_info = known_case.get("Case Information", "")
             dataset_index = known_case.get('id', 'unknown')
             original_case_id = known_case.get('Patient-SN', 'N/A')
+            
+            # 使用 Patient-SN 作为患者ID（如果可用）
+            if original_case_id and original_case_id != 'N/A':
+                patient_id = f"patient_{original_case_id}"
+            else:
+                patient_id = f"patient_{case_id:03d}"
             
             # 提取主诉
             if "主诉：" in case_info:
@@ -162,21 +162,14 @@ class MultiPatientWorkflow:
             dataset_index = case_id
             original_case_id = "N/A"
         
-        # 显示患者到达信息
-        current_time = time.strftime("%H:%M:%S")
+        # 显示患者到达信息（简洁版）
         color = get_patient_color(i)
         priority_icon = "🚨" if priority >= 9 else "⚠️" if priority >= 7 else "📋"
         
-        logger.info(f"\n{color}{'='*80}\033[0m")
         if total_patients == 1:
-            logger.info(format_patient_log(patient_id, f"🚶 患者到达医院 [{current_time}]", i))
+            logger.info(f"{color}▶ P{dataset_index} 就诊 ({priority_icon}P{priority})\033[0m")
         else:
-            logger.info(format_patient_log(patient_id, f"🚶 患者 {i+1}/{total_patients} 到达医院 [{current_time}]", i))
-        logger.info(format_patient_log(patient_id, f"{priority_icon} 数据集索引={dataset_index}, 原始ID={original_case_id}, 优先级={priority}/10", i))
-        
-        chief_complaint_short = chief_complaint[:50] + "..." if len(chief_complaint) > 50 else chief_complaint
-        logger.info(format_patient_log(patient_id, f"💬 主诉: {chief_complaint_short}", i))
-        logger.info(f"{color}{'='*80}\033[0m\n")
+            logger.info(f"{color}▶ P{dataset_index} [{i+1}/{total_patients}] ({priority_icon}P{priority})\033[0m")
         
         # 提交患者
         task_id = self.processor.submit_patient(
@@ -186,10 +179,8 @@ class MultiPatientWorkflow:
             priority=priority
         )
         
-        if total_patients == 1:
-            logger.info(format_patient_log(patient_id, "✅ 开始就诊流程", i))
-        else:
-            logger.info(format_patient_log(patient_id, "✅ 线程已启动，开始竞争资源", i))
+        # 不显示线程启动提示，避免冗余输出
+        pass
         
         return task_id
     
@@ -258,15 +249,8 @@ class MultiPatientWorkflow:
     
     def _display_system_status(self, active_count: int) -> None:
         """显示系统状态（内部方法）"""
-        logger.info("\n" + "┌" + "─"*78 + "┐")
-        logger.info("│" + " "*25 + "\033[1m📊 实时状态监控\033[0m" + " "*28 + "│")
-        logger.info("├" + "─"*78 + "┤")
-        
         sys_stats = self.coordinator.get_system_stats()
-        logger.info(f"│  🏥 系统状态: {active_count} 个患者处理中" + " "*(78 - 30 - len(str(active_count))) + "│")
-        logger.info(f"│  👨‍⚕️  可用医生: {sys_stats['available_doctors']}/{sys_stats['total_doctors']}" + " "*(78 - 25 - len(str(sys_stats['available_doctors'])) - len(str(sys_stats['total_doctors']))) + "│")
-        logger.info(f"│  ✅ 已完成: {sys_stats['total_consultations_completed']} 次" + " "*(78 - 20 - len(str(sys_stats['total_consultations_completed']))) + "│")
-        logger.info("└" + "─"*78 + "┘\n")
+        logger.info(f"🟢 活动:{active_count} | 医生:{sys_stats['available_doctors']}/{sys_stats['total_doctors']} | 完成:{sys_stats['total_consultations_completed']}")
     
     def stop_monitoring(self, monitor_thread: threading.Thread) -> None:
         """停止监控

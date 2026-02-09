@@ -93,18 +93,8 @@ class StaffTracker:
         staff_ids = {
             "nurse_001": "护士",
             "doctor_001": "医生",
-            "lab_tech_001": "检验技师"
+            "lab_tech_001": "检验科医生"
         }
         
-        for agent_id, title in staff_ids.items():
-            if agent_id in world.physical_states:
-                state = world.physical_states[agent_id]
-                summary = (
-                    f"{title}: 体力{state.energy_level:.1f} "
-                    f"负荷{state.work_load:.1f} "
-                    f"效率{state.get_work_efficiency()*100:.0f}% "
-                    f"服务{state.patients_served_today}人"
-                )
-                summaries.append(summary)
-        
-        return " | ".join(summaries) if summaries else "无医护状态"
+        # 不再显示医护人员详细状态
+        return ""

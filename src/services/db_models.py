@@ -119,6 +119,10 @@ class Examination(Base):
     exam_name = Column(String(200))
     exam_type = Column(String(50))  # lab/imaging/functional
     
+    # 检验科医生信息
+    lab_doctor_id = Column(String(50))  # 检验科医生ID
+    lab_doctor_name = Column(String(100))  # 检验科医生姓名
+    
     # 时间
     ordered_at = Column(DateTime, default=datetime.now)
     reported_at = Column(DateTime)

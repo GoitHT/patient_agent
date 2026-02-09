@@ -40,10 +40,9 @@ class SystemInitializer:
         Returns:
             LLM客户端实例
         """
-        logger.info(f"🤖 初始化大语言模型 ({self.config.llm.backend})...")
+        logger.info(f"🤖 初始化 LLM ({self.config.llm.backend})")
         try:
             llm_client = build_llm_client(self.config.llm.backend)
-            logger.info("  ✅ 大语言模型初始化成功\n")
             self.components['llm'] = llm_client
             return llm_client
         except Exception as e:
@@ -57,20 +56,19 @@ class SystemInitializer:
             检索器实例
         """
         if not self.config.rag.skip_rag:
-            logger.info("📂 初始化知识库检索器...")
+            logger.info("📂 初始化知识库")
             try:
                 retriever = default_retriever(
                     persist_dir=self.config.rag.persist_dir,
                     collection_name=self.config.rag.collection_name
                 )
-                logger.info("  ✅ 知识库检索器初始化成功\n")
                 self.components['retriever'] = retriever
                 return retriever
             except Exception as e:
                 logger.error(f"❌ 知识库检索器初始化失败：{e}")
                 raise
         else:
-            logger.info("⏭️ 使用虚拟检索器（跳过RAG）\n")
+            logger.info("⏭️ 跳过RAG")
             retriever = DummyRetriever()
             self.components['retriever'] = retriever
             return retriever
@@ -81,9 +79,8 @@ class SystemInitializer:
         Returns:
             业务服务集合
         """
-        logger.info("💼 初始化业务服务（预约、计费）...")
+        logger.info("💼 初始化业务服务")
         services = build_services()
-        logger.info("  ✅ 业务服务初始化完成\n")
         self.components['services'] = services
         return services
     
@@ -96,21 +93,17 @@ class SystemInitializer:
         Returns:
             病例库服务实例
         """
-        logger.info("📋 初始化病例库服务...")
+        logger.info("📋 初始化病例库")
         medical_record_service = get_medical_record_service(
             config=self.config,
             storage_dir=storage_dir
         )
-        logger.info("  ✅ 病例库服务初始化完成")
         
         if hasattr(self.config, 'database') and self.config.database.enabled:
-            logger.info(f"  🗄️  使用数据库存储: {self.config.database.connection_string.split('@')[1] if '@' in self.config.database.connection_string else 'MySQL'}")
-            if self.config.database.backup_to_file:
-                logger.info(f"  💾 同时备份到文件: {storage_dir.absolute()}\n")
-            else:
-                logger.info("")
+            db_info = self.config.database.connection_string.split('@')[1] if '@' in self.config.database.connection_string else 'MySQL'
+            logger.info(f"   → 数据库: {db_info}")
         else:
-            logger.info(f"  📁 病例存储目录: {storage_dir.absolute()}\n")
+            logger.info(f"   → 文件: {storage_dir.absolute()}")
         
         self.components['medical_record_service'] = medical_record_service
         return medical_record_service
@@ -124,9 +117,8 @@ class SystemInitializer:
         Returns:
             协调器实例
         """
-        logger.info("🏥 初始化医院协调器...")
+        logger.info("🏥 初始化协调器")
         coordinator = get_coordinator(medical_record_service=medical_record_service)
-        logger.info("  ✅ 协调器初始化完成\n")
         self.components['coordinator'] = coordinator
         return coordinator
     

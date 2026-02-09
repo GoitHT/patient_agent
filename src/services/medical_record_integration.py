@@ -87,12 +87,21 @@ class MedicalRecordIntegration:
             self.mrs._save_record(record)  # 调用私有方法保存更新后的病例
         
         # 记录分诊信息
+        # 注意：分诊时使用患者的现病史描述，而不是简洁主诉
+        patient_description = state.history.get("present_illness", "")
+        
+        # 清理称呼语（如"护士您好"、"医生"等）
+        import re
+        patient_description = re.sub(r'^(护士|医生|大夫)(您好|你好)?[，,、]?\s*', '', patient_description)
+        patient_description = patient_description.strip()
+        
         self.mrs.add_triage(
             patient_id=patient_id,
             dept=state.dept,
-            chief_complaint=state.chief_complaint,
+            chief_complaint=patient_description,  # 传入清理后的患者描述
             nurse_id=nurse_id,
-            location="triage"
+            location="triage",
+            nurse_name=nurse_name
         )
         
         # 记录生命体征（如果有）
@@ -127,16 +136,18 @@ class MedicalRecordIntegration:
         conversation = []
         qa_pairs = None
         
-        # 优先使用 doctor_patient_qa（新版本）
+        # 获取患者标识（优先使用case_id）
+        case_id = state.case_data.get("id") if state.case_data else None
+        patient_display = f"P{case_id}" if case_id is not None else patient_id
+        
+        # 优先使用 doctor_patient_qa（新版本） - 内部处理，不输出日志
         if "doctor_patient_qa" in state.agent_interactions:
             qa_pairs = state.agent_interactions["doctor_patient_qa"]
-            logger.info(f"📝 [Integration] 从agent_interactions['doctor_patient_qa']提取到 {len(qa_pairs)} 轮问诊对话")
         # 兼容旧版本的 doctor_patient 键名
         elif "doctor_patient" in state.agent_interactions:
             qa_pairs = state.agent_interactions["doctor_patient"]
-            logger.info(f"📝 [Integration] 从agent_interactions['doctor_patient']提取到 {len(qa_pairs)} 轮问诊对话")
         else:
-            logger.warning(f"⚠️ [Integration] state.agent_interactions 中没有问诊对话键")
+            logger.warning(f"⚠️  state.agent_interactions 中没有问诊对话键")
             logger.debug(f"agent_interactions keys: {list(state.agent_interactions.keys())}")
         
         # 转换为conversation格式
@@ -151,9 +162,8 @@ class MedicalRecordIntegration:
                     "content": qa.get("answer", "")
                 })
         
-        # 记录问诊（只有对话不为空时才保存）
+        # 记录问诊（只有对话不为空时才保存） - 内部处理，不输出日志
         if conversation:
-            logger.info(f"💾 [Integration] 准备保存 {len(conversation)} 条对话记录到数据库")
             self.mrs.add_consultation(
                 patient_id=patient_id,
                 doctor_id=doctor_id,
@@ -163,7 +173,15 @@ class MedicalRecordIntegration:
                 location=state.dept
             )
         else:
-            logger.warning(f"⚠️ [Integration] 患者 {patient_id} 问诊对话为空，跳过保存")
+            # 提供更详细的调试信息
+            logger.warning(f"[{patient_display}] ⚠️ [Integration] 患者 {patient_display} 问诊对话为空，跳过保存")
+            logger.debug(f"   - qa_pairs 状态: {qa_pairs}")
+            logger.debug(f"   - node_qa_counts: {state.node_qa_counts}")
+            logger.debug(f"   - 紧急标记: {state.escalations}")
+            
+            # 检查是否因为紧急情况跳过了问诊
+            if any("意识" in esc or "紧急" in esc or "急诊" in esc for esc in state.escalations):
+                logger.info(f"   ℹ️  可能因紧急情况（{state.escalations}）跳过了常规问诊")
         
         # 更新位置
         dept_location = self._map_dept_to_location(state.dept)
@@ -187,33 +205,41 @@ class MedicalRecordIntegration:
                 location=state.dept,
                 operator=doctor_id,
                 content={
-                    "test_name": test.get("name"),
-                    "test_type": test.get("type"),
+                    "test_name": test.get("name", test.get("test_name", "")),
+                    "test_type": test.get("type", test.get("test_type", "")),
                     "indication": test.get("indication", "")
                 },
-                notes=f"申请检验: {test.get('name')}"
+                notes=f"申请检验: {test.get('name', test.get('test_name', ''))}"
             )
         
         self.mrs._save_record(self.mrs.get_record(patient_id))
     
-    def on_lab_test_completed(self, state: 'BaseState', lab_tech_id: str = "lab_tech_001"):
+    def on_lab_test_completed(self, state: 'BaseState', lab_tech_id: str = "lab_tech_001", 
+                             lab_doctor_name: str = "检验科医生"):
         """
         检验完成节点 - 更新病例
         
         Args:
             state: 图状态
-            lab_tech_id: 检验技师ID
+            lab_tech_id: 检验科医生ID
+            lab_doctor_name: 检验科医生姓名
         """
         patient_id = state.patient_id
         
         # 记录每项检验结果
         for result in state.test_results:
+            test_name = result.get("test_name", result.get("name", ""))
             self.mrs.add_lab_test(
                 patient_id=patient_id,
-                test_name=result.get("name", ""),
+                test_name=test_name,
                 test_results=result,
-                operator=lab_tech_id
+                operator=lab_tech_id,
+                operator_name=lab_doctor_name
             )
+            
+            # 详细日志记录检验结果
+            if hasattr(state, 'patient_detail_logger') and state.patient_detail_logger:
+                state.patient_detail_logger.lab_test(test_name, result)
     
     def on_imaging_completed(self, state: 'BaseState', radiology_tech_id: str = "radiology_tech_001"):
         """
@@ -230,7 +256,7 @@ class MedicalRecordIntegration:
             if result.get("type") in ["imaging", "xray", "ct", "mri", "ultrasound"]:
                 self.mrs.add_imaging(
                     patient_id=patient_id,
-                    imaging_type=result.get("name", ""),
+                    imaging_type=result.get("test_name", result.get("name", "")),
                     imaging_results=result,
                     operator=radiology_tech_id
                 )
@@ -254,6 +280,27 @@ class MedicalRecordIntegration:
             doctor_name=doctor_name,
             location=state.dept
         )
+        
+        # 详细日志记录诊断结果
+        if hasattr(state, 'patient_detail_logger') and state.patient_detail_logger:
+            logger = state.patient_detail_logger
+            logger.diagnosis_result(state.diagnosis)
+        
+        # 如果诊断中包含随访计划，保存到数据库
+        if hasattr(state, 'followup_plan') and state.followup_plan:
+            followup_text = self._format_followup_plan(state.followup_plan)
+            if followup_text:
+                followup_date = state.followup_plan.get('when', None)
+                if hasattr(self.mrs, 'add_followup'):
+                    self.mrs.add_followup(
+                        patient_id=patient_id,
+                        followup_plan=followup_text,
+                        followup_date=followup_date,
+                        doctor_id=doctor_id
+                    )
+                # 详细日志记录随访计划
+                if hasattr(state, 'patient_detail_logger') and state.patient_detail_logger:
+                    state.patient_detail_logger.followup_plan(state.followup_plan)
     
     def on_prescription(self, state: 'BaseState', doctor_id: str = "doctor_001"):
         """
@@ -282,6 +329,26 @@ class MedicalRecordIntegration:
                 medications=medications,
                 location=state.dept
             )
+            
+            # 详细日志记录处方
+            if hasattr(state, 'patient_detail_logger') and state.patient_detail_logger:
+                state.patient_detail_logger.prescription(medications)
+        
+        # 记录医嘱
+        if "medical_advice" in state.treatment_plan:
+            advice = state.treatment_plan["medical_advice"]
+            if advice and hasattr(state, 'patient_detail_logger') and state.patient_detail_logger:
+                state.patient_detail_logger.medical_advice(advice)
+            
+            # 详细日志记录处方
+            if hasattr(state, 'patient_detail_logger') and state.patient_detail_logger:
+                state.patient_detail_logger.prescription(medications)
+        
+        # 记录医嘱
+        if "medical_advice" in state.treatment_plan:
+            advice = state.treatment_plan["medical_advice"]
+            if advice and hasattr(state, 'patient_detail_logger') and state.patient_detail_logger:
+                state.patient_detail_logger.medical_advice(advice)
     
     def on_treatment(self, state: 'BaseState', treatment_type: str, 
                     treatment_details: Dict[str, Any], operator: str):
@@ -303,6 +370,42 @@ class MedicalRecordIntegration:
             operator=operator,
             location=state.current_location
         )
+    
+    def _format_followup_plan(self, followup_plan: dict) -> str:
+        """
+        格式化随访计划为文本
+        
+        Args:
+            followup_plan: 随访计划字典
+            
+        Returns:
+            格式化的随访计划文本
+        """
+        if not followup_plan:
+            return ""
+        
+        parts = []
+        
+        # 复诊时间
+        if followup_plan.get('when'):
+            parts.append(f"复诊时间：{followup_plan['when']}")
+        
+        # 监测项目
+        monitoring = followup_plan.get('monitoring', [])
+        if monitoring:
+            parts.append("监测项目：" + "、".join(monitoring))
+        
+        # 紧急情况
+        emergency = followup_plan.get('emergency', [])
+        if emergency:
+            parts.append("紧急情况：" + "；".join(emergency))
+        
+        # 长期目标
+        long_term = followup_plan.get('long_term_goals', [])
+        if long_term:
+            parts.append("长期目标：" + "、".join(long_term))
+        
+        return "\n".join(parts)
     
     def on_discharge(self, state: 'BaseState', doctor_id: str = "doctor_001"):
         """

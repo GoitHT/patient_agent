@@ -138,6 +138,10 @@ class HospitalCoordinator:
         self.lab_queue: Queue = Queue()
         self.imaging_queue: Queue = Queue()
         
+        # 用于去重等待消息
+        self._last_waiting_log: Dict[str, float] = {}  # dept -> timestamp (避免重复输出等待消息)
+        self._waiting_log_interval = 15.0  # 10秒内不重复输出同一科室的等待消息
+        
         # 会诊请求队列
         self.consultation_requests: Queue = Queue()
         
@@ -152,7 +156,8 @@ class HospitalCoordinator:
             "average_waiting_time": 0,
         }
         
-        logger.info("✅ 医院协调器已启动")
+        # 登记信息（内部处理，简化日志）
+        # 不显示启动提示，避免冗余
     
     # ========== 医生管理 ==========
     
@@ -230,8 +235,13 @@ class HospitalCoordinator:
             
             # 检查是否已有病例记录
             existing_record = self.medical_record_service.get_record(patient_id)
+            
+            # 获取患者标识（用于日志输出）
+            case_id = patient_data.get("case_id")
+            patient_display = f"P{case_id}" if case_id is not None else patient_id
+            
             if existing_record:
-                logger.info(f"✅ 患者挂号: {patient_id} -> {dept}科 (优先级: {priority}, 病例已存在: {existing_record.record_id})")
+                logger.info(f"[{patient_display}] ✅ 患者挂号: {patient_display} -> {dept}科 (优先级: {priority}, 病例已存在: {existing_record.record_id})")
             else:
                 # 创建病例（注意：此时dept是挂号科室，真实科室需等护士分诊后确定）
                 patient_profile = {
@@ -244,7 +254,7 @@ class HospitalCoordinator:
                     # 注意：不在此处设置dept，等护士分诊后再更新
                 }
                 record = self.medical_record_service.create_record(patient_id, patient_profile)
-                logger.info(f"✅ 患者挂号: {patient_id} -> {dept}科 (优先级: {priority}, 病例: {record.record_id})")
+                logger.info(f"[{patient_display}] ✅ 患者挂号: {patient_display} -> {dept}科 (优先级: {priority}, 病例: {record.record_id})")
             
             self.stats["total_patients"] += 1
             
@@ -325,7 +335,13 @@ class HospitalCoordinator:
                 if not available_doctors:
                     waiting_count = self.waiting_queues[dept].qsize() if dept in self.waiting_queues else 0
                     if waiting_count > 0 and assigned_count == 0:
-                        logger.info(f"⏳ {dept}科暂无空闲医生，{waiting_count}名患者等候中")
+                        # 去重：只在距离上次输出超过指定间隔时才输出
+                        import time
+                        current_time = time.time()
+                        last_log_time = self._last_waiting_log.get(dept, 0)
+                        if current_time - last_log_time >= self._waiting_log_interval:
+                            logger.info(f"⏳ {dept}科暂无空闲医生，{waiting_count}名患者等候中")
+                            self._last_waiting_log[dept] = current_time
                     break
                 
                 # 从队列取患者
@@ -355,11 +371,12 @@ class HospitalCoordinator:
                 
                 doctor.start_consultation(patient_id)
                 
-                # 显示医生分配信息
-                remaining_queue = self.waiting_queues[dept].qsize()
-                logger.info(f"✅ 分配: 患者 {patient_id} → {doctor.name}")
-                current_count = 1 if doctor.current_patient else 0
-                logger.info(f"   📊 {doctor.name}: 当前{current_count}人 | 今日{doctor.total_patients_today}人 | 队列剩余{remaining_queue}人")
+                # 显示医生分配信息 - 简化输出
+                # 获取患者标识（优先使用case_id）
+                case_id = session.patient_data.get("case_id")
+                patient_display = f"P{case_id}" if case_id is not None else patient_id
+                
+                logger.info(f"[{patient_display}] ✅ 分配: 患者 {patient_display} → {doctor.name}")
                 
                 assigned_count += 1
         
@@ -394,7 +411,10 @@ class HospitalCoordinator:
             
             doctor.start_consultation(patient_id)
             
-            logger.info(f"✅ 手动分配: 患者 {patient_id} -> 医生 {doctor.name}")
+            # 获取患者标识（用于日志输出）
+            case_id = session.patient_data.get("case_id")
+            patient_display = f"P{case_id}" if case_id is not None else patient_id
+            logger.info(f"[{patient_display}] ✅ 手动分配: 患者 {patient_display} -> 医生 {doctor.name}")
             
             return True
     

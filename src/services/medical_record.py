@@ -124,7 +124,7 @@ class MedicalRecordService:
         # 内存缓存（当前会话的活跃病例）
         self._active_records: Dict[str, MedicalRecord] = {}
         
-        logger.info(f"医疗病例库服务已初始化，存储目录: {self.storage_dir.absolute()}")
+        # 不显示初始化提示，由initializer统一管理
     
     def create_record(self, patient_id: str, patient_profile: Dict[str, Any]) -> MedicalRecord:
         """
@@ -164,7 +164,7 @@ class MedicalRecordService:
         # 持久化
         self._save_record(record)
         
-        logger.info(f"创建病例: {record_id} (患者: {patient_id})")
+        logger.debug(f"创建病例: {record_id} (患者: {patient_id})")
         
         return record
     
@@ -235,7 +235,7 @@ class MedicalRecordService:
         
         self._save_record(record)
         
-        logger.info(f"添加分诊记录: {patient_id} -> {dept}")
+        logger.debug(f"添加分诊记录: {patient_id} -> {dept}")
         
         return True
     
@@ -600,7 +600,11 @@ class MedicalRecordService:
         
         self._save_record(record)
         
-        logger.info(f"患者出院: {patient_id}")
+        # 获取患者标识（优先使用case_id）
+        case_id = record.patient_profile.get("case_id") if record.patient_profile else None
+        patient_display = f"P{case_id}" if case_id is not None else patient_id
+        
+        logger.info(f"[{patient_display}] 患者出院: {patient_display}")
         
         return True
     

@@ -197,7 +197,10 @@ class ChromaRetriever:
         self.persist_dir = Path(persist_dir)
         self.collection_name = collection_name
         self.embedding = HashEmbeddingFunction(dim=dim)
-        self.client = chromadb.PersistentClient(path=str(self.persist_dir))
+        
+        # 禁用遥测
+        settings = chromadb.Settings(anonymized_telemetry=False)
+        self.client = chromadb.PersistentClient(path=str(self.persist_dir), settings=settings)
         self.collection = self.client.get_collection(
             name=self.collection_name, embedding_function=self.embedding
         )
@@ -278,7 +281,8 @@ def build_index(
     persist_dir = Path(persist_dir)
     persist_dir.mkdir(parents=True, exist_ok=True)
 
-    client = chromadb.PersistentClient(path=str(persist_dir))
+    settings = chromadb.Settings(anonymized_telemetry=False)
+    client = chromadb.PersistentClient(path=str(persist_dir), settings=settings)
     try:
         client.delete_collection(collection_name)
     except Exception:

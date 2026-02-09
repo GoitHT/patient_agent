@@ -51,7 +51,7 @@ class MedicalRecordDAO:
         # 创建所有表
         Base.metadata.create_all(self.engine)
         
-        logger.info(f"数据库连接已建立: {connection_string.split('@')[1] if '@' in connection_string else 'local'}")
+        # 不显示连接提示，由initializer统一管理
     
     @contextmanager
     def get_session(self) -> Session:
@@ -148,7 +148,7 @@ class MedicalRecordDAO:
             case = MedicalCase(**case_data)
             session.add(case)
             
-            logger.info(f"创建病例: {case.case_id} (门诊号: {outpatient_no})")
+            logger.debug(f"创建病例: {case.case_id} (门诊号: {outpatient_no})")
             
             return case.case_id
     
@@ -219,7 +219,7 @@ class MedicalRecordDAO:
             
             case.updated_at = datetime.now()
             
-            logger.info(f"更新病例: {case_id}")
+            logger.debug(f"更新病例: {case_id}")
             return True
     
     def get_cases_by_outpatient_no(self, outpatient_no: str) -> List[Dict[str, Any]]:

@@ -528,11 +528,6 @@ class InteractiveSession:
                 for symptom, severity in obs['symptoms'].items():
                     status = "轻度" if severity <= 3 else ("中度" if severity <= 6 else "重度")
                     lines.append(f"  - {symptom}: {severity}/10 ({status})")
-            
-            if 'energy_level' in obs:
-                energy = obs['energy_level']
-                energy_status = "充沛" if energy >= 7 else ("一般" if energy >= 4 else "疲惫")
-                lines.append(f"体力: {energy}/10 ({energy_status})")
         
         lines.append("=" * 50)
         return "\n".join(lines)
