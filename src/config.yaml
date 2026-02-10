@@ -21,7 +21,7 @@ agent:
   max_questions: 3         # 医生最多问几个问题（配额，医生可根据信息充分性主动提前结束）
                            # 影响范围：DoctorAgent、专科子图、问诊流程
                            # 修改此值将全局生效
-  max_triage_questions: 3  # 护士分诊时最多问几个问题
+  max_triage_questions: 1  # 护士分诊时最多问几个问题
 
 # RAG配置
 rag:
@@ -32,26 +32,22 @@ rag:
 # 运行模式配置
 mode:
   multi_patient: true            # 多患者多医生模式（推荐，num_patients=1时等同于单体模式）
-  num_patients: 1               # 患者数量（1=单患者模式，>1=多患者并发模式）
+  num_patients: 5               # 患者数量（1=单患者模式，>1=多患者并发模式）
   patient_interval: 60            # 患者进入间隔时间（秒，单患者时可设为0）
 
 # 物理环境配置
 physical:
-  enable_simulation: true        # 启用物理环境模拟
   interactive: false             # 启用交互式命令模式
-  use_sim_clock: false           # 启用仿真时钟（true=性能分析模式，false=实时模式）
-                                 # 仿真模式优势：秒级完成模拟、自动统计、可复现、资源优化分析
 
 # 数据库配置
 database:
   enabled: true                                     # 是否启用数据库（false则使用文件存储）
-  connection_string: "mysql+pymysql://root:123456@10.11.169.21:3306/agent?charset=utf8mb4"
+  connection_string: "mysql+pymysql://root:cufe2026@bj-cdb-bdka53ky.sql.tencentcdb.com:27415/agent?charset=utf8mb4"
+  # 备用连接
+  # connection_string: "mysql+pymysql://root:123456@10.11.169.21:3306/agent?charset=utf8mb4"
   # connection_string: "mysql+pymysql://root:123456@101.42.36.8:3306/agent?charset=utf8mb4"
   backup_to_file: false                               # 数据库模式下是否同时备份到文件
 
 # 系统配置
 system:
   verbose: false                 # 终端显示详细日志
-  log_file: null                 # 详细日志文件路径（null表示自动生成）
-  save_trace: agent_trace.json  # 追踪日志保存路径
-  enable_trace: false            # 是否自动保存追踪日志

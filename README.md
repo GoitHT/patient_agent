@@ -108,9 +108,9 @@ python src/main.py --enable-reports
 - **智能体配置**：max_questions、max_triage_questions
 - **RAG配置**：persist_dir、collection_name、skip_rag
 - **运行模式**：multi_patient、num_patients、patient_interval
-- **物理环境**：enable_simulation、interactive、use_sim_clock
+- **物理环境**：interactive
 - **数据库**：enabled、connection_string、backup_to_file
-- **系统**：verbose、log_file、save_trace、enable_trace
+- **系统**：verbose
 
 > 📄 完整配置示例请参考 `src/config.yaml` 文件
 

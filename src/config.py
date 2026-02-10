@@ -49,7 +49,6 @@ class ModeConfig:
 @dataclass
 class PhysicalConfig:
     """物理环境配置"""
-    enable_simulation: bool = True
     interactive: bool = False
 
 
@@ -57,9 +56,6 @@ class PhysicalConfig:
 class SystemConfig:
     """系统配置"""
     verbose: bool = False
-    log_file: Optional[str] = None
-    save_trace: Path = field(default_factory=lambda: Path("agent_trace.json"))
-    enable_trace: bool = False
 
 
 @dataclass
@@ -157,8 +153,6 @@ class Config:
             # Physical配置
             if "physical" in data:
                 physical_data = data["physical"]
-                if "enable_simulation" in physical_data:
-                    self.physical.enable_simulation = physical_data["enable_simulation"]
                 if "interactive" in physical_data:
                     self.physical.interactive = physical_data["interactive"]
             
@@ -167,12 +161,6 @@ class Config:
                 system_data = data["system"]
                 if "verbose" in system_data:
                     self.system.verbose = system_data["verbose"]
-                if "log_file" in system_data and system_data["log_file"]:
-                    self.system.log_file = system_data["log_file"]
-                if "save_trace" in system_data:
-                    self.system.save_trace = Path(system_data["save_trace"])
-                if "enable_trace" in system_data:
-                    self.system.enable_trace = system_data["enable_trace"]
             
             # 数据库配置
             if "database" in data:
@@ -207,12 +195,6 @@ class Config:
             self.rag.persist_dir = Path(os.getenv("HOSPITAL_CHROMA_DIR"))
         if os.getenv("HOSPITAL_COLLECTION"):
             self.rag.collection_name = os.getenv("HOSPITAL_COLLECTION")
-        
-        # 系统配置
-        if os.getenv("HOSPITAL_TRACE_FILE"):
-            self.system.save_trace = Path(os.getenv("HOSPITAL_TRACE_FILE"))
-        if os.getenv("HOSPITAL_ENABLE_TRACE"):
-            self.system.enable_trace = os.getenv("HOSPITAL_ENABLE_TRACE").lower() in ("true", "1", "yes")
     
     def _load_from_args(self, args) -> None:
         """从CLI参数加载配置（最高优先级）"""
@@ -243,19 +225,12 @@ class Config:
             self.mode.patient_interval = args.patient_interval
         
         # Physical配置
-        if hasattr(args, "physical_sim"):
-            self.physical.enable_simulation = args.physical_sim
         if hasattr(args, "interactive"):
             self.physical.interactive = args.interactive
         
         # 系统配置
         if hasattr(args, "verbose"):
             self.system.verbose = args.verbose
-        if hasattr(args, "log_file") and args.log_file:
-            self.system.log_file = args.log_file
-        if hasattr(args, "save_trace") and args.save_trace:
-            self.system.save_trace = args.save_trace
-            self.system.enable_trace = True
     
     def summary(self) -> str:
         """生成配置摘要"""
@@ -268,7 +243,6 @@ class Config:
             f"  - 最多问题数: {self.agent.max_questions}",
             f"  - 数据源: HuggingFace DiagnosisArena",
             f"  - RAG集合: {self.rag.collection_name}",
-            f"  - 物理环境: {'启用' if self.physical.enable_simulation else '禁用'}",
         ]
         if self.mode.multi_patient:
             lines.append(f"  - 患者数量: {self.mode.num_patients}")
