@@ -7,7 +7,7 @@ from typing import Any
 
 from graphs.common_opd_graph import CommonOPDGraph, Services
 from graphs.dept_subgraphs.common_specialty_subgraph import build_common_specialty_subgraph
-from rag import ChromaRetriever
+from rag import AdaptiveRAGRetriever
 from services.appointment import AppointmentService
 from services.billing import BillingService
 from services.llm_client import LLMClient
@@ -26,7 +26,7 @@ def build_services() -> Services:
 
 
 def build_dept_subgraphs(
-    *, retriever: ChromaRetriever, llm: LLMClient | None = None,
+    *, retriever: AdaptiveRAGRetriever, llm: LLMClient | None = None,
     doctor_agent: Any | None = None, patient_agent: Any | None = None, 
     max_questions: int = 3  # 最底层默认值，通常从 config传入
 ) -> dict[str, Any]:
@@ -54,7 +54,7 @@ def build_dept_subgraphs(
 def build_common_graph(
     dept_subgraphs: dict[str, Any],
     *,
-    retriever: ChromaRetriever,
+    retriever: AdaptiveRAGRetriever,
     services: Services,
     llm: LLMClient | None = None,
     llm_reports: bool = False,

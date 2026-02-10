@@ -50,25 +50,54 @@ class SystemInitializer:
             raise
     
     def initialize_rag(self) -> Any:
-        """初始化知识库检索器
+        """初始化知识库检索器（Adaptive RAG 系统）
         
         Returns:
             检索器实例
         """
         if not self.config.rag.skip_rag:
-            logger.info("📂 初始化知识库")
+            logger.info("🚀 初始化 Adaptive RAG（SPLLM-RAG1）")
             try:
-                retriever = default_retriever(
-                    persist_dir=self.config.rag.persist_dir,
-                    collection_name=self.config.rag.collection_name
+                from rag import AdaptiveRAGRetriever
+                from pathlib import Path
+                
+                # 解析 SPLLM-RAG1 路径
+                spllm_root = Path(self.config.rag.spllm_root)
+                if not spllm_root.is_absolute():
+                    # 相对路径，相对于项目根目录
+                    from graphs.router import repo_root
+                    spllm_root = (repo_root() / spllm_root).resolve()
+                
+                # 检查路径是否存在
+                if not spllm_root.exists():
+                    raise FileNotFoundError(
+                        f"SPLLM-RAG1 路径不存在: {spllm_root}\n"
+                        f"请检查 config.yaml 中的 spllm_root 配置"
+                    )
+                
+                chroma_path = spllm_root / "chroma"
+                if not chroma_path.exists():
+                    raise FileNotFoundError(
+                        f"SPLLM-RAG1 chroma 目录不存在: {chroma_path}\n"
+                        f"请运行 SPLLM-RAG1/create_database_general.py 创建向量库"
+                    )
+                
+                retriever = AdaptiveRAGRetriever(
+                    spllm_root=spllm_root,
+                    cache_folder=self.config.rag.adaptive_cache_folder,
+                    cosine_threshold=self.config.rag.adaptive_threshold,
+                    embed_model=self.config.rag.adaptive_embed_model,
                 )
+                logger.info(f"   → SPLLM-RAG1: {spllm_root}")
+                logger.info(f"   → 阈值: {self.config.rag.adaptive_threshold}")
                 self.components['retriever'] = retriever
                 return retriever
             except Exception as e:
-                logger.error(f"❌ 知识库检索器初始化失败：{e}")
+                logger.error(f"❌ Adaptive RAG 初始化失败：{e}")
                 raise
         else:
-            logger.info("⏭️ 跳过RAG")
+            logger.info("⏭️ 跳过 RAG")
+            from rag import DummyRetriever
             retriever = DummyRetriever()
             self.components['retriever'] = retriever
             return retriever

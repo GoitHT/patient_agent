@@ -32,10 +32,13 @@ class AgentConfig:
 
 @dataclass
 class RAGConfig:
-    """RAG配置"""
-    persist_dir: Path = field(default_factory=lambda: Path(".chroma"))
-    collection_name: str = "hospital_kb"
+    """RAG配置（Adaptive RAG 系统）"""
     skip_rag: bool = False
+    # Adaptive RAG 配置
+    spllm_root: Path = field(default_factory=lambda: Path("../SPLLM-RAG1"))  # SPLLM-RAG1 项目路径
+    adaptive_cache_folder: Optional[Path] = None  # 模型缓存目录（默认为 spllm_root/model_cache）
+    adaptive_threshold: float = 0.3  # 余弦距离阈值（0-1，越小越严格）
+    adaptive_embed_model: str = "shibing624/text2vec-base-chinese"  # 嵌入模型名称
 
 
 @dataclass

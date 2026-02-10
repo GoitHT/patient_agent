@@ -19,7 +19,7 @@ from typing import Any, Callable
 from langgraph.graph import END, StateGraph
 
 from graphs.log_helpers import _log_node_start, _log_node_end, _log_detail, _log_physical_state
-from rag import ChromaRetriever
+from rag import AdaptiveRAGRetriever
 from services.appointment import AppointmentService
 from services.billing import BillingService
 from services.llm_client import LLMClient

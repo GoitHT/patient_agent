@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from rag import ChromaRetriever
+from rag import AdaptiveRAGRetriever
 from services.llm_client import LLMClient
 from utils import get_logger
 
@@ -15,7 +15,7 @@ class DoctorAgent:
     def __init__(
         self,
         dept: str,
-        retriever: ChromaRetriever,
+        retriever: AdaptiveRAGRetriever,
         llm: LLMClient | None = None,
         max_questions: int = 10  # 最底层默认值，通常由config.yaml覆盖
     ):

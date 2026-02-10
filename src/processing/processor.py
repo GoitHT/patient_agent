@@ -22,7 +22,7 @@ from graphs.router import build_common_graph, build_dept_subgraphs, build_servic
 from coordination import HospitalCoordinator, PatientStatus
 from loaders import load_diagnosis_arena_case
 from logging_utils import create_patient_detail_logger, close_patient_detail_logger, get_patient_detail_logger
-from rag import ChromaRetriever
+from rag import AdaptiveRAGRetriever
 from services.llm_client import LLMClient
 from services.medical_record import MedicalRecordService
 from services.medical_record_integration import MedicalRecordIntegration
@@ -78,7 +78,7 @@ class LangGraphPatientExecutor:
         dept: str,
         priority: int,
         coordinator: HospitalCoordinator,
-        retriever: ChromaRetriever,
+        retriever: AdaptiveRAGRetriever,
         llm: LLMClient,
         services: Any,
         medical_record_service: MedicalRecordService,
@@ -892,7 +892,7 @@ class LangGraphMultiPatientProcessor:
     def __init__(
         self,
         coordinator: HospitalCoordinator,
-        retriever: ChromaRetriever,
+        retriever: AdaptiveRAGRetriever,
         llm: LLMClient,
         services: Any,
         medical_record_service: MedicalRecordService,
