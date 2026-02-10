@@ -1,0 +1,418 @@
+import os
+import chardet
+import json
+import re
+import csv
+import numpy as np
+import shutil
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+
+# --- 1. 配置与模型初始化（修复：强制向量归一化） ---
+MODEL_NAME = "shibing624/text2vec-base-chinese"
+CACHE_FOLDER = "./model_cache"
+
+
+def get_normalized_embeddings():
+    """创建归一化的嵌入模型（强制向量范数为1）"""
+    embeddings = HuggingFaceEmbeddings(
+        model_name=MODEL_NAME,
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={
+            'normalize_embeddings': True,  # 强制归一化
+            'batch_size': 32
+        },
+        cache_folder=CACHE_FOLDER
+    )
+    # 验证归一化效果（可选）
+    test_emb = embeddings.embed_query("测试文本")
+    norm = np.linalg.norm(test_emb)
+    print(f"嵌入向量归一化验证：范数 = {norm:.4f}（理想值=1.0）")
+    return embeddings
+
+
+# 全局嵌入模型（确保所有向量库使用同一归一化模型）
+EMBEDDINGS = get_normalized_embeddings()
+
+
+# --- 修复2：统一向量库创建逻辑（指定余弦距离） ---
+def create_chroma_db_with_cosine(docs, db_path, collection_name):
+    """
+    创建指定余弦距离的Chroma向量库
+    :param docs: 文档列表（不能为空）
+    :param db_path: 持久化路径
+    :param collection_name: 集合名称
+    :return: Chroma向量库实例
+    """
+    # 如果路径存在，先删除（确保重新创建时使用指定的距离函数）
+    if os.path.exists(db_path):
+        shutil.rmtree(db_path)
+        print(f"已删除旧向量库：{db_path}")
+
+    # 检查文档列表是否为空
+    if not docs:
+        raise ValueError(f"无法创建空的向量库 {db_path}，文档列表不能为空")
+
+    # 创建向量库（显式指定余弦距离）
+    db = Chroma.from_documents(
+        documents=docs,
+        embedding=EMBEDDINGS,
+        persist_directory=db_path,
+        collection_name=collection_name,
+        collection_metadata={"hnsw:space": "cosine"}  # 强制使用余弦距离
+    )
+    db.persist()
+    print(f"✅ 已创建余弦距离向量库：{db_path}，包含 {len(docs)} 个文档")
+    return db
+
+
+# --- 2. 核心加载器：修复 JSON 解析 ---
+def load_single_document(file_path):
+    ext = os.path.splitext(file_path)[-1].lower()
+
+    def get_encoding(path):
+        with open(path, 'rb') as f:
+            return chardet.detect(f.read())['encoding'] or 'utf-8'
+
+    try:
+        if ext in [".txt", ".md"]:
+            return TextLoader(file_path, encoding=get_encoding(file_path)).load()
+        elif ext == ".json":
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                docs = []
+                rows = []
+                # 兼容性修复：适配单条记录 JSON 或 列表 JSON
+                if isinstance(data, list):
+                    rows = data
+                elif isinstance(data, dict):
+                    # 如果字典本身就有这些医学键，说明它本身就是一行记录
+                    if "medicalRecordId" in data or "主诉" in data:
+                        rows = [data]
+                    else:
+                        # 否则按 Sheet 结构处理
+                        for val in data.values():
+                            if isinstance(val, list): rows.extend(val)
+                for row in rows:
+                    content = " | ".join([f"{k}: {str(v).strip()}" for k, v in row.items() if v])
+                    content = re.sub(r'\s+', ' ', content)
+                    if len(content) > 10:
+                        docs.append(Document(
+                            page_content=content,
+                            metadata={"source": file_path}
+                        ))
+                return docs
+        return []
+    except Exception as e:
+        print(f"\n❌ 读取文件 {file_path} 失败: {e}")
+        return []
+
+
+# --- 3. 增量同步逻辑：适配根目录chroma + 余弦距离 ---
+def update_vector_db(db_name, data_folder):
+    # 向量库路径：根目录/chroma/{db_name}
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma", db_name)
+    data_dir = os.path.join("data", data_folder)
+    print(f"\n>>> 🚀 开始同步数据库: {db_name}")
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+        return
+
+    # 获取文件列表
+    allowed_extensions = {".txt", ".md", ".json"}
+    files_to_process = [f for f in os.listdir(data_dir) if os.path.splitext(f)[-1].lower() in allowed_extensions]
+
+    if not files_to_process:
+        print(f"⚠️ 数据目录 {data_dir} 中没有可处理的文件")
+        return
+
+    # 切分器：强制用于所有文件，防止 Token 溢出
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=600,
+        chunk_overlap=60,
+        separators=["\n\n", "\n", "。", "；", "！", "？", "，", " ", ""]
+    )
+
+    # 检查向量库是否存在
+    if os.path.exists(db_path):
+        # 加载已有向量库
+        db = Chroma(
+            persist_directory=db_path,
+            embedding_function=EMBEDDINGS,
+            collection_name=db_name,
+            collection_metadata={"hnsw:space": "cosine"}
+        )
+
+        # 获取已存在文件清单
+        results = db.get()
+        processed_files = set()
+        if results and results['metadatas']:
+            processed_files = {os.path.basename(m['source']) for m in results['metadatas'] if 'source' in m}
+    else:
+        # 首次创建向量库
+        db = None
+        processed_files = set()
+        print(f"🆕 首次创建向量库: {db_name}")
+
+    # 处理所有文件
+    for i, filename in enumerate(files_to_process):
+        # 如果文件已在库中，直接跳过
+        if filename in processed_files:
+            print(f"⏩ 文件已存在，跳过: {filename}")
+            continue
+
+        file_path = os.path.join(data_dir, filename)
+        print(f"📄 正在处理 ({i + 1}/{len(files_to_process)}): {filename} ", end="", flush=True)
+
+        raw_docs = load_single_document(file_path)
+        if raw_docs:
+            # 无论什么格式，都进行切分，确保入库的片段大小可控
+            current_splits = text_splitter.split_documents(raw_docs)
+            if current_splits:
+                if db is None:
+                    # 首次创建向量库
+                    db = create_chroma_db_with_cosine(current_splits, db_path, db_name)
+                else:
+                    # 批量入库到已有向量库
+                    batch_size = 50
+                    for j in range(0, len(current_splits), batch_size):
+                        batch = current_splits[j: j + batch_size]
+                        db.add_documents(batch)
+                        print(".", end="", flush=True)
+                    db.persist()
+                print(f" ✅ 完成 (新增 {len(current_splits)} 个片段)")
+            else:
+                print("⚠️ 内容无效")
+        else:
+            print("❌ 加载失败")
+
+    print(f"✨ {db_name} 同步完成！")
+
+
+# --- 4. 实时对话存储函数：修复版（确保余弦距离） ---
+def store_chat_history_rag(question: str, answer: str, patient_id: str, db_name="UserHistory_db"):
+    """
+    增加了 patient_id 参数，实现多患者隔离存储，向量库指向根目录chroma
+    修复：强制使用余弦距离存储
+    """
+    # 构建文档
+    doc_content = f"患者问: {question} | 医生答: {answer}"
+    doc = Document(
+        page_content=doc_content,
+        metadata={"patient_id": patient_id, "source": "conversation_history"}
+    )
+
+    # 向量库路径：根目录/chroma/{db_name}
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    db_path = os.path.join(root_dir, "chroma", db_name)
+
+    # 切片
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=600,
+        chunk_overlap=60,
+        separators=["|", "。", "；", "！", "？", "，", " "]
+    )
+    splits = text_splitter.split_documents([doc])
+
+    if not splits:
+        print(f"⚠️ 无法存储空对话")
+        return
+
+    # 检查向量库是否存在
+    if os.path.exists(db_path):
+        # 加载已有向量库
+        db = Chroma(
+            persist_directory=db_path,
+            embedding_function=EMBEDDINGS,
+            collection_name="UserHistory",
+            collection_metadata={"hnsw:space": "cosine"}
+        )
+        db.add_documents(splits)
+        db.persist()
+    else:
+        # 首次创建向量库
+        create_chroma_db_with_cosine(
+            docs=splits,
+            db_path=db_path,
+            collection_name="UserHistory"
+        )
+
+    print(f"✅ 患者 {patient_id} 的对话已完成切片索引")
+
+
+# --- 5. 医生进化存储函数：双存储（用户专属+全量汇总），适配state/dataset ---
+def store_doctor_qa_evolution(question, answer, rag_info, patient_id, score, is_high_quality):
+    """
+    仅高质量对话才会被存入CSV，用于Few-shot学习
+    新增：同步写入【state/dataset】下的用户专属CSV + 全量高分对话汇总CSV，标记patient_id便于溯源
+    """
+    if not is_high_quality:
+        print(f"⚠️ 对话非高质量（总分{score}），未达进化标准，不执行 CSV 存储")
+        return
+
+    # CSV存储路径：根目录/state/dataset/
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_dir = os.path.join(root_dir, "state", "dataset")
+    os.makedirs(csv_dir, exist_ok=True)
+
+    # ========== 1. 写入用户专属CSV ==========
+    user_csv_path = os.path.join(csv_dir, f"doctor_evolve_{patient_id}.csv")
+    file_exists = os.path.isfile(user_csv_path)
+    # 新增patient_id字段，用于溯源和向量库去重
+    headers = [
+        "patient_id",
+        "question1", "qus_embedding", "rag_info1", "answer1",
+        "qus2_embedding", "question2", "answer2", "rag_info2",
+        "total_score", "is_high_quality"
+    ]
+    # 构造数据行
+    row = [
+        patient_id,
+        "N/A", "vector_placeholder", "N/A", "N/A",
+        "vector_placeholder", question, answer, rag_info,
+        score, is_high_quality
+    ]
+    # 写入用户专属库
+    with open(user_csv_path, 'a', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(headers)
+        writer.writerow(row)
+
+    # ========== 2. 新增：写入全量高分对话汇总CSV ==========
+    summary_csv_path = os.path.join(csv_dir, "doctor_evolve_summary.csv")
+    summary_file_exists = os.path.isfile(summary_csv_path)
+    with open(summary_csv_path, 'a', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        if not summary_file_exists:
+            writer.writerow(headers)  # 字段与用户CSV一致，含patient_id
+        writer.writerow(row)  # 复用同一行数据，确保数据一致
+    print(f"🚀 高质量问答已存入：用户专属库({user_csv_path}) + 全量汇总库({summary_csv_path}) (Score: {score})")
+
+
+# --- 6. 修复3：高质量问答向量库初始化/更新函数（余弦距离版） ---
+def init_high_quality_qa_db():
+    """
+    初始化/更新高质量问答向量库（HighQualityQA_db）
+    【修复版】：使用余弦距离+归一化嵌入，将问题和答案分开存储
+    基于【state/dataset/doctor_evolve_summary.csv】构建，向量库指向根目录chroma
+    """
+    db_name = "HighQualityQA_db"
+    # 向量库路径：根目录/chroma/HighQualityQA_db
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    db_path = os.path.join(root_dir, "chroma", db_name)
+    # CSV汇总文件路径：根目录/state/dataset/doctor_evolve_summary.csv
+    csv_dir = os.path.join(root_dir, "state", "dataset")
+    summary_csv_path = os.path.join(csv_dir, "doctor_evolve_summary.csv")
+
+    # 1. 检查汇总CSV是否存在
+    if not os.path.exists(summary_csv_path):
+        print(f"⚠️ 全量高分对话汇总CSV不存在({summary_csv_path})，跳过高质量向量库初始化")
+        return
+
+    # 2. 读取CSV并构造文档
+    high_quality_docs = []
+    with open(summary_csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            question = row["question2"]
+            answer = row["answer2"]
+            patient_id = row["patient_id"]
+
+            # ⚡️ 关键改进：将问题单独存储为一个文档（便于问题匹配）
+            question_doc = Document(
+                page_content=question,  # 只存储问题文本，便于匹配
+                metadata={
+                    "patient_id": patient_id,
+                    "question": question,
+                    "answer": answer,  # 答案放在metadata中
+                    "full_answer": answer,
+                    "score": row["total_score"],
+                    "source": "high_quality_qa_summary",
+                    "doc_type": "question"  # 标记文档类型
+                }
+            )
+            high_quality_docs.append(question_doc)
+
+            # 可选：也可以存储答案文档，用于答案检索
+            answer_doc = Document(
+                page_content=answer,  # 存储答案文本
+                metadata={
+                    "patient_id": patient_id,
+                    "question": question,
+                    "answer": answer,
+                    "score": row["total_score"],
+                    "source": "high_quality_qa_summary",
+                    "doc_type": "answer"
+                }
+            )
+            high_quality_docs.append(answer_doc)
+
+    if not high_quality_docs:
+        print("ℹ️ 无高质量问答数据，向量库无需更新")
+        return
+
+    # 3. 批量入库（切片后入库，防止Token溢出）
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500, chunk_overlap=50,
+        separators=["|", "。", "；", "！", "？", "，", " "]
+    )
+    splits = text_splitter.split_documents(high_quality_docs)
+
+    if not splits:
+        print("⚠️ 切片后无有效文档")
+        return
+
+    # 4. 初始化/加载向量库（指定余弦距离）
+    if os.path.exists(db_path):
+        # 加载已有向量库
+        db = Chroma(
+            persist_directory=db_path,
+            embedding_function=EMBEDDINGS,
+            collection_name="HighQualityQA",
+            collection_metadata={"hnsw:space": "cosine"}
+        )
+
+        # 读取已存在的记录（通过question+patient_id做唯一标识）
+        processed_qa = set()
+        results = db.get()
+        if results and results['metadatas']:
+            processed_qa = {(m.get("question"), m.get("patient_id")) for m in results['metadatas'] if
+                            m.get("question") and m.get("patient_id")}
+
+        # 过滤掉已存在的文档
+        new_splits = []
+        for split in splits:
+            question = split.metadata.get("question")
+            patient_id = split.metadata.get("patient_id")
+            if (question, patient_id) not in processed_qa:
+                new_splits.append(split)
+
+        splits = new_splits
+    else:
+        # 首次创建向量库
+        db = create_chroma_db_with_cosine(splits, db_path, "HighQualityQA")
+        return
+
+    # 5. 批量入库
+    if splits:
+        batch_size = 50
+        for j in range(0, len(splits), batch_size):
+            batch = splits[j:j + batch_size]
+            db.add_documents(batch)
+        db.persist()
+        print(f"✅ 高质量问答向量库更新完成，新增 {len(splits)} 个片段（问题+答案分别存储）")
+    else:
+        print("ℹ️ 无新增高质量问答，向量库无需更新")
+
+
+# --- 主函数：启动时同步基础向量库+更新高质量向量库 ---
+if __name__ == "__main__":
+    # 同步医学指南、临床案例向量库（余弦距离版）
+    update_vector_db("MedicalGuide_db", "MedicalGuide_data")
+    update_vector_db("ClinicalCase_db", "ClinicalCase_data")
+    # 新增：初始化/更新高质量问答向量库（余弦距离版）
+    init_high_quality_qa_db()
