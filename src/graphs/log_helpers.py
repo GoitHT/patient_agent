@@ -130,3 +130,132 @@ def _log_physical_state(state: BaseState, node_name: str = "", level: int = 2):
     _log_detail(f"\n🏥 物理环境状态:", state, level, node_name)
     _log_detail(f"  🕐 时间: {current_time}", state, level, node_name)
     _log_detail(f"  📍 位置: {loc_name}", state, level, node_name)
+
+
+def _log_rag_retrieval(
+    query: str,
+    chunks: list[dict[str, Any]],
+    state: BaseState,
+    filters: dict[str, Any] | None = None,
+    node_name: str = "",
+    level: int = 2,
+    purpose: str = "检索"
+):
+    """详细记录 RAG 检索过程和结果
+    
+    Args:
+        query: 查询文本
+        chunks: 检索结果列表
+        state: 状态对象
+        filters: 过滤条件
+        node_name: 节点名称
+        level: 日志级别
+        purpose: 检索目的描述（如"专科知识"，"历史记录"等）
+    """
+    detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
+    if not detail_logger:
+        return
+    
+    # 记录检索请求
+    detail_logger.info(f"\n📖 RAG {purpose}检索:")
+    detail_logger.info(f"  🔍 查询: {query}")
+    
+    # 根据filters推断查询的目标数据库
+    target_dbs = _infer_target_databases(filters, state)
+    if target_dbs:
+        detail_logger.info(f"  🗄️  目标库: {', '.join(target_dbs)}")
+    
+    # 记录过滤条件
+    if filters:
+        filter_desc = ", ".join([f"{k}={v}" for k, v in filters.items() if v])
+        if filter_desc:
+            detail_logger.info(f"  🎯 过滤: {filter_desc}")
+    
+    # 记录检索结果统计
+    if not chunks:
+        detail_logger.info(f"  ℹ️  未检索到相关内容")
+        return
+    
+    detail_logger.info(f"  ✅ 检索到 {len(chunks)} 个知识片段")
+    
+    # 统计各数据库来源
+    db_sources = {}
+    for chunk in chunks:
+        meta = chunk.get('meta', {})
+        source = meta.get('source', 'unknown')
+        db_sources[source] = db_sources.get(source, 0) + 1
+    
+    if db_sources:
+        detail_logger.info(f"  📊 数据来源:")
+        db_name_map = {
+            'MedicalGuide': '医学指南库 (MedicalGuide_db)',
+            'ClinicalCase': '临床案例库 (ClinicalCase_db)',
+            'HighQualityQA': '高质量问答库 (HighQualityQA_db)',
+            'UserHistory': '患者历史库 (UserHistory_db)',
+            'unknown': '未知来源'
+        }
+        for source, count in sorted(db_sources.items(), key=lambda x: -x[1]):
+            source_name = db_name_map.get(source, f'{source}库')
+            detail_logger.info(f"     • {source_name}: {count}条")
+    else:
+        # 如果没有source信息，记录警告
+        detail_logger.info(f"  ⚠️  未能识别数据来源")
+    
+    # 记录前3条高质量结果的详细信息
+    detail_logger.info(f"  📝 相关内容预览（前3条）:")
+    for i, chunk in enumerate(chunks[:3], 1):
+        score = chunk.get('score', 0.0)
+        text = chunk.get('text', '')
+        meta = chunk.get('meta', {})
+        source = meta.get('source', 'unknown')
+        
+        # 截取文本预览（最多100字）
+        preview = text[:100].replace('\n', ' ').strip()
+        if len(text) > 100:
+            preview += '...'
+        
+        # 格式化相关度显示
+        relevance = "高" if score > 0.8 else "中" if score > 0.6 else "低"
+        
+        detail_logger.info(f"     [{i}] 相关度: {relevance} ({score:.3f})")
+        detail_logger.info(f"         内容: {preview}")
+        
+        # 如果有特殊元数据，也记录
+        if 'dept' in meta:
+            detail_logger.info(f"         科室: {meta['dept']}")
+        if 'type' in meta:
+            detail_logger.info(f"         类型: {meta['type']}")
+    
+    # 如果检索结果超过3条，显示统计
+    if len(chunks) > 3:
+        detail_logger.info(f"     ... 及其他 {len(chunks) - 3} 条结果")
+
+
+def _infer_target_databases(filters: dict[str, Any] | None, state: BaseState) -> list[str]:
+    """根据过滤条件推断将要查询的目标数据库
+    
+    Args:
+        filters: 过滤条件字典
+        state: 状态对象
+        
+    Returns:
+        目标数据库名称列表
+    """
+    if not filters:
+        # 默认策略：提示用户应该指定 db_name
+        return ["未指定数据库"]
+    
+    # 【优先策略】如果明确指定了 db_name，只返回该数据库
+    db_name = filters.get("db_name")
+    if db_name:
+        db_name_map = {
+            "HospitalProcess_db": "规则流程库",
+            "MedicalGuide_db": "医学指南库",
+            "ClinicalCase_db": "临床案例库",
+            "HighQualityQA_db": "高质量问答库",
+            "UserHistory_db": "患者历史库",
+        }
+        return [db_name_map.get(db_name, db_name)]
+    
+    # 如果没有指定 db_name，显示警告
+    return ["⚠️ 未指定 db_name"]

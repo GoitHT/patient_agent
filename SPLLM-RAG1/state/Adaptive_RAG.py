@@ -5,10 +5,29 @@ import re
 import logging
 from typing import List, TypedDict, Annotated
 
-# --- 关键修复：在导入任何库之前设置环境变量 ---
-os.environ['HF_HUB_OFFLINE'] = '1'  # 强制使用离线模式
-os.environ['TRANSFORMERS_OFFLINE'] = '1'  # Transformers离线模式
-os.environ['HF_HOME'] = './model_cache'  # 指定HuggingFace缓存目录
+# --- 智能模型下载：检查本地是否有模型，没有则临时允许下载 ---
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(CURRENT_DIR)
+CACHE_FOLDER = os.path.join(ROOT_DIR, "model_cache")
+EMBED_MODEL_NAME = "BAAI/bge-large-zh-v1.5"
+
+# 检查模型是否存在
+model_cache_path = os.path.join(CACHE_FOLDER, "models--BAAI--bge-large-zh-v1.5")
+model_exists = os.path.exists(model_cache_path) and os.path.isdir(model_cache_path)
+
+if not model_exists:
+    print(f"⚠️  未检测到本地模型缓存: {model_cache_path}")
+    print("📥 首次运行，将在线下载模型...")
+    # 临时允许下载
+    os.environ['HF_HUB_OFFLINE'] = '0'
+    os.environ['TRANSFORMERS_OFFLINE'] = '0'
+else:
+    print(f"✅ 检测到本地模型缓存，使用离线模式")
+    # 强制使用离线模式
+    os.environ['HF_HUB_OFFLINE'] = '1'
+    os.environ['TRANSFORMERS_OFFLINE'] = '1'
+
+os.environ['HF_HOME'] = CACHE_FOLDER  # 指定HuggingFace缓存目录
 
 # 修复：导入正确的Chroma版本
 from langchain_chroma import Chroma
@@ -23,16 +42,12 @@ from langchain_core.prompts import ChatPromptTemplate
 DEEPSEEK_KEY = 'sk-16ecbb2a436c410e870b3ec10c87a84b'
 DEEPSEEK_BASE = 'https://api.deepseek.com'
 COSINE_DISTANCE_THRESHOLD = 0.3  # 临时放宽，确保能检索到
-EMBED_MODEL_NAME = "shibing624/text2vec-base-chinese"
+# EMBED_MODEL_NAME 已在上面定义
 
 
-# --- 2. 嵌入模型初始化（修复：强制使用本地缓存） ---
+# --- 2. 嵌入模型初始化（支持自动下载） ---
 def init_embeddings():
-    """从本地缓存初始化嵌入模型，避免网络请求"""
-    # 首先检查本地缓存路径
-    CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-    ROOT_DIR = os.path.dirname(CURRENT_DIR)
-    CACHE_FOLDER = os.path.join(ROOT_DIR, "model_cache")
+    """从本地缓存初始化嵌入模型，首次运行自动下载"""
 
     print(f"📂 嵌入模型缓存路径: {CACHE_FOLDER}")
     print(f"📂 缓存路径是否存在: {os.path.exists(CACHE_FOLDER)}")
@@ -52,9 +67,15 @@ def init_embeddings():
                 "normalize_embeddings": True,
                 "batch_size": 32
             },
-            cache_folder=CACHE_FOLDER  # 关键：指定缓存文件夹
+            cache_folder=CACHE_FOLDER
         )
-        print("✅ 嵌入模型初始化成功（使用本地缓存）")
+        if model_exists:
+            print("✅ 嵌入模型初始化成功（使用本地缓存）")
+        else:
+            print("✅ 嵌入模型下载并初始化成功")
+            # 下载完成后，重新设置为离线模式
+            os.environ['HF_HUB_OFFLINE'] = '1'
+            os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
         # 测试嵌入模型是否正常工作
         test_emb = embeddings.embed_query("测试文本")
@@ -70,7 +91,7 @@ def init_embeddings():
             from sentence_transformers import SentenceTransformer
 
             # 直接使用本地模型路径
-            model_path = os.path.join(CACHE_FOLDER, "models--shibing624--text2vec-base-chinese")
+            model_path = os.path.join(CACHE_FOLDER, "models--BAAI--bge-large-zh-v1.5")
             if not os.path.exists(model_path):
                 model_path = EMBED_MODEL_NAME
 

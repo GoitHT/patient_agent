@@ -8,7 +8,9 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 
 from graphs.log_helpers import _log_detail
-from rag import ChromaRetriever
+from rag import AdaptiveRAGRetriever, DialogueQualityEvaluator
+from rag.query_optimizer import QueryContext, get_query_optimizer
+from rag.keyword_generator import RAGKeywordGenerator, NodeContext
 from services.llm_client import LLMClient
 from state.schema import BaseState, make_audit_entry
 from utils import load_prompt, contains_any_positive, get_logger
@@ -120,7 +122,7 @@ DEPT_CONFIG = {
 
 def build_common_specialty_subgraph(
     *, 
-    retriever: ChromaRetriever,
+    retriever: AdaptiveRAGRetriever,
     llm: LLMClient | None = None,
     doctor_agent=None, 
     patient_agent=None, 
@@ -177,10 +179,57 @@ def build_common_specialty_subgraph(
         
         # 检索该科室的专科知识
         # 注意：此时chief_complaint还未设置（医生尚未从患者处获得），使用科室信息检索
-        query = f"{dept} {dept_name} 红旗 检查建议 鉴别诊断"
-        logger.info(f"🔍 检索{dept_name}知识...")
-        chunks = retriever.retrieve(query, filters={"dept": dept}, k=4)
+        _log_detail(f"🔍 检索{dept_name}专科知识库...", state, 2, "S4")
+        
+        # 使用关键词生成器构建节点上下文（优先使用医生主诉，回退到原始主诉）
+        keyword_generator = RAGKeywordGenerator()
+        complaint_seed = state.chief_complaint or state.original_chief_complaint
+        node_ctx = NodeContext(
+            node_id="S4",
+            node_name="专科问诊",
+            dept=dept,
+            dept_name=dept_name,
+            chief_complaint=complaint_seed,
+            patient_age=state.patient_profile.get("age") if state.patient_profile else None,
+            patient_gender=state.patient_profile.get("gender") if state.patient_profile else None,
+        )
+        
+        # 【增强RAG】1. 检索专科知识库（使用关键词生成器）
+        # 【单一数据库检索】只查询医学指南库(MedicalGuide_db) - 检索专科基础知识、Red Flags、鉴别诊断
+        query = keyword_generator.generate_keywords(node_ctx, "MedicalGuide_db")
+        chunks = retriever.retrieve(query, filters={"db_name": "MedicalGuide_db"}, k=4)
         state.add_retrieved_chunks(chunks)
+        from graphs.log_helpers import _log_rag_retrieval
+        _log_rag_retrieval(query, chunks, state, filters={"db_name": "MedicalGuide_db"}, node_name="S4", purpose=f"{dept_name}专科知识[医学指南库]")
+        
+        # 【增强RAG】2. 检索高质量问诊库（使用关键词生成器）
+        # 【单一数据库检索】只查询高质量问诊库(HighQualityQA_db) - 检索推荐的问诊问题
+        qa_query = keyword_generator.generate_keywords(node_ctx, "HighQualityQA_db")
+        qa_chunks = retriever.retrieve(
+            qa_query,
+            filters={"db_name": "HighQualityQA_db"},
+            k=3
+        )
+        # 无论是否有结果，都记录检索日志
+        from graphs.log_helpers import _log_rag_retrieval
+        _log_rag_retrieval(qa_query, qa_chunks, state, filters={"db_name": "HighQualityQA_db"}, node_name="S4", purpose="高质量问诊参考[高质量问诊库]")
+        if qa_chunks:
+            state.add_retrieved_chunks(qa_chunks)
+        
+        # 【增强RAG】3. 检索相似症状的临床案例（使用关键词生成器）
+        # 【单一数据库检索】只查询临床案例库(ClinicalCase_db) - 检索相似症状的患者案例
+        if state.patient_id:
+            case_query = keyword_generator.generate_keywords(node_ctx, "ClinicalCase_db")
+            case_chunks = retriever.retrieve(
+                case_query,
+                filters={"db_name": "ClinicalCase_db"},
+                k=2
+            )
+            # 无论是否有结果，都记录检索日志
+            from graphs.log_helpers import _log_rag_retrieval
+            _log_rag_retrieval(case_query, case_chunks, state, filters={"db_name": "ClinicalCase_db"}, node_name="S4", purpose="临床案例参考[临床案例库]")
+            if case_chunks:
+                state.add_retrieved_chunks(case_chunks)
 
         cc = state.chief_complaint
         
@@ -252,6 +301,38 @@ def build_common_specialty_subgraph(
             # 获取患者详细日志记录器（如果存在）
             detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
             
+            # 【新增】初始化对话质量评估器
+            qa_evaluator = None
+            qa_scores = []  # 存储每轮对话的质量评分
+            high_quality_count = 0  # 高质量对话计数
+            
+            if hasattr(state, 'retriever') and state.retriever:
+                try:
+                    # 获取SPLLM根目录
+                    import sys
+                    from pathlib import Path
+                    spllm_root = None
+                    for path in sys.path:
+                        candidate = Path(path).parent / "SPLLM-RAG1"
+                        if candidate.exists():
+                            spllm_root = candidate
+                            break
+                    
+                    if not spllm_root:
+                        # 尝试从retriever获取
+                        if hasattr(retriever, 'spllm_root'):
+                            spllm_root = retriever.spllm_root
+                    
+                    if spllm_root:
+                        qa_evaluator = DialogueQualityEvaluator(
+                            llm=llm if llm else None,
+                            spllm_root=spllm_root,
+                            high_quality_threshold=0.7
+                        )
+                        logger.info("  ✅ 对话质量评估器已启用")
+                except Exception as e:
+                    logger.warning(f"  ⚠️  对话质量评估器初始化失败: {e}")
+            
             for i in range(remaining_questions):
                 # 终端只显示简洁信息
                 if should_log(1, "specialty_subgraph", "S4"):
@@ -268,11 +349,12 @@ def build_common_specialty_subgraph(
                     question = "您好，请问您哪里不舒服？"
                 else:
                     # 后续问题：使用收集到的信息生成针对性问题
+                    # 【增强】传入检索到的知识片段（包括高质量问诊库）作为参考
                     # 注意：不直接使用state.chief_complaint，而是使用doctor_agent已收集的信息
                     question = doctor_agent.generate_one_question(
                         chief_complaint=doctor_agent.collected_info.get("chief_complaint", ""),
                         context=context_desc,
-                        rag_chunks=chunks
+                        rag_chunks=chunks + qa_chunks + case_chunks  # 合并所有检索结果
                     )
                 
                 if not question:
@@ -306,6 +388,59 @@ def build_common_specialty_subgraph(
                     "answer": answer, 
                     "stage": f"{dept}_specialty"
                 })
+                
+                # 【新增】对话质量评估与存储
+                if qa_evaluator and question and answer:
+                    try:
+                        # 准备患者信息（用于忠实性评估）
+                        patient_info = {
+                            "chief_complaint": state.chief_complaint,
+                            "history": state.history,
+                            "patient_profile": state.patient_profile,
+                        }
+                        
+                        # 准备问诊上下文（用于医生提问评估）
+                        context = {
+                            "dept": dept,
+                            "dept_name": dept_name,
+                            "stage": "specialty_interview",
+                            "collected_info": doctor_agent.collected_info if doctor_agent else {}
+                        }
+                        
+                        # 评估对话质量
+                        dialogue_score = qa_evaluator.evaluate_dialogue(
+                            question=question,
+                            answer=answer,
+                            patient_info=patient_info,
+                            context=context
+                        )
+                        
+                        qa_scores.append(dialogue_score)
+                        
+                        # 如果是高质量对话，存储到向量库
+                        if dialogue_score.is_high_quality():
+                            success = qa_evaluator.store_high_quality_dialogue(
+                                dialogue_score=dialogue_score,
+                                patient_id=state.patient_id,
+                                metadata={
+                                    "dept": dept,
+                                    "stage": "specialty_interview",
+                                    "round": questions_asked_this_node + i + 1
+                                }
+                            )
+                            if success:
+                                high_quality_count += 1
+                        
+                        # 详细日志（仅在debug级别显示）
+                        if should_log(3, "specialty_subgraph", "S4"):
+                            logger.debug(
+                                f"  📊 Q{i+1} 质量评分: "
+                                f"医生={dialogue_score.doctor_metrics.quality:.2f}, "
+                                f"患者={dialogue_score.patient_metrics.ability:.2f}, "
+                                f"综合={dialogue_score.overall_score:.2f}"
+                            )
+                    except Exception as e:
+                        logger.warning(f"  ⚠️  对话质量评估失败 (Q{i+1}): {e}")
                 
                 # 更新该节点和全局计数器
                 state.node_qa_counts[node_key] = questions_asked_this_node + i + 1
@@ -360,6 +495,45 @@ def build_common_specialty_subgraph(
             final_qa_count = state.node_qa_counts.get(node_key, 0)
             final_global_count = state.node_qa_counts.get("global_total", 0)
             logger.info(f"  ✅ {dept_name}专科问诊完成，本节点 {final_qa_count} 轮，全局总计 {final_global_count} 轮")
+            
+            # 【新增】展示对话质量统计
+            if qa_scores:
+                logger.info(f"\n{'━'*60}")
+                logger.info("💎 对话质量统计")
+                logger.info(f"{'━'*60}")
+                
+                # 计算平均分数
+                avg_doctor_quality = sum(s.doctor_metrics.quality for s in qa_scores) / len(qa_scores)
+                avg_patient_ability = sum(s.patient_metrics.ability for s in qa_scores) / len(qa_scores)
+                avg_overall = sum(s.overall_score for s in qa_scores) / len(qa_scores)
+                
+                logger.info(f"  📈 对话轮数: {len(qa_scores)} 轮")
+                logger.info(f"  👨‍⚕️  医生平均质量: {avg_doctor_quality:.2f}/1.0")
+                logger.info(f"     • 具体性: {sum(s.doctor_metrics.specificity for s in qa_scores) / len(qa_scores):.2f}")
+                logger.info(f"     • 针对性: {sum(s.doctor_metrics.targetedness for s in qa_scores) / len(qa_scores):.2f}")
+                logger.info(f"     • 专业性: {sum(s.doctor_metrics.professionalism for s in qa_scores) / len(qa_scores):.2f}")
+                logger.info(f"  👤 患者平均能力: {avg_patient_ability:.2f}/1.0")
+                logger.info(f"     • 相关性: {sum(s.patient_metrics.relevance for s in qa_scores) / len(qa_scores):.2f}")
+                logger.info(f"     • 忠实性: {sum(s.patient_metrics.faithfulness for s in qa_scores) / len(qa_scores):.2f}")
+                logger.info(f"     • 鲁棒性: {sum(s.patient_metrics.robustness for s in qa_scores) / len(qa_scores):.2f}")
+                logger.info(f"  🎯 综合得分: {avg_overall:.2f}/1.0")
+                
+                if high_quality_count > 0:
+                    logger.info(f"  ✨ 高质量对话: {high_quality_count}/{len(qa_scores)} 轮已存入知识库")
+                else:
+                    logger.info(f"  ℹ️  本次问诊暂无高质量对话达到存储阈值")
+                
+                # 保存质量评分到state（用于审计）
+                state.agent_interactions["qa_quality_scores"] = {
+                    "total_rounds": len(qa_scores),
+                    "avg_doctor_quality": avg_doctor_quality,
+                    "avg_patient_ability": avg_patient_ability,
+                    "avg_overall_score": avg_overall,
+                    "high_quality_count": high_quality_count,
+                    "detailed_scores": [s.to_dict() for s in qa_scores]
+                }
+                
+                logger.info(f"{'━'*60}\n")
             
             # ===== 医生总结专业主诉 =====
             # 总是让医生基于问诊总结专业主诉，覆盖患者向护士说的口语化描述
@@ -712,13 +886,63 @@ def build_common_specialty_subgraph(
                 # 获取详细日志记录器
         detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
         logger.info("\n" + "="*60)
-        logger.info(f"� S6: {dept_name}初步判断")
+        logger.info(f"📊 S6: {dept_name}初步判断")
         logger.info("="*60)
         
-        query = f"{dept} {dept_name} 检查选择 适应症 {state.chief_complaint}"
+        # 【增强RAG】S6: 检索医学指南库 + 临床案例库（使用关键词生成器）
+        # S6节点用途：综合患者信息和医学指南和相关案例得出是否需要辅助检查
+        # 使用：医学指南库(MedicalGuide_db) - 检索专科诊疗指南、检查指征、适应症
+        #      临床案例库(ClinicalCase_db) - 检索相似案例
+        
+        # 使用关键词生成器
+        keyword_generator = RAGKeywordGenerator()
+        node_ctx = NodeContext(
+            node_id="S6",
+            node_name="初步判断",
+            dept=dept,
+            dept_name=dept_name,
+            chief_complaint=state.chief_complaint,
+            patient_age=state.patient_profile.get("age") if state.patient_profile else None,
+            patient_gender=state.patient_profile.get("gender") if state.patient_profile else None,
+            specialty_summary=state.specialty_summary,
+        )
+        
+        # 1. 检索医学指南库（使用关键词生成器）
+        query = keyword_generator.generate_keywords(node_ctx, "MedicalGuide_db")
         logger.info(f"🔍 检索{dept_name}检查指南...")
-        chunks = retriever.retrieve(query, filters={"dept": dept}, k=4)
-        state.add_retrieved_chunks(chunks)
+        _log_detail(f"\n🔍 检索{dept_name}诊疗指南与检查指征[医学指南库]...", state, 2, "S6")
+        
+        # 【单一数据库检索】只查询医学指南库
+        chunks_guide = retriever.retrieve(query, filters={"db_name": "MedicalGuide_db"}, k=4)
+        state.add_retrieved_chunks(chunks_guide)
+        
+        # 使用详细的 RAG 日志记录
+        from graphs.log_helpers import _log_rag_retrieval
+        _log_rag_retrieval(query, chunks_guide, state, 
+                         filters={"db_name": "MedicalGuide_db"}, 
+                         node_name="S6", 
+                         purpose=f"{dept_name}诊疗指南与检查指征[医学指南库]")
+        
+        # 2. 检索临床案例库（使用关键词生成器）
+        case_query = keyword_generator.generate_keywords(node_ctx, "ClinicalCase_db")
+        _log_detail(f"\n🔍 检索相似临床案例[临床案例库]...", state, 2, "S6")
+        
+        # 【单一数据库检索】只查询临床案例库
+        chunks_cases = retriever.retrieve(
+            case_query,
+            filters={"db_name": "ClinicalCase_db"},
+            k=3
+        )
+        state.add_retrieved_chunks(chunks_cases)
+        
+        _log_rag_retrieval(case_query, chunks_cases, state, 
+                         filters={"db_name": "ClinicalCase_db"}, 
+                         node_name="S6", 
+                         purpose=f"相似临床案例[临床案例库]")
+        
+        # 合并所有检索结果
+        chunks = chunks_guide + chunks_cases
+        _log_detail(f"  ✅ 共检索到 {len(chunks)} 个知识片段", state, 2, "S6")
 
         cc = state.chief_complaint
         

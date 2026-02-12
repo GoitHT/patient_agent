@@ -28,15 +28,15 @@ rag:
   skip_rag: false                             # 跳过 RAG 系统初始化（用于测试）
   
   # SPLLM-RAG1 配置
-  spllm_root: ../SPLLM-RAG1                   # SPLLM-RAG1 项目路径（相对或绝对路径）
+  spllm_root: SPLLM-RAG1                      # SPLLM-RAG1 项目路径（相对于项目根目录）
   adaptive_cache_folder: null                 # 模型缓存目录（null=默认为 spllm_root/model_cache）
   adaptive_threshold: 0.3                     # 余弦距离阈值（0-1，越小匹配越严格）
-  adaptive_embed_model: shibing624/text2vec-base-chinese  # 嵌入模型
+  adaptive_embed_model: BAAI/bge-large-zh-v1.5  # 嵌入模型
 
 # 运行模式配置
 mode:
   multi_patient: true            # 多患者多医生模式（推荐，num_patients=1时等同于单体模式）
-  num_patients: 5               # 患者数量（1=单患者模式，>1=多患者并发模式）
+  num_patients: 1               # 患者数量（1=单患者模式，>1=多患者并发模式）
   patient_interval: 60            # 患者进入间隔时间（秒，单患者时可设为0）
 
 # 物理环境配置

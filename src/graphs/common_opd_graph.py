@@ -18,8 +18,10 @@ from typing import Any, Callable
 
 from langgraph.graph import END, StateGraph
 
-from graphs.log_helpers import _log_node_start, _log_node_end, _log_detail, _log_physical_state
+from graphs.log_helpers import _log_node_start, _log_node_end, _log_detail, _log_physical_state, _log_rag_retrieval
 from rag import AdaptiveRAGRetriever
+from rag.query_optimizer import QueryContext, get_query_optimizer
+from rag.keyword_generator import RAGKeywordGenerator, NodeContext
 from services.appointment import AppointmentService
 from services.billing import BillingService
 from services.llm_client import LLMClient
@@ -72,7 +74,7 @@ class CommonOPDGraph:
     def __init__(
         self,
         *,
-        retriever: ChromaRetriever,
+        retriever: Any,  # AdaptiveRAGRetriever或兼容的检索器
         dept_subgraphs: dict[str, Any],
         services: Services,
         llm: LLMClient | None = None,
@@ -97,6 +99,9 @@ class CommonOPDGraph:
         self.lab_agent = lab_agent
         self.max_questions = max_questions
         self.world = world
+        
+        # 初始化 RAG 关键词生成器
+        self.keyword_generator = RAGKeywordGenerator()
     
     def _map_test_to_equipment_type(self, test_name: str, test_type: str) -> str:
         """
@@ -562,8 +567,6 @@ class CommonOPDGraph:
                 if doctor_agent:
                     # 重置医生状态（清空上一个患者的问诊历史）
                     doctor_agent.reset()
-                    if detail_logger:
-                        detail_logger.info(f"🔄 DoctorAgent 已重置（清空问诊历史）")
                     
                     # 注入到 state 中供后续节点使用
                     state.doctor_agent = doctor_agent
@@ -646,17 +649,38 @@ class CommonOPDGraph:
             # 显示物理环境状态
             _log_physical_state(state, "C5", level=2)
             
-            _log_detail("🔍 检索医院通用SOP与免责声明...", state, 2, "C5")
-            chunks = self.retriever.retrieve(
-                f"门诊 问诊要点 分流 免责声明 {state.chief_complaint}",
-                filters={"dept": "hospital", "type": "sop"},
-                k=4,
+            # 获取查询优化器
+            query_optimizer = get_query_optimizer()
+            
+            # 构建查询上下文
+            query_ctx = QueryContext(
+                patient_id=state.patient_id,
+                age=state.patient_profile.get("age") if state.patient_profile else None,
+                gender=state.patient_profile.get("gender") if state.patient_profile else None,
+                chief_complaint=state.chief_complaint,
+                dept=state.dept,
             )
-            _log_detail(f"  ✅ 检索到 {len(chunks)} 个知识片段", state, 2, "C5")
+            
+            # 【增强RAG】检索规则流程库（使用关键词生成器）
+            # C5节点用途：获取通用就诊流程标准操作规程，在日志中展示
+            node_ctx = NodeContext(
+                node_id="C5",
+                node_name="准备问诊",
+                dept=state.dept,
+                dept_name=state.dept_name if hasattr(state, "dept_name") else None,
+                chief_complaint=state.chief_complaint,
+            )
+            query = self.keyword_generator.generate_keywords(node_ctx, "HospitalProcess_db")
+            # 【单一数据库检索】只查询规则流程库
+            chunks = self.retriever.retrieve(
+                query, 
+                filters={"db_name": "HospitalProcess_db"}, 
+                k=6
+            )
+            _log_rag_retrieval(query, chunks, state, filters={"db_name": "HospitalProcess_db"}, node_name="C5", purpose="通用就诊流程SOP[规则流程库]")
             state.add_retrieved_chunks(chunks)
 
             # 初始化问诊对话记录（实际问诊在C6专科子图中进行）
-            _log_detail("\n💬 注：详细问诊将在C6专科子图中进行", state, 2, "C5")
             state.agent_interactions["doctor_patient_qa"] = []
             
             # 推进时间（医生准备问诊约需2分钟）
@@ -667,9 +691,9 @@ class CommonOPDGraph:
             state.add_audit(
                 make_audit_entry(
                     node_name="C5 Prepare Intake",
-                    inputs_summary={"chief_complaint": state.chief_complaint[:40]},
-                    outputs_summary={"sop_chunks": len(chunks)},
-                    decision="检索医院通用SOP/免责声明，初始化问诊记录（实际问诊在C6专科子图执行）",
+                    inputs_summary={"chief_complaint": state.chief_complaint[:40], "dept": state.dept},
+                    outputs_summary={"guide_chunks": len(chunks)},
+                    decision="检索规则流程库（HospitalProcess_db）获取通用就诊流程标准操作规程，初始化问诊记录（实际问诊在C6专科子图执行）",
                     chunks=chunks,
                     flags=["AGENT_MODE"],
                 )
@@ -757,33 +781,84 @@ class CommonOPDGraph:
             # 显示物理环境状态
             _log_physical_state(state, "C8", level=2)
             
-            # 检索医院通用流程SOP
-            _log_detail("🔍 检索医院通用流程...", state, 1, "C8")
+            # 获取查询优化器
+            query_optimizer = get_query_optimizer()
+            
+            # 构建查询上下文
+            query_ctx = QueryContext(
+                patient_id=state.patient_id,
+                age=state.patient_profile.get("age") if state.patient_profile else None,
+                gender=state.patient_profile.get("gender") if state.patient_profile else None,
+                chief_complaint=state.chief_complaint,
+                dept=state.dept,
+                ordered_tests=state.ordered_tests,
+                specialty_summary=state.specialty_summary,
+            )
+            
+            # 【增强RAG】1. 检索医院通用流程SOP（使用关键词生成器）
+            # C8节点用途：获取对应检查/检验前准备事项，对患者进行检验前宣教
+            _log_detail("🔍 检索医院通用流程[规则流程库]...", state, 1, "C8")
+            node_ctx_c8 = NodeContext(
+                node_id="C8",
+                node_name="开单与准备说明",
+                dept=state.dept,
+                dept_name=state.dept_name if hasattr(state, "dept_name") else None,
+                chief_complaint=state.chief_complaint,
+                ordered_tests=state.ordered_tests,
+            )
+            query = self.keyword_generator.generate_keywords(node_ctx_c8, "HospitalProcess_db")
+            # 【单一数据库检索】只查询规则流程库
             hospital_chunks = self.retriever.retrieve(
-                "缴费 预约 报告领取 回诊 流程",
-                filters={"dept": "hospital", "type": "sop"},
+                query,
+                filters={"db_name": "HospitalProcess_db"},
                 k=4,
             )
             state.add_retrieved_chunks(hospital_chunks)
             _log_detail(f"  ✅ 检索到 {len(hospital_chunks)} 个通用流程SOP", state, 1, "C8")
+            
+            # 【增强RAG】2. 检索患者历史检查开单记录（避免重复开单）
+            # 使用：患者对话历史库(UserHistory_db) - 检索患者历史检查记录
+            test_history_chunks = []
+            if state.patient_id and state.ordered_tests:
+                _log_detail("\n🔍 检索患者历史检查记录（检查重复开单）[患者对话历史库]...", state, 1, "C8")
+                test_keywords = [t.get('name', '') for t in state.ordered_tests if t.get('name')]
+                test_history_chunks = self.retriever.retrieve_patient_test_history(
+                    patient_id=state.patient_id,
+                    test_keywords=test_keywords,
+                    k=5
+                )
+                if test_history_chunks:
+                    _log_detail(f"  ⚠️  发现 {len(test_history_chunks)} 条历史检查记录", state, 1, "C8")
+                    state.add_retrieved_chunks(test_history_chunks)
+                    for chunk in test_history_chunks[:2]:
+                        preview = chunk.get('text', '')[:60].replace('\n', ' ')
+                        _log_detail(f"     • {preview}...", state, 2, "C8")
+                else:
+                    _log_detail(f"  ✅ 无重复检查，可正常开单", state, 2, "C8")
 
             dept_chunks: list[dict[str, Any]] = []
             prep_items: list[dict[str, Any]] = []
             
             # 为每个检查项目检索准备知识
-            _log_detail(f"\n📋 检索 {len(state.ordered_tests)} 个检查项目的准备知识...", state, 1, "C8")
+            # 使用：规则流程库(HospitalProcess_db) - 检索检查项目准备知识
+            _log_detail(f"\n📋 检索 {len(state.ordered_tests)} 个检查项目的准备知识[规则流程库]...", state, 1, "C8")
             for t in state.ordered_tests:
                 test_name = t.get('name', '')
                 test_type = t.get('type', 'unknown')
                 
                 _log_detail(f"  🔍 {test_name} ({test_type})", state, 1, "C8")
                 
-                # 检索专科检查准备知识
-                q = f"{state.dept} {test_name} 准备 禁忌 注意事项 禁食"
-                cs = self.retriever.retrieve(q, filters={"dept": state.dept}, k=4)
+                # 更新查询上下文（添加当前测试信息）
+                query_ctx.ordered_tests = [t]
+                
+                # 检索检查准备知识（使用关键词生成器，动态更新检查项）
+                node_ctx_c8.ordered_tests = [t]
+                query = self.keyword_generator.generate_keywords(node_ctx_c8, "HospitalProcess_db")
+                # 【单一数据库检索】只查询规则流程库
+                cs = self.retriever.retrieve(query, filters={"db_name": "HospitalProcess_db"}, k=4)
                 dept_chunks.extend(cs)
                 state.add_retrieved_chunks(cs)
-                _log_detail(f"     ✅ 检索到 {len(cs)} 个准备知识片段", state, 1, "C8")
+                _log_rag_retrieval(query, cs, state, filters={"db_name": "HospitalProcess_db"}, node_name="C8", purpose=f"{test_name}准备知识[规则流程库]")
 
                 # 生成准备说明（不包含预约调度信息）
                 prep_item = {
@@ -1377,6 +1452,80 @@ class CommonOPDGraph:
             state.appointment["return_visit"] = {"status": "returned", "reports_ready": True}
             logger.info("✅ 患者携报告返回诊室")
             
+            # 【增强RAG】C11: 检索高质量对话库 + 临床案例库
+            # C11节点用途：如果医生需要进行对话获取信息参考高质量对话库，医生参考案例库对患者检查结果进行分析
+            # 目的：结合真实世界证据，准确解读报告，精准把握患者症状
+            if state.test_results:
+                _log_detail("\n🔍 RAG检索：高质量对话库 + 临床案例库...", state, 1, "C11")
+                
+                # 1. 检索高质量对话库（获取问诊参考）
+                # 构建查询：主诉 + 检查项目 + 关键异常指标
+                test_keywords = []
+                abnormal_keywords = []
+                for result in state.test_results[:5]:  # 最多前5项检查
+                    test_name = result.get('test_name', '')
+                    if test_name:
+                        test_keywords.append(test_name)
+                    # 提取异常关键词
+                    if result.get('abnormal'):
+                        summary = result.get('summary', '')
+                        abnormal_keywords.append(summary[:30])  # 取前30字符
+                
+                # 获取查询优化器
+                query_optimizer = get_query_optimizer()
+                
+                # 构建查询上下文
+                query_ctx = QueryContext(
+                    patient_id=state.patient_id,
+                    age=state.patient_profile.get("age") if state.patient_profile else None,
+                    gender=state.patient_profile.get("gender") if state.patient_profile else None,
+                    chief_complaint=state.chief_complaint,
+                    dept=state.dept,
+                    test_results=state.test_results,
+                    abnormal_results=[r for r in state.test_results if r.get("abnormal")],
+                    specialty_summary=state.specialty_summary,
+                )
+                
+                # 【增强RAG】1. 检索高质量对话库（使用关键词生成器）
+                # 使用：高质量对话库(HighQualityQA_db) - 检索问诊对话参考
+                node_ctx_c11 = NodeContext(
+                    node_id="C11",
+                    node_name="报告回诊",
+                    dept=state.dept,
+                    dept_name=state.dept_name if hasattr(state, "dept_name") else None,
+                    chief_complaint=state.chief_complaint,
+                    test_results=state.test_results,
+                )
+                query_qa = self.keyword_generator.generate_keywords(node_ctx_c11, "HighQualityQA_db")
+                
+                # 【单一数据库检索】只查询高质量问诊库
+                qa_chunks = self.retriever.retrieve(
+                    query_qa,
+                    filters={"db_name": "HighQualityQA_db"},
+                    k=4
+                )
+                _log_rag_retrieval(query_qa, qa_chunks, state, 
+                                 filters={"db_name": "HighQualityQA_db"}, 
+                                 node_name="C11", purpose="高质量对话参考[高质量对话库]")
+                state.add_retrieved_chunks(qa_chunks)
+                
+                # 2. 检索相似临床案例（使用关键词生成器）
+                # 使用：临床案例库(ClinicalCase_db) - 检索相似患者案例
+                query_cases = self.keyword_generator.generate_keywords(node_ctx_c11, "ClinicalCase_db")
+                
+                # 【单一数据库检索】只查询临床案例库
+                case_chunks = self.retriever.retrieve(
+                    query_cases,
+                    filters={"db_name": "ClinicalCase_db"},
+                    k=5
+                )
+                _log_rag_retrieval(query_cases, case_chunks, state, 
+                                 filters={"db_name": "ClinicalCase_db"}, 
+                                 node_name="C11", purpose="相似临床案例[临床案例库]")
+                state.add_retrieved_chunks(case_chunks)
+                
+                _log_detail(f"  ✅ 共检索到 {len(qa_chunks) + len(case_chunks)} 个相关知识片段", state, 1, "C11")
+            
             # 初始化变量（防止作用域错误）
             need_followup = False
             followup_reason = []
@@ -1591,24 +1740,48 @@ class CommonOPDGraph:
             else:
                 _log_detail(f"  • 检查结果: 无", state, 1, "C12")
             
-            _log_detail("\n🔍 检索诊断相关知识...", state, 1, "C12")
-            chunks_forms = self.retriever.retrieve(
-                "门诊病历 诊断证明 病假条 宣教单 模板",
-                filters={"dept": "forms"},
-                k=4,
+            # 【增强RAG】C12: 检索医学指南库 + 临床案例库
+            # C12节点用途：综合患者信息和医学指南和相关案例得出诊断结果
+            # 目的：综合理论与实践，辅助医生做出准确、可解释的最终诊断
+            _log_detail("\n🔍 检索医学指南库 + 临床案例库...", state, 1, "C12")
+            
+            # 1. 检索医学指南库（使用关键词生成器）
+            # 使用：医学指南库(MedicalGuide_db) - 检索诊断指南和专科方案
+            node_ctx_c12 = NodeContext(
+                node_id="C12",
+                node_name="综合分析与诊断",
+                dept=state.dept,
+                dept_name=state.dept_name if hasattr(state, "dept_name") else None,
+                chief_complaint=state.chief_complaint,
+                test_results=state.test_results,
             )
-            chunks_hospital = self.retriever.retrieve(
-                "诊后处置 随访 SOP",
-                filters={"dept": "hospital", "type": "sop"},
-                k=4,
+            guide_query = self.keyword_generator.generate_keywords(node_ctx_c12, "MedicalGuide_db")
+            
+            # 【单一数据库检索】只查询医学指南库
+            chunks_guide = self.retriever.retrieve(
+                guide_query,
+                filters={"db_name": "MedicalGuide_db"},
+                k=6,
             )
-            chunks_dept_plan = self.retriever.retrieve(
-                f"{state.dept} plan 随访 模板",
-                filters={"dept": state.dept, "type": "plan"},
-                k=4,
+            _log_rag_retrieval(guide_query, chunks_guide, state,
+                             filters={"db_name": "MedicalGuide_db"},
+                             node_name="C12", purpose="诊断指南[医学指南库]")
+            
+            # 2. 检索相似临床案例（使用关键词生成器）
+            # 使用：临床案例库(ClinicalCase_db) - 检索相似临床案例
+            case_query = self.keyword_generator.generate_keywords(node_ctx_c12, "ClinicalCase_db")
+            
+            # 【单一数据库检索】只查询临床案例库
+            chunks_cases = self.retriever.retrieve(
+                case_query,
+                filters={"db_name": "ClinicalCase_db"},
+                k=5,
             )
-            all_chunks = chunks_forms + chunks_hospital + chunks_dept_plan
-            _log_detail(f"  ✅ 检索到 {len(all_chunks)} 个知识片段", state, 1, "C12")
+            
+            _log_rag_retrieval(case_query, chunks_cases, state, filters={"db_name": "ClinicalCase_db"}, node_name="C12", purpose="相似临床案例[临床案例库]")
+            
+            all_chunks = chunks_guide + chunks_cases
+            _log_detail(f"  ✅ 共检索到 {len(all_chunks)} 个知识片段", state, 1, "C12")
             state.add_retrieved_chunks(all_chunks)
 
             # 定义fallback函数（统一管理默认值）
@@ -2097,6 +2270,72 @@ class CommonOPDGraph:
             # 显示物理环境状态
             _log_physical_state(state, "C14", level=2)
             
+            # 获取查询优化器
+            query_optimizer = get_query_optimizer()
+            
+            # 构建查询上下文
+            query_ctx = QueryContext(
+                patient_id=state.patient_id,
+                age=state.patient_profile.get("age") if state.patient_profile else None,
+                gender=state.patient_profile.get("gender") if state.patient_profile else None,
+                chief_complaint=state.chief_complaint,
+                dept=state.dept,
+                preliminary_diagnosis=state.diagnosis.get("name") if state.diagnosis else None,
+            )
+            
+            # 【增强RAG】1. 检索文书模板（使用关键词生成器）
+            # C14节点用途：检索规则流程库获取门诊病历/诊断证明/病假条/宣教单模板，综合患者信息和医学指南和相关案例得出
+            # 使用：规则流程库(HospitalProcess_db) - 检索病历/证明/病假条模板
+            _log_detail("\n🔍 检索文书模板[规则流程库]...", state, 1, "C14")
+            node_ctx_c14 = NodeContext(
+                node_id="C14",
+                node_name="生成文书",
+                dept=state.dept,
+                dept_name=state.dept_name if hasattr(state, "dept_name") else None,
+                chief_complaint=state.chief_complaint,
+                preliminary_diagnosis=state.diagnosis.get("name") if state.diagnosis else None,
+            )
+            query = self.keyword_generator.generate_keywords(node_ctx_c14, "HospitalProcess_db")
+            # 【单一数据库检索】只查询规则流程库
+            template_chunks = self.retriever.retrieve(
+                query,
+                filters={"db_name": "HospitalProcess_db"},
+                k=6,
+            )
+            _log_rag_retrieval(query, template_chunks, state,
+                             filters={"db_name": "HospitalProcess_db"},
+                             node_name="C14", purpose="文书模板[规则流程库]")
+            state.add_retrieved_chunks(template_chunks)
+            
+            # 【增强RAG】2. 检索患者历史病历（使用关键词生成器）
+            patient_history_context = ""
+            if state.patient_id:
+                _log_detail("\n🔍 检索患者历史病历信息...", state, 1, "C14")
+                query = self.keyword_generator.generate_keywords(node_ctx_c14, "UserHistory_db")
+                # 【单一数据库检索】只查询患者历史库
+                history_chunks = self.retriever.retrieve(
+                    query,
+                    filters={"db_name": "UserHistory_db", "patient_id": state.patient_id},
+                    k=3,
+                )
+                # 无论是否有结果，都记录检索日志
+                _log_rag_retrieval(query, history_chunks, state,
+                                 filters={"db_name": "UserHistory_db", "patient_id": state.patient_id},
+                                 node_name="C14", purpose="历史病历[患者对话历史库]")
+                if history_chunks:
+                    _log_detail(f"  ✅ 找到 {len(history_chunks)} 条历史病历记录", state, 1, "C14")
+                    state.add_retrieved_chunks(history_chunks)
+                    # 构建历史上下文
+                    history_texts = []
+                    for chunk in history_chunks:
+                        text = chunk.get('text', '')
+                        if text:
+                            history_texts.append(text[:200])  # 截取前200字符
+                    patient_history_context = "\n\n【患者历史病历摘要】\n" + "\n".join(history_texts)
+                    _log_detail(f"     • 已整合历史病历信息用于生成文书", state, 2, "C14")
+                else:
+                    _log_detail(f"  ℹ️  首次就诊，无历史病历", state, 2, "C14")
+            
             # 显示输入信息
             _log_detail("\n📋 输入信息:", state, 1, "C14")
             _log_detail(f"  • 诊断: {state.diagnosis.get('name', '未明确')}", state, 1, "C14")
@@ -2154,6 +2393,7 @@ class CommonOPDGraph:
                     f"请生成一份专业的{doc_type}。\n\n"
                     + "【患者信息】\n"
                     + json.dumps(context, ensure_ascii=False, indent=2)
+                    + patient_history_context  # 添加患者历史上下文
                     + "\n\n【文书要求】\n"
                 )
                 
@@ -2283,21 +2523,34 @@ class CommonOPDGraph:
             _log_detail(f"  • 科室: {state.dept}", state, 1, "C15")
             _log_detail(f"  • 治疗方案: 已制定", state, 1, "C15")
             
-            _log_detail("\n🔍 检索宣教知识...", state, 1, "C15")
-            chunks_common = self.retriever.retrieve(
-                "门诊 宣教 随访 红旗 应急处理",
-                filters={"dept": "hospital", "type": "education"},
-                k=4,
+            # 【增强RAG】C15: 检索规则流程库（使用关键词生成器）
+            # C15节点用途：检索规则流程库获取疾病科普材料、生活方式指导、健康宣教和随访计划模板，并综合患者信息得出最后内容
+            # 使用：规则流程库(HospitalProcess_db) - 为患者提供个性化健康教育和长期管理建议
+            _log_detail("\n🔍 检索宣教知识[规则流程库]...", state, 1, "C15")
+            
+            node_ctx_c15 = NodeContext(
+                node_id="C15",
+                node_name="宣教与随访",
+                dept=state.dept,
+                dept_name=state.dept_name if hasattr(state, "dept_name") else None,
+                chief_complaint=state.chief_complaint,
+                preliminary_diagnosis=state.diagnosis.get("name") if state.diagnosis else None,
             )
-            chunks_dept = self.retriever.retrieve(
-                f"{state.dept} 宣教 随访 注意事项",
-                filters={"dept": state.dept, "type": "education"},
-                k=4,
+            
+            # 使用关键词生成器生成检索关键词
+            query = self.keyword_generator.generate_keywords(node_ctx_c15, "HospitalProcess_db")
+            # 【单一数据库检索】只查询规则流程库
+            all_chunks = self.retriever.retrieve(
+                query,
+                filters={"db_name": "HospitalProcess_db"},
+                k=8,
             )
-            all_chunks = chunks_common + chunks_dept
-            _log_detail(f"  ✅ 检索到 {len(all_chunks)} 个宣教片段", state, 1, "C15")
-            _log_detail(f"    - 通用宣教: {len(chunks_common)}个", state, 1, "C15")
-            _log_detail(f"    - 专科宣教: {len(chunks_dept)}个", state, 1, "C15")
+            
+            # 使用详细的 RAG 日志记录
+            _log_rag_retrieval(query, all_chunks, state, 
+                             filters={"db_name": "HospitalProcess_db"}, 
+                             node_name="C15", purpose="宣教与随访[规则流程库]")
+            
             state.add_retrieved_chunks(all_chunks)
 
             # 神经内科默认宣教内容

@@ -35,10 +35,10 @@ class RAGConfig:
     """RAG配置（Adaptive RAG 系统）"""
     skip_rag: bool = False
     # Adaptive RAG 配置
-    spllm_root: Path = field(default_factory=lambda: Path("../SPLLM-RAG1"))  # SPLLM-RAG1 项目路径
+    spllm_root: Path = field(default_factory=lambda: Path("SPLLM-RAG1"))  # SPLLM-RAG1 项目路径
     adaptive_cache_folder: Optional[Path] = None  # 模型缓存目录（默认为 spllm_root/model_cache）
     adaptive_threshold: float = 0.3  # 余弦距离阈值（0-1，越小越严格）
-    adaptive_embed_model: str = "shibing624/text2vec-base-chinese"  # 嵌入模型名称
+    adaptive_embed_model: str = "BAAI/bge-large-zh-v1.5"  # 嵌入模型名称
 
 
 @dataclass
@@ -142,6 +142,15 @@ class Config:
                     self.rag.collection_name = rag_data["collection_name"]
                 if "skip_rag" in rag_data:
                     self.rag.skip_rag = rag_data["skip_rag"]
+                # Adaptive RAG 配置
+                if "spllm_root" in rag_data:
+                    self.rag.spllm_root = Path(rag_data["spllm_root"])
+                if "adaptive_cache_folder" in rag_data:
+                    self.rag.adaptive_cache_folder = Path(rag_data["adaptive_cache_folder"]) if rag_data["adaptive_cache_folder"] else None
+                if "adaptive_threshold" in rag_data:
+                    self.rag.adaptive_threshold = float(rag_data["adaptive_threshold"])
+                if "adaptive_embed_model" in rag_data:
+                    self.rag.adaptive_embed_model = rag_data["adaptive_embed_model"]
             
             # Mode配置
             if "mode" in data:

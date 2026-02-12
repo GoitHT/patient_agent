@@ -38,7 +38,7 @@ class AdaptiveRAGRetriever:
         spllm_root: Path | str,
         cache_folder: Path | str | None = None,
         cosine_threshold: float = 0.3,
-        embed_model: str = "shibing624/text2vec-base-chinese",
+        embed_model: str = "BAAI/bge-large-zh-v1.5",
     ):
         """
         Args:
@@ -69,6 +69,15 @@ class AdaptiveRAGRetriever:
             return
         
         try:
+            # 临时屏蔽嵌入模型的加载日志
+            import logging as std_logging
+            sentence_transformers_logger = std_logging.getLogger('sentence_transformers')
+            transformers_logger = std_logging.getLogger('transformers')
+            old_st_level = sentence_transformers_logger.level
+            old_tf_level = transformers_logger.level
+            sentence_transformers_logger.setLevel(std_logging.WARNING)
+            transformers_logger.setLevel(std_logging.WARNING)
+            
             from langchain_huggingface import HuggingFaceEmbeddings
             
             self._embeddings = HuggingFaceEmbeddings(
@@ -81,10 +90,20 @@ class AdaptiveRAGRetriever:
                 cache_folder=str(self.cache_folder)
             )
             
+            # 恢复日志级别
+            sentence_transformers_logger.setLevel(old_st_level)
+            transformers_logger.setLevel(old_tf_level)
+            
             # 测试嵌入
             test_vec = self._embeddings.embed_query("测试")
             self._logger.info(f"✅ 嵌入模型加载成功（维度={len(test_vec)}）")
         except Exception as e:
+            # 恢复日志级别（即使出错）
+            try:
+                sentence_transformers_logger.setLevel(old_st_level)
+                transformers_logger.setLevel(old_tf_level)
+            except:
+                pass
             self._logger.error(f"❌ 嵌入模型初始化失败: {e}")
             raise RuntimeError(f"无法初始化嵌入模型: {e}")
     
@@ -126,33 +145,79 @@ class AdaptiveRAGRetriever:
         
         Args:
             query: 查询文本
-            filters: 过滤条件（可选，包含 dept/type/patient_id）
+            filters: 过滤条件（可选，包含 dept/type/patient_id/scenario/db_name）
             k: 返回结果数量
             
         Returns:
             统一格式的检索结果: [{doc_id, chunk_id, score, text, meta}, ...]
         """
-        patient_id = filters.get("patient_id") if filters else None
-        dept = filters.get("dept") if filters else None
+        filters = filters or {}
+        patient_id = filters.get("patient_id")
+        dept = filters.get("dept")
+        scenario = filters.get("scenario")
+        db_name = filters.get("db_name")  # 如果指定了db_name，只查询该数据库
         
         results = []
         
-        # 1. 患者历史记忆（如果有 patient_id）
-        if patient_id:
-            history_results = self._retrieve_history(query, patient_id, k=2)
-            results.extend(history_results)
+        # 【优先策略】如果指定了 db_name，强制只查询该单一数据库
+        if db_name:
+            db_method_map = {
+                "HospitalProcess_db": self._retrieve_hospital_process,
+                "MedicalGuide_db": self._retrieve_guide,
+                "ClinicalCase_db": self._retrieve_case,
+                "HighQualityQA_db": self._retrieve_high_quality_qa,
+                "UserHistory_db": lambda q, k: self._retrieve_history(q, patient_id, k) if patient_id else [],
+            }
+            method = db_method_map.get(db_name)
+            if method:
+                results = method(query, k=k)
+            else:
+                self._logger.warning(f"⚠️  未知的数据库名称: {db_name}")
+            return results[:k]  # 强制返回，不走后续逻辑
         
-        # 2. 高质量问答库（核心）
-        qa_results = self._retrieve_high_quality_qa(query, k=k)
-        results.extend(qa_results)
+        # 根据场景选择检索策略
+        if scenario == "patient_history":
+            # 专注于患者历史（C5/C8/C14）
+            if patient_id:
+                history_results = self._retrieve_history(query, patient_id, k=k)
+                results.extend(history_results)
+            guide_results = self._retrieve_guide(query, k=k//2)
+            results.extend(guide_results)
         
-        # 3. 医学指南库（补充专业知识）
-        guide_results = self._retrieve_guide(query, k=k)
-        results.extend(guide_results)
+        elif scenario == "clinical_case":
+            # 专注于临床案例（C11/C12）- 只查询临床案例库
+            case_results = self._retrieve_case(query, k=k)
+            results.extend(case_results)
         
-        # 4. 临床案例库（可选，按需启用）
-        # case_results = self._retrieve_case(query, k=k)
-        # results.extend(case_results)
+        elif scenario == "quality_qa":
+            # 专注于高质量问答（S4）- 只查询高质量问答库
+            qa_results = self._retrieve_high_quality_qa(query, k=k)
+            results.extend(qa_results)
+        
+        elif scenario == "hospital_process":
+            # 专注于规则流程库（C5/C8/C14/C15）- 只查询流程规则库
+            process_results = self._retrieve_hospital_process(query, k=k)
+            results.extend(process_results)
+        
+        else:
+            # 默认策略：均衡检索所有库
+            # 1. 患者历史记忆（如果有 patient_id）
+            if patient_id:
+                history_results = self._retrieve_history(query, patient_id, k=2)
+                results.extend(history_results)
+            
+            # 2. 高质量问答库（核心）
+            qa_results = self._retrieve_high_quality_qa(query, k=k)
+            results.extend(qa_results)
+            
+            # 3. 医学指南库（补充专业知识）
+            guide_results = self._retrieve_guide(query, k=k)
+            results.extend(guide_results)
+            
+            # 4. 临床案例库（已启用）
+            case_results = self._retrieve_case(query, k=k//2)
+            results.extend(case_results)
+            results.extend(case_results)
         
         # 去重并按分数排序
         unique_results = self._deduplicate_and_sort(results)
@@ -200,6 +265,64 @@ class AdaptiveRAGRetriever:
             return results
         except Exception as e:
             self._logger.warning(f"⚠️  历史记忆检索失败: {e}")
+            return []
+    
+    def retrieve_patient_test_history(
+        self,
+        patient_id: str,
+        test_keywords: list[str],
+        k: int = 5
+    ) -> list[dict[str, Any]]:
+        """检索患者历史检查记录（用于避免重复开单）
+        
+        Args:
+            patient_id: 患者ID
+            test_keywords: 检查关键词列表（如 ["CT", "MRI", "血常规"]）
+            k: 返回结果数量
+            
+        Returns:
+            患者历史检查记录列表
+        """
+        if not patient_id or not test_keywords:
+            return []
+        
+        # 构建查询语句
+        query = f"检查 检验 开单 {' '.join(test_keywords)}"
+        
+        db = self._get_db("UserHistory_db")
+        if not db:
+            return []
+        
+        try:
+            docs_and_distances = db.similarity_search_with_score(
+                query,
+                k=k,
+                filter={"patient_id": patient_id}
+            )
+            
+            results = []
+            for doc, distance in docs_and_distances:
+                # 历史检查记录阈值放宽
+                if distance < self.cosine_threshold * 1.5:
+                    similarity = max(0, 1 - distance)
+                    results.append({
+                        "doc_id": f"test_history_{patient_id}",
+                        "chunk_id": doc.metadata.get("chunk_id", "0"),
+                        "score": float(similarity),
+                        "text": doc.page_content,
+                        "meta": {
+                            "source": "UserHistory",
+                            "patient_id": patient_id,
+                            "keywords": test_keywords,
+                            **doc.metadata
+                        }
+                    })
+            
+            if results:
+                self._logger.info(f"🔍 历史检查记录: 找到 {len(results)} 条相关记录")
+            return results
+        except Exception as e:
+            self._logger.warning(f"⚠️  历史检查记录检索失败: {e}")
             return []
     
     def _retrieve_high_quality_qa(self, query: str, k: int = 3) -> list[dict[str, Any]]:
@@ -301,6 +424,45 @@ class AdaptiveRAGRetriever:
             return results
         except Exception as e:
             self._logger.warning(f"⚠️  临床案例检索失败: {e}")
+            return []
+    
+    def _retrieve_hospital_process(self, query: str, k: int = 3) -> list[dict[str, Any]]:
+        """检索医院规则流程（SOP、文书模板、宣教材料等）
+        
+        用于：
+        - C5: 通用就诊流程SOP
+        - C8: 检查/检验前准备事项
+        - C14: 门诊病历/诊断证明/病假条模板
+        - C15: 疾病科普材料、健康宣教和随访计划模板
+        """
+        db = self._get_db("HospitalProcess_db")
+        if not db:
+            return []
+        
+        try:
+            docs_and_distances = db.similarity_search_with_score(query, k=k)
+            
+            results = []
+            for doc, distance in docs_and_distances:
+                # 规则流程库要求精准匹配
+                if distance < self.cosine_threshold:
+                    similarity = max(0, 1 - distance)
+                    results.append({
+                        "doc_id": "hospital_process",
+                        "chunk_id": doc.metadata.get("chunk_id", "0"),
+                        "score": float(similarity),
+                        "text": doc.page_content,
+                        "meta": {
+                            "source": "HospitalProcess",
+                            **doc.metadata
+                        }
+                    })
+            
+            if results:
+                self._logger.debug(f"📋 规则流程: 找到 {len(results)} 条")
+            return results
+        except Exception as e:
+            self._logger.warning(f"⚠️  规则流程检索失败: {e}")
             return []
     
     def _deduplicate_and_sort(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:

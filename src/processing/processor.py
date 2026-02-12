@@ -344,13 +344,33 @@ class LangGraphPatientExecutor:
                 original_chief_complaint = case_info[:200].strip()
             
             # 详细日志中记录完整病例信息
-            self.detail_logger.info(f"原始主诉: {original_chief_complaint}")
+            # 处理原始主诉的显示
+            formatted_complaint = original_chief_complaint.replace('\\n', '\n    ')  # 将转义的换行符转为实际换行并缩进
+            if len(formatted_complaint) > 300:
+                formatted_complaint = formatted_complaint[:300] + "..."
+            self.detail_logger.info(f"📋 原始主诉:\n    {formatted_complaint}")
+            
+            # 参考诊断
             if ground_truth.get('diagnosis'):
-                self.detail_logger.info(f"参考诊断: {ground_truth['diagnosis']}")
+                self.detail_logger.info(f"\n🎯 参考诊断: {ground_truth['diagnosis']}")
+            
+            # 参考治疗方案 - 改进格式化
             if ground_truth.get('treatment_plan'):
-                self.detail_logger.info(f"参考治疗方案: {ground_truth['treatment_plan'][:200]}...")
+                treatment_plan = ground_truth['treatment_plan']
+                # 处理转义的换行符
+                treatment_plan = treatment_plan.replace('\\n', '\n    ')
+                # 智能截断
+                if len(treatment_plan) > 250:
+                    # 尝试在句号处截断
+                    truncate_pos = treatment_plan.rfind('。', 0, 250)
+                    if truncate_pos == -1:
+                        truncate_pos = 250
+                    treatment_plan = treatment_plan[:truncate_pos+1] + "..."
+                self.detail_logger.info(f"\n💡 参考治疗方案:\n    {treatment_plan}")
+            
+            # 建议检查
             if ground_truth.get('recommended_tests'):
-                self.detail_logger.info(f"建议检查: {', '.join(ground_truth['recommended_tests'])}")
+                self.detail_logger.info(f"\n🔬 建议检查: {', '.join(ground_truth['recommended_tests'])}")
             self.detail_logger.info("")
             
             # 2. 使用共享物理环境
@@ -379,9 +399,6 @@ class LangGraphPatientExecutor:
                     "use_agents": True,
                 },
             )
-            
-            # 详细日志记录预约信息
-            self.detail_logger.info(f"预约渠道: {appointment_info['channel']}, 就诊时段: {appointment_info['timeslot']}")
             
             # 集成物理环境和病例库
             state.world_context = world
@@ -413,22 +430,20 @@ class LangGraphPatientExecutor:
                 "gender": extracted_info["gender"],
             })
             
-            # 详细日志中记录提取结果
-            self.detail_logger.info(f"智能提取患者信息: {extracted_info['name']}, {extracted_info['age']}岁, {extracted_info['gender']}")
-            
             # 获取已创建的病例（在 coordinator.register_patient 时已创建）
             existing_record = self.medical_record_service.get_record(self.patient_id)
             if existing_record:
                 record_id = existing_record.record_id
-                self.detail_logger.info(f"使用已创建的病例: {record_id}")
+                self.detail_logger.info(f"✅ 使用已创建的病例: {record_id}")
             else:
                 # 容错：如果病例不存在（不应发生），则创建
                 record_id = medical_record_integration.on_patient_entry(self.patient_id, patient_profile)
-                self.detail_logger.warning(f"⚠️ 病例不存在，已创建新病例: {record_id}")
+                self.detail_logger.warning(f"⚠️  病例不存在，已创建新病例: {record_id}")
             
-            # 详细日志记录病例信息
-            self.detail_logger.info(f"病例已创建: {record_id}")
-            self.detail_logger.info(f"患者信息: {patient_profile['name']}, {patient_profile['age']}岁, {patient_profile['gender']}")
+            # 详细日志记录病例和患者信息（合并为一行，减少重复）
+            self.detail_logger.info(f"\n👤 患者信息: {extracted_info['name']}, {extracted_info['age']}岁, {extracted_info['gender']} | 病例ID: {record_id}")
+            self.detail_logger.info(f"📅 预约信息: {appointment_info['channel']}预约 | 就诊时段: {appointment_info['timeslot']}")
+            self.detail_logger.info("")  # 空行分隔
             
             # 4. 准备 Agents
             # 重置护士状态（避免患者之间状态污染）
@@ -618,7 +633,6 @@ class LangGraphPatientExecutor:
                         # 跟踪最近有诊断的状态
                         if isinstance(out.diagnosis, dict) and out.diagnosis.get("name"):
                             last_diagnosis_state = out
-                            self.detail_logger.info(f"✅ [{node_name}] 更新last_diagnosis_state: {out.diagnosis.get('name')}")
                     elif isinstance(out, dict):
                         # 【修复】LangGraph可能返回字典而非Pydantic对象
                         # 尝试将字典转换为BaseState
@@ -628,7 +642,6 @@ class LangGraphPatientExecutor:
                             # 跟踪最近有诊断的状态
                             if isinstance(final_state.diagnosis, dict) and final_state.diagnosis.get("name"):
                                 last_diagnosis_state = final_state
-                                self.detail_logger.info(f"✅ [{node_name}] 更新last_diagnosis_state: {final_state.diagnosis.get('name')}")
                         except Exception as e:
                             if node_name in ["C12", "C13", "C14", "C15", "C16"]:
                                 self.detail_logger.warning(f"⚠️  [{node_name}] 从字典转换为BaseState失败: {e}")
