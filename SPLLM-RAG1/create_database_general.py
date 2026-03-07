@@ -17,6 +17,14 @@ from typing import List, Dict, Any
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(CURRENT_DIR)
 sys.path.insert(0, ROOT_DIR)  # 添加项目根目录到路径
+
+# 导入患者历史CSV存储模块
+try:
+    from src.rag.patient_history_csv import get_patient_history_csv
+    PATIENT_CSV_AVAILABLE = True
+except ImportError:
+    PATIENT_CSV_AVAILABLE = False
+    print("⚠️  PatientHistoryCSV 模块未找到，患者对话将无法存储")
 CACHE_FOLDER = os.path.join(CURRENT_DIR, "model_cache")
 MODEL_NAME = "BAAI/bge-large-zh-v1.5"
 
@@ -102,39 +110,65 @@ EMBEDDINGS = get_normalized_embeddings()
 # =============================================================================
 
 def load_documents_from_json_rebuild(file_path: Path) -> List[Dict[str, Any]]:
-    """从 JSON 文件加载文档（rebuild 模式专用）"""
+    """从 JSON 文件加载文档（rebuild 模式专用）
+    
+    支持以下 JSON 格式：
+    1. 列表格式        : [{"case_character": ..., "treatment_plan": ...}, ...]
+    2. 包装器字典格式  : {"Sheet1": [...], "Sheet2": [...]} → 展开所有列表值
+    3. 单一字典格式    : {"text": ..., "meta": ...} → 包装成单元素列表
+    """
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        logger.info(f"📄 从 {file_path.name} 加载了 {len(data) if isinstance(data, list) else 1} 个文档")
-        return data if isinstance(data, list) else [data]
+        
+        if isinstance(data, list):
+            # 标准列表格式
+            logger.info(f"📄 从 {file_path.name} 加载了 {len(data)} 条记录")
+            return data
+        elif isinstance(data, dict):
+            # 检查是否为包装器字典（如 {"Sheet1": [...], ...}）
+            merged = []
+            for key, value in data.items():
+                if isinstance(value, list):
+                    merged.extend(value)
+                    logger.info(f"   → Sheet/分组 '{key}': {len(value)} 条记录")
+            if merged:
+                logger.info(f"📄 从 {file_path.name} 展开加载了 {len(merged)} 条记录")
+                return merged
+            else:
+                # 单一字典
+                logger.info(f"📄 从 {file_path.name} 加载了 1 个文档")
+                return [data]
+        else:
+            logger.warning(f"⚠️  未知 JSON 格式 ({type(data)}): {file_path.name}")
+            return []
     except Exception as e:
         logger.error(f"❌ 加载文件失败 {file_path}: {e}")
         return []
 
 
 def load_documents_from_txt_rebuild(file_path: Path) -> List[Dict[str, Any]]:
-    """从 TXT 文件加载文档（rebuild 模式专用）"""
+    """从 TXT/MD 文件加载文档（rebuild 模式专用）
+    
+    整文件作为一个文档加载，由 DynamicChunker 负责按层次/语义完整分块，
+    避免预先按 \\n\\n 切割造成上下文碎片化。
+    """
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # 简单分割（按双换行符）
-        sections = content.split('\n\n')
-        docs = []
+        if not content.strip():
+            logger.warning(f"⚠️  文件为空: {file_path.name}")
+            return []
         
-        for i, section in enumerate(sections):
-            if section.strip():
-                docs.append({
-                    "text": section.strip(),
-                    "meta": {
-                        "source": file_path.name,
-                        "section_id": i
-                    }
-                })
-        
-        logger.info(f"📄 从 {file_path.name} 加载了 {len(docs)} 个文档段")
-        return docs
+        logger.info(f"📄 从 {file_path.name} 加载了 1 个完整文档 ({len(content)} 字符)")
+        return [{
+            "text": content,
+            "meta": {
+                "source": file_path.name,
+                "section_id": 0
+            }
+        }]
     except Exception as e:
         logger.error(f"❌ 加载文件失败 {file_path}: {e}")
         return []
@@ -276,7 +310,18 @@ def update_vector_db(db_name, data_folder, use_dynamic_chunker=True):
     # 向量库路径：根目录/chroma/{db_name}
     db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma", db_name)
     data_dir = os.path.join("data", data_folder)
-    print(f"\n>>> 🚀 开始同步数据库: {db_name}")
+    
+    # 映射数据库名称到collection名称（与rebuild模式保持一致）
+    db_to_collection = {
+        "MedicalGuide_db": "MedicalGuide",
+        "HospitalProcess_db": "HospitalProcess",
+        "ClinicalCase_db": "ClinicalCase",
+        "HighQualityQA_db": "HighQualityQA",
+        "UserHistory_db": "UserHistory"
+    }
+    collection_name = db_to_collection.get(db_name, db_name.replace("_db", ""))
+    
+    print(f"\n>>> 🚀 开始同步数据库: {db_name} (collection={collection_name})")
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
         return
@@ -299,22 +344,23 @@ def update_vector_db(db_name, data_folder, use_dynamic_chunker=True):
                 strategy=ChunkStrategy.HIERARCHICAL,
                 chunk_size=800,
                 chunk_overlap=100,
-                min_chunk_size=100,
+                min_chunk_size=200,
                 max_chunk_size=2000
             )
         elif "Case" in db_name:
             chunk_config = ChunkConfig(
                 strategy=ChunkStrategy.SEMANTIC,
-                chunk_size=600,
-                chunk_overlap=80,
-                min_chunk_size=100,
-                max_chunk_size=1500
+                chunk_size=800,
+                chunk_overlap=100,
+                min_chunk_size=200,
+                max_chunk_size=2000
             )
         else:
             chunk_config = ChunkConfig(
-                strategy=ChunkStrategy.FIXED,
+                strategy=ChunkStrategy.HIERARCHICAL,
                 chunk_size=600,
-                chunk_overlap=60
+                chunk_overlap=60,
+                min_chunk_size=200
             )
         use_dynamic = True
     else:
@@ -333,18 +379,23 @@ def update_vector_db(db_name, data_folder, use_dynamic_chunker=True):
     # 检查向量库是否存在
     if os.path.exists(db_path):
         # 加载已有向量库
-        db = Chroma(
-            persist_directory=db_path,
-            embedding_function=EMBEDDINGS,
-            collection_name=db_name,
-            collection_metadata={"hnsw:space": "cosine"}
-        )
-
-        # 获取已存在文件清单
-        results = db.get()
-        processed_files = set()
-        if results and results['metadatas']:
-            processed_files = {os.path.basename(m['source']) for m in results['metadatas'] if 'source' in m}
+        try:
+            db = Chroma(
+                persist_directory=db_path,
+                embedding_function=EMBEDDINGS,
+                collection_name=collection_name,  # 使用一致的collection_name
+                collection_metadata={"hnsw:space": "cosine"}
+            )
+            # 获取已存在文件清单
+            results = db.get()
+            processed_files = set()
+            if results and results['metadatas']:
+                processed_files = {os.path.basename(m['source']) for m in results['metadatas'] if 'source' in m}
+        except Exception as e:
+            logger.warning(f"⚠️ 加载现有向量库失败: {e}，将重新创建")
+            shutil.rmtree(db_path)
+            db = None
+            processed_files = set()
     else:
         # 首次创建向量库
         db = None
@@ -384,8 +435,8 @@ def update_vector_db(db_name, data_folder, use_dynamic_chunker=True):
             
             if current_splits:
                 if db is None:
-                    # 首次创建向量库
-                    db = create_chroma_db_with_cosine(current_splits, db_path, db_name)
+                    # 首次创建向量库（使用一致的collection_name）
+                    db = create_chroma_db_with_cosine(current_splits, db_path, collection_name)
                 else:
                     # 批量入库到已有向量库
                     batch_size = 50
@@ -396,7 +447,9 @@ def update_vector_db(db_name, data_folder, use_dynamic_chunker=True):
                     db.persist()
                 print(f" ✅ 完成 (新增 {len(current_splits)} 个片段)")
             else:
-                print("⚠️ 内容无效")
+                # 空文档也标记为已处理，避免重复尝试
+                processed_files.add(filename)
+                print("⚠️ 内容无效（已跳过）")
         else:
             print("❌ 加载失败")
 
@@ -406,52 +459,52 @@ def update_vector_db(db_name, data_folder, use_dynamic_chunker=True):
 # --- 4. 实时对话存储函数：修复版（确保余弦距离） ---
 def store_chat_history_rag(question: str, answer: str, patient_id: str, db_name="UserHistory_db"):
     """
-    增加了 patient_id 参数，实现多患者隔离存储，向量库指向根目录chroma
-    修复：强制使用余弦距离存储
+    患者对话历史存储 - 使用CSV文件存储（每个患者一个CSV文件）
+    
+    注意：不再使用向量数据库存储，改为CSV文件方式，便于管理和查询
+    
+    Args:
+        question: 患者问题
+        answer: 医生回答
+        patient_id: 患者ID
+        db_name: 数据库名称（保留参数兼容性，但不使用）
     """
-    # 构建文档
-    doc_content = f"患者问: {question} | 医生答: {answer}"
-    doc = Document(
-        page_content=doc_content,
-        metadata={"patient_id": patient_id, "source": "conversation_history"}
-    )
-
-    # 向量库路径：根目录/chroma/{db_name}
-    root_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(root_dir, "chroma", db_name)
-
-    # 切片
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=60,
-        separators=["|", "。", "；", "！", "？", "，", " "]
-    )
-    splits = text_splitter.split_documents([doc])
-
-    if not splits:
-        print(f"⚠️ 无法存储空对话")
+    if not PATIENT_CSV_AVAILABLE:
+        print(f"⚠️ 患者历史CSV模块不可用，无法存储对话")
         return
-
-    # 检查向量库是否存在
-    if os.path.exists(db_path):
-        # 加载已有向量库
-        db = Chroma(
-            persist_directory=db_path,
-            embedding_function=EMBEDDINGS,
-            collection_name="UserHistory",
-            collection_metadata={"hnsw:space": "cosine"}
+    
+    # 检查输入
+    if not question or not answer or not patient_id:
+        print(f"⚠️ 无法存储空对话（问题、回答或患者ID为空）")
+        return
+    
+    try:
+        # 获取CSV管理器（使用项目根目录下的 patient_history_csv 文件夹）
+        csv_storage_path = os.path.join(ROOT_DIR, "patient_history_csv")
+        csv_manager = get_patient_history_csv(csv_storage_path)
+        
+        # 存储对话
+        metadata = {
+            "source": "conversation_history",
+            "db_name": db_name  # 保留原始db_name信息
+        }
+        
+        success = csv_manager.store_conversation(
+            patient_id=patient_id,
+            question=question,
+            answer=answer,
+            metadata=metadata
         )
-        db.add_documents(splits)
-        db.persist()
-    else:
-        # 首次创建向量库
-        create_chroma_db_with_cosine(
-            docs=splits,
-            db_path=db_path,
-            collection_name="UserHistory"
-        )
-
-    print(f"✅ 患者 {patient_id} 的对话已完成切片索引")
+        
+        if success:
+            print(f"✅ 患者 {patient_id} 的对话已存储到CSV")
+        else:
+            print(f"⚠️ 患者 {patient_id} 的对话存储失败")
+            
+    except Exception as e:
+        print(f"❌ 存储患者 {patient_id} 对话时发生错误: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 # --- 5. 医生进化存储函数：双存储（用户专属+全量汇总），适配state/dataset ---
@@ -522,9 +575,10 @@ def init_high_quality_qa_db():
 
     # 1. 检查汇总CSV是否存在
     if not os.path.exists(summary_csv_path):
-        logger.warning(f"⚠️ 全量高分对话汇总CSV不存在({summary_csv_path})，创建空向量库")
-        # 创建空向量库
+        logger.warning(f"⚠️ 全量高分对话汇总CSV不存在({summary_csv_path})，确保向量库已初始化")
+        # 如果向量库不存在，创建空向量库
         if not os.path.exists(db_path):
+            os.makedirs(csv_dir, exist_ok=True)  # 确保目录存在
             placeholder_doc = Document(
                 page_content="高质量问答库初始化占位符",
                 metadata={
@@ -586,8 +640,8 @@ def init_high_quality_qa_db():
             high_quality_docs.append(answer_doc)
 
     if not high_quality_docs:
-        logger.warning("ℹ️ 无高质量问答数据，创建空向量库")
-        # 创建空向量库
+        logger.warning("ℹ️ CSV文件存在但无高质量问答数据，确保向量库已初始化")
+        # 如果向量库不存在，创建空向量库
         if not os.path.exists(db_path):
             placeholder_doc = Document(
                 page_content="高质量问答库初始化占位符",
@@ -607,6 +661,8 @@ def init_high_quality_qa_db():
                 collection_metadata={"hnsw:space": "cosine"}
             )
             logger.info(f"✅ 高质量问答库创建成功（空库）")
+        else:
+            logger.info(f"ℹ️  高质量问答库已存在，无需更新")
         return
 
     # 3. 批量入库（切片后入库，防止Token溢出）
@@ -698,12 +754,13 @@ def rebuild_medical_guide_db_dynamic():
         return
     
     # 使用层次分块策略
+    # min_chunk_size=200: 过滤并合并孤立标题行等碎片
     chunker = DynamicChunker()
     config = ChunkConfig(
         strategy=ChunkStrategy.HIERARCHICAL,
         chunk_size=800,
         chunk_overlap=100,
-        min_chunk_size=100,
+        min_chunk_size=200,
         max_chunk_size=2000
     )
     
@@ -778,13 +835,14 @@ def rebuild_hospital_process_db_dynamic():
         logger.warning("⚠️  没有找到医院流程文档")
         return
     
-    # 使用固定分块策略（适合模板和流程文档）
+    # HospitalProcess 使用层次分块（流程文档含 ## 章节标题，层次分块更合适）
+    # min_chunk_size=200: 合并过短的单行Markdown fragment
     chunker = DynamicChunker()
     config = ChunkConfig(
-        strategy=ChunkStrategy.FIXED,
+        strategy=ChunkStrategy.HIERARCHICAL,
         chunk_size=600,
         chunk_overlap=60,
-        min_chunk_size=100,
+        min_chunk_size=200,
         max_chunk_size=1500
     )
     
@@ -837,14 +895,38 @@ def rebuild_clinical_case_db_dynamic():
             
             if isinstance(item, dict):
                 if "text" in item or "content" in item:
+                    # 已有标准格式
                     doc = {
                         "text": item.get("text") or item.get("content", ""),
                         "meta": item.get("meta", {})
                     }
+                elif "case_character" in item or "treatment_plan" in item:
+                    # 患者案例格式：{Patient-SN, case_character, treatment_plan}
+                    # 格式化为结构化自然语言文本，避免原始JSON字符串入库
+                    parts = []
+                    case_char = item.get("case_character")
+                    treatment = item.get("treatment_plan")
+                    # 字段可能是字符串或被嵌套为dict，统一转为字符串
+                    if case_char:
+                        case_char_str = str(case_char).strip() if not isinstance(case_char, str) else case_char.strip()
+                        if case_char_str:
+                            parts.append(f"【患者情况】{case_char_str}")
+                    if treatment:
+                        treatment_str = str(treatment).strip() if not isinstance(treatment, str) else treatment.strip()
+                        if treatment_str:
+                            parts.append(f"【诊疗方案】{treatment_str}")
+                    text = "\n\n".join(parts)
+                    meta = {
+                        "patient_sn": str(item.get("Patient-SN", "")),
+                        "doc_subtype": "patient_case"
+                    }
+                    doc = {"text": text, "meta": meta}
                 else:
-                    doc = {"text": str(item), "meta": {}}
+                    # 未知格式，转为文本但过滤掉过短的
+                    text = str(item)
+                    doc = {"text": text, "meta": {}} if len(text) > 50 else None
             elif isinstance(item, str):
-                doc = {"text": item, "meta": {}}
+                doc = {"text": item, "meta": {}} if len(item.strip()) > 50 else None
             else:
                 logger.warning(f"   ⚠️  跳过不支持的数据类型: {type(item)}")
                 continue
@@ -859,13 +941,15 @@ def rebuild_clinical_case_db_dynamic():
         return
     
     # 使用语义分块策略
+    # chunk_size=800: 保证每个案例的完整上下文（主诉+方案可达600-1000字）
+    # min_chunk_size=200: 避免碎片化的短内容
     chunker = DynamicChunker()
     config = ChunkConfig(
         strategy=ChunkStrategy.SEMANTIC,
-        chunk_size=600,
-        chunk_overlap=80,
-        min_chunk_size=100,
-        max_chunk_size=1500
+        chunk_size=800,
+        chunk_overlap=100,
+        min_chunk_size=200,
+        max_chunk_size=2000
     )
     
     chunked_docs = chunker.chunk_documents(all_docs, config)

@@ -145,26 +145,43 @@ class RAGKeywordGenerator:
         if not text:
             return []
 
-        # 常见无意义词
+        # 常见无意义词（扩展：增加中文冒号引导词及括号噪声）
         stop_words = {
             "患者", "病人", "家属", "妈妈", "母亲", "父亲", "孩子", "本人",
             "不舒服", "不适", "感觉", "觉得", "出现", "发现", "最近", "今天", "昨天",
             "一直", "一个", "有点", "有些", "没有", "不", "可以", "需要", "请问",
             "怎么办", "怎么", "如何", "情况", "症状", "问题", "能否", "是否",
+            # 主诉引导词
+            "主诉", "主要", "诉", "述", "反映", "表示", "描述",
+            # 常见填充短语
+            "以上", "所以", "因此", "但是", "然后", "已经", "目前", "现在",
+            # 数量词
+            "多", "少", "个", "次", "年", "月", "天", "小时", "分钟",
         }
 
-        # 按常见标点切分
-        for ch in [";", "；", "，", ",", "。", ".", "、", "\n"]:
+        # 按常见分隔符切分（扩展：加入全角冒号、括号、书名号等）
+        for ch in [";", "；", "，", ",", "。", ".", "、", "\n",
+                   "：", ":", "（", "）", "(", ")", "【", "】", "「", "」",
+                   "？", "！", "?", "!"]:
             text = text.replace(ch, " ")
 
         parts = [p.strip() for p in text.split(" ") if p.strip()]
         keywords: list[str] = []
+        seen: set[str] = set()
         for part in parts:
             if part in stop_words:
                 continue
             if len(part) < 2:
                 continue
-            keywords.append(part)
+            # 过滤纯数字（如"30"、"45"等，避免年龄/时间数字污染）
+            if part.isdigit():
+                continue
+            # 过滤数字+单位组合（如"30年"、"2周"）
+            if len(part) <= 3 and any(c.isdigit() for c in part):
+                continue
+            if part not in seen:
+                seen.add(part)
+                keywords.append(part)
             if len(keywords) >= max_terms:
                 break
         return keywords
@@ -246,9 +263,10 @@ class RAGKeywordGenerator:
         """
         keywords = []
         
-        # 1. 患者主诉
+        # 1. 患者主诉（提取症状关键词）
         if ctx.chief_complaint:
-            keywords.append(ctx.chief_complaint[:20])
+            kws = self._extract_symptom_keywords(ctx.chief_complaint, max_terms=3)
+            keywords.extend(kws) if kws else keywords.append(ctx.chief_complaint[:20])
         
         # 2. 检查项目和异常结果
         if ctx.test_results:
@@ -277,9 +295,10 @@ class RAGKeywordGenerator:
         """
         keywords = []
         
-        # 1. 患者主诉
+        # 1. 患者主诉（提取症状关键词）
         if ctx.chief_complaint:
-            keywords.append(ctx.chief_complaint[:20])
+            kws = self._extract_symptom_keywords(ctx.chief_complaint, max_terms=3)
+            keywords.extend(kws) if kws else keywords.append(ctx.chief_complaint[:20])
         
         # 2. 科室
         if ctx.dept_name:
@@ -314,13 +333,14 @@ class RAGKeywordGenerator:
         """
         keywords = []
         
-        # 1. 患者主诉（必须）
-        if ctx.chief_complaint:
-            keywords.append(ctx.chief_complaint[:30])
-        
-        # 2. 科室（提供专科背景）
+        # 1. 科室（提供专科背景）
         if ctx.dept_name:
             keywords.append(ctx.dept_name)
+        
+        # 2. 患者主诉（提取症状关键词）
+        if ctx.chief_complaint:
+            kws = self._extract_symptom_keywords(ctx.chief_complaint, max_terms=4)
+            keywords.extend(kws) if kws else keywords.append(ctx.chief_complaint[:20])
         
         # 3. 关键症状（从检查结果提取）
         if ctx.test_results:
@@ -349,13 +369,14 @@ class RAGKeywordGenerator:
         """
         keywords = []
         
-        # 1. 患者主诉
-        if ctx.chief_complaint:
-            keywords.append(ctx.chief_complaint[:30])
-        
-        # 2. 科室
+        # 1. 科室
         if ctx.dept_name:
             keywords.append(ctx.dept_name)
+        
+        # 2. 患者主诉（提取症状关键词）
+        if ctx.chief_complaint:
+            kws = self._extract_symptom_keywords(ctx.chief_complaint, max_terms=3)
+            keywords.extend(kws) if kws else keywords.append(ctx.chief_complaint[:20])
         
         # 3. 已完成检查及关键症状
         if ctx.test_results:
@@ -539,13 +560,13 @@ class RAGKeywordGenerator:
         """
         keywords = []
         
-        # 1. 患者主诉（必须）
-        if ctx.chief_complaint:
-            keywords.append(ctx.chief_complaint[:30])
-        
-        # 2. 科室
+        # 1. 科室（必须，提供专科背景）
         if ctx.dept_name:
             keywords.append(ctx.dept_name)
+        
+        # 2. 患者主诉（提取症状关键词，避免原始长文本）
+        if ctx.chief_complaint:
+            keywords.extend(self._extract_symptom_keywords(ctx.chief_complaint, max_terms=4))
         
         # 3. 关键症状（从专科小结提取）
         if ctx.specialty_summary:
@@ -590,7 +611,8 @@ class RAGKeywordGenerator:
             keywords.append(ctx.dept_name)
         
         if ctx.chief_complaint:
-            keywords.append(ctx.chief_complaint[:30])
+            kws = self._extract_symptom_keywords(ctx.chief_complaint, max_terms=4)
+            keywords.extend(kws) if kws else keywords.append(ctx.chief_complaint[:30])
         
         # 2. 关键症状/已完成检查（适用于指南库和案例库）
         if db_name in ["MedicalGuide_db", "ClinicalCase_db"]:

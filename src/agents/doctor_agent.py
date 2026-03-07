@@ -99,7 +99,12 @@ class DoctorAgent:
         
         # 构建历史对话展示 - 包括问题和患者的回答
         is_first_question = len(self.questions_asked) == 0
-        
+
+        # Python层面早停检查：核心信息充分收集后，跳过LLM调用直接终止
+        if not is_first_question and self._should_stop_early():
+            self._logger.info("  ✅ [早停] 核心信息已充分收集，提前结束问诊")
+            return ""
+
         if self.questions_asked:
             # 显示完整的对话历史（问题 + 回答）
             conversation_history = self.collected_info.get("conversation_history", [])
@@ -142,31 +147,36 @@ class DoctorAgent:
   ❌ 禁止：“疼痛的范围大吗？”（与已问问题重复）
 """
         else:
-            asked_summary = """🎯 **首次问诊 - 开放式问题策略**
+            # 首次问诊：使用独立最简提示词，直接返回开场问候，避免被后续阶段策略干扰
+            _fq_prompt = (
+                f"你是{self._dept_name()}医生，患者刚进入诊室，这是本次就诊的第一句话。\n"
+                "唯一任务：生成一个开放式问候，让患者自己描述来意，不得假设任何症状。\n\n"
+                "✅ 直接使用以下之一：\n"
+                '  "您好，哪里不舒服？"\n'
+                '  "您好，今天来看什么问题？"\n'
+                '  "您好，跟我说说您的情况吧。"\n\n'
+                "❌ 绝对禁止（患者尚未陈述任何症状！）：\n"
+                '  问具体细节，如"疼多久了"、"有放射痛吗"\n'
+                '  使用专业术语，如"放射痛"、"压榨感"\n'
+                "  一次问多个问题\n\n"
+                f"【分诊护士主诉记录（仅做背景参考，不要据此假设具体症状）】\n{chief_complaint}\n\n"
+                '输出JSON：{"question": "问候语", "reason": "首次开放式问诊", "duplicate_check": "首次问诊无需检查"}'
+            )
+            try:
+                _fq_obj, _, _ = self._llm.generate_json(
+                    system_prompt=_fq_prompt,
+                    user_prompt="请生成首次问诊的开场问候语。",
+                    fallback=lambda: {"question": "您好，哪里不舒服？", "reason": "首次", "duplicate_check": "首次"},
+                    temperature=0.2,
+                )
+                return str(_fq_obj.get("question", "")).strip() or "您好，哪里不舒服？"
+            except Exception as _fq_err:
+                self._logger.error(f"  ❌ 首次问诊生成失败: {_fq_err}")
+                return "您好，哪里不舒服？"
 
-这是患者第一次见到你，你还不了解患者的任何情况。
-真实医生的做法是：先用开放式问题让患者自己描述，而不是直接问很具体的医学问题。
-
-✅ **推荐的首次问题**（选一个）：
-- "您好，哪里不舒服？" 
-- "您好，今天来看什么问题？"
-- "您好，有什么不舒服的吗？"
-- "您好，跟我说说您的情况吧。"
-
-⚠️ **首次问诊禁忌**：
-❌ 不要直接问很具体的问题（如"疼痛持续多久了？" - 患者还没说疼痛呢）
-❌ 不要使用专业术语（如"放射痛"、"触痛" - 患者可能不懂）
-❌ 不要一次问多个问题（让患者先说完主要问题）
-❌ 不要假设患者的症状（应该让患者自己描述）
-
-💡 **后续问诊策略**：
-- 第1-2个问题：开放式，让患者描述主要症状
-- 第3-5个问题：针对患者提到的症状，追问关键细节（时间、程度、性质）
-- 第6-8个问题：筛查危险信号、伴随症状、既往病史
-- 第9-10个问题：补充暴露史、鉴别诊断关键点
-"""
-        
-        system_prompt = f"""你是一名经验丰富的{self._dept_name()}医生，正在进行{context}。你需要通过系统的问诊收集关键信息，做出准确诊断。
+        # ── 后续轮次：构建含话题覆盖图的结构化提示词 ──
+        topic_map = self._build_topic_coverage_map()
+        system_prompt = f"""你是一名经验丰富的{self._dept_name()}医生，正在进行{context}（第{len(self.questions_asked)+1}问/上限{self._max_questions}问）。你需要通过系统的问诊收集关键信息，做出准确诊断。
 
 ⚠️ 患者状态感知
 - 观察患者的回答：如果简短、含糊或表现痛苦，说明状态不佳，应优先问最关键的问题
@@ -186,6 +196,11 @@ class DoctorAgent:
 【临床知识参考】
 {kb_context}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+## 📊 已覆盖话题（优先阅读，决定停止前必看）
+{topic_map}
+（✅=已收集到信息  ❌=仍空缺）
+⭐ 当 ❌缺失维度 ≤2 时，信息已充分，应主动停止提问。
 
 🚫 **重复问题检测 - 核心原则（最高优先级）**
 
@@ -307,72 +322,32 @@ class DoctorAgent:
    - 其他系统症状（全身性疾病筛查）
 
 【你的任务】
-⚠️ **重要原则**：问诊的目标是获取足够做出临床决策的信息，而不是问满固定轮数。信息足够时应主动停止，避免过度问诊。
+**① 优先判断：是否停止提问？**（满足任一条件即立即停止，返回 question=""）
+- 上方已覆盖话题中 ❌缺失维度 ≤2 个（信息已充分）
+- 已收集信息足以制定初步检查计划或诊断方向
+- 已达问诊上限 {len(self.questions_asked)}/{self._max_questions} 问
 
-分析当前问诊进度，决定下一步行动：
+⭐ 质量原则：5个精准问题 > 机械问满{self._max_questions}问。信息够用时主动停止。
 
-🛑 **应该停止提问**（优先判断，满足以下**多个**条件时才停止）：
-1. **诊断清晰度**：已收集足够信息可以做出初步诊断或制定检查计划
-2. **核心信息完整**（问诊完整性检查，必须满足以下所有条件）：
-   - ✅ 主要症状已量化（严重度用1-10评分、持续时间具体到天/周）
-   - ✅ 危险征象已排查（发热、体重下降、意识改变、急性恶化等）
-   - ✅ 鉴别诊断关键信息已获取（至少2-3个鉴别点）
-   - ✅ 时间轴清晰（起病时间、进展趋势）
-   - ✅ 加重/缓解因素明确
-3. **检查优先** AND **患者状态良好**：进一步明确需要依赖检查而非问诊（如需要影像、化验）且患者可以继续
-4. **已达上限**：问诊次数**已达到**上限（{len(self.questions_asked)}/{self._max_questions}）
+**② 若继续：从【❌ 仍缺失】维度选方向，生成前确认：**
+- 不与已问问题语义重复（换词重述同样算重复）
+  · "疼痛会扩散吗" ＝ "有放射感吗" ＝ "痛会跑别处吗" → 都是同一问题
+  · "加重因素" ＝ "什么情况更痛" ＝ "诱发因素" → 都是同一维度
+- 不问患者回答中已主动提及的内容
+- 无新角度时，返回 question="" 停止（不要凑问题）
 
-注意：仅当核心信息完整（第2条所有子项都满足）且满足第1、3或4条中的至少一条时，才应停止。
-
-✅ **继续提问**（严格按顺序执行）：
-
-第1步：【重复检查 - 最高优先级】
-- 仔细阅读【问诊历史】中的每一个已问问题
-- 在生成新问题前，确保新问题不与任何已问问题重复（参考上方🚫重复问题检测规则）
-- 检查维度：语义、意图、部分包含关系
-- 如果无法确定是否重复，宁可换一个完全不同的方向
-
-第2步：【评估信息完整性】
-- 当前已收集的信息是否足够做出临床决策？
-- 核心诊断要素是否齐全？
-
-第3步：【检查停止条件】
-- 是否满足任何一个"应该停止提问"的条件？
-
-第4步：【决定行动】
-- 满足停止条件 → 返回空字符串 + 说明理由
-- 需要继续 → 生成针对信息缺口的高质量问题
-
-**生成问题的强制要求**：
-1. ⚠️ 问题不得与【问诊历史】中的任何问题重复（最重要！）
-2. 问题必须针对【已收集的信息】中明显的空白点
-3. 问题要简洁、口语化、患者易懂
-4. 一次只问一个问题
-5. 避免开放式泛问（如"还有什么"）
-
-**质量原则**：
-- 不要为了达到问诊轮数而机械提问
-- 信息足够时主动停止
-- 每个问题都应该有明确的诊断价值
+**③ 问题质量要求**
+- 口语化（"有多久了"而非"病程多长"）
+- 一次只问一个问题
+- 从患者已有答案出发具体追问，避免"还有什么不舒服"类泛问
 
 **输出JSON格式**：
 {{
-  "question": "问题内容（如果信息足够或应停止则为空字符串）",
-  "reason": "决策理由（说明为什么问这个问题/为什么停止，如果是新问题需简要说明与已问问题的区别）",
-  "duplicate_check": "已确认不与以下问题重复：[列出最相关的1-2个已问问题编号]"
+  "question": "问题内容（停止则为空字符串）",
+  "reason": "决策理由（新问题需说明：针对哪个缺失维度 + 与哪些已问问题不重复）",
+  "duplicate_check": "已核对第N、M问，确认不重复"
 }}
 
-⚠️ **特别提醒 - 重复检查是最高优先级**：
-- 在生成问题前，必须逐条检查上面《已问过的所有问题》列表
-- 如果想生成的问题可能与任何一个已问问题重复，必须立即更换方向
-- 如果无法想到不重复的新问题，就返回 question="" 停止问诊
-- duplicate_check 字段必须填写，说明你检查过了哪些相关问题 **如果确实需要继续**：
-   - 生成一个简洁、口语化的问题（避免医学术语，患者容易理解）
-   - 问题要有明确的临床目的，能填补关键信息缺口
-   - 避免开放式泛问（如"还有什么不舒服"）
-   - 一次只问一个问题，不要多个问题组合
-   - **必须确保新问题与已问问题完全不重复**
-3. **质量优先于数量**：宁可问5个高质量问题得到足够信息，也不要机械地问满10个问题
 
 【良好问题示例 - 按问诊阶段分类】
 
@@ -446,51 +421,132 @@ class DoctorAgent:
 ❌ 避免："最近怎么样？"（过于开放，缺乏目的性）
 """
         
-        user_prompt = "请根据以上信息，决定是否继续问诊。如果需要继续，生成下一个问题；如果信息已足够，返回空字符串。"
-        
-        # 调用LLM生成问题(只尝试1次，因为prompt已经充分强调了避免重复)
-        try:
-            obj, _, _ = self._llm.generate_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                fallback=lambda: {"question": "", "reason": "", "duplicate_check": ""},
-                temperature=0.3
-            )
-            question = str(obj.get("question", "")).strip()
-            reason = str(obj.get("reason", "")).strip()
-            duplicate_check = str(obj.get("duplicate_check", "")).strip()
-            
-            # 如果为空，直接返回
-            if not question:
-                if reason:
-                    self._logger.debug(f"  💡 停止问诊: {reason}")
-                return ""
-            
-            # 【最后的安全网】检查是否重复
-            # 注意：由于prompt已经强调避免重复，这里应该很少触发
-            if self._is_duplicate_question(question):
-                self._logger.warning(
-                    f"  ⚠️  LLM生成了重复问题（尽管prompt已强调避免）\n"
-                    f"     生成的问题: {question}\n"
-                    f"     LLM自己的检查: {duplicate_check if duplicate_check else '未填写'}\n"
-                    f"     当前已问问题数: {len(self.questions_asked)}"
+        base_user_prompt = "请根据以上信息，决定是否继续问诊。如果需要继续，生成下一个问题；如果信息已足够，返回空字符串。"
+
+        # 最多重试2次：当检测到重复时，携带明确禁止的问题重新请求LLM
+        max_retries = 2
+        banned_questions: list[str] = []  # 本轮被判为重复的问题，用于重试时明确告知LLM
+
+        for attempt in range(max_retries + 1):
+            # 如果有被拒绝的问题，追加到user_prompt中
+            if banned_questions:
+                banned_block = "\n\n".join(
+                    f"  ❌ 禁止生成（已判定为与已问问题重复）：{q}" for q in banned_questions
                 )
-                self._logger.warning(f"      已问问题参考: {self.questions_asked[-3:] if len(self.questions_asked) >= 3 else self.questions_asked}")
-                self._logger.warning(f"      跳过本轮提问，避免重复")
+                user_prompt = (
+                    f"{base_user_prompt}\n\n"
+                    f"【注意】以下问题已被系统判定为重复，本次必须生成完全不同方向的新问题：\n"
+                    f"{banned_block}\n"
+                    f"请换一个完全不同的问诊方向，绝对不能再问与以上禁止问题语义相同或相似的内容。"
+                )
+            else:
+                user_prompt = base_user_prompt
+
+            try:
+                obj, _, _ = self._llm.generate_json(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    fallback=lambda: {"question": "", "reason": "", "duplicate_check": ""},
+                    temperature=0.3
+                )
+                question = str(obj.get("question", "")).strip()
+                reason = str(obj.get("reason", "")).strip()
+                duplicate_check = str(obj.get("duplicate_check", "")).strip()
+
+                # 如果为空，直接返回
+                if not question:
+                    if reason:
+                        self._logger.debug(f"  💡 停止问诊: {reason}")
+                    return ""
+
+                # 【安全网】检查是否仍然重复
+                if self._is_duplicate_question(question):
+                    self._logger.warning(
+                        f"  ⚠️  LLM生成了重复问题（第{attempt + 1}次尝试）\n"
+                        f"     生成的问题: {question}\n"
+                        f"     LLM自己的检查: {duplicate_check if duplicate_check else '未填写'}\n"
+                        f"     当前已问问题数: {len(self.questions_asked)}"
+                    )
+                    self._logger.warning(
+                        f"     已问问题参考: {self.questions_asked[-3:] if len(self.questions_asked) >= 3 else self.questions_asked}"
+                    )
+                    banned_questions.append(question)  # 记录本次被拒绝的问题
+                    if attempt < max_retries:
+                        self._logger.warning(
+                            f"     携带禁止问题重试（第{attempt + 2}次）..."
+                        )
+                        continue  # 重试
+                    else:
+                        self._logger.warning(f"     已达最大重试次数，跳过本轮提问")
+                        return ""
+
+                # 成功得到非重复问题
+                if reason:
+                    self._logger.debug(f"  💡 问题目的: {reason}")
+                if duplicate_check:
+                    self._logger.debug(f"  ✓ 重复检查: {duplicate_check}")
+                return question
+
+            except Exception as e:
+                self._logger.error(f"  ❌ 生成问题时出错: {e}")
                 return ""
-            
-            # 显示问题生成信息
-            if reason:
-                self._logger.debug(f"  💡 问题目的: {reason}")
-            if duplicate_check:
-                self._logger.debug(f"  ✓ 重复检查: {duplicate_check}")
-            
-            return question
-                    
-        except Exception as e:
-            self._logger.error(f"  ❌ 生成问题时出错: {e}")
-            return ""
+
+        return ""
     
+    def _should_stop_early(self) -> bool:
+        """Python层面判断核心维度覆盖是否充分，提前终止问诊以避免凑问题。
+
+        检查7个关键维度中已覆盖的数量（≥5个且已问≥5问时返回True）。
+        仅用于后续问诊（首次问诊不受此限制）。
+        """
+        if len(self.questions_asked) < 3:
+            return False
+
+        all_text = " ".join([
+            str(self.collected_info.get("chief_complaint", "")),
+            str(self.collected_info.get("duration", "")),
+            json.dumps(self.collected_info.get("symptoms", []), ensure_ascii=False),
+            json.dumps(self.collected_info.get("history", {}), ensure_ascii=False),
+            " ".join(c.get("answer", "") for c in self.collected_info.get("conversation_history", []))
+        ]).lower()
+
+        dimension_keywords = [
+            ["症状", "不舒服", "痛", "疼", "胀", "麻", "晕"],           # 主诉/症状
+            ["多久", "天", "周", "月", "年", "开始", "时候"],            # 发病时间
+            ["程度", "分", "严重", "厉害", "轻", "重"],                  # 症状程度
+            ["加重", "缓解", "诱发", "什么情况", "好转", "减轻"],        # 加重/缓解因素
+            ["还有", "其他", "伴随", "发烧", "恶心", "头晕", "呕吐"],   # 伴随症状
+            ["发烧", "体重", "晕倒", "意识", "呼吸", "黑矇", "大汗"],   # 危险征象
+            ["以前", "历史", "既往", "药", "手术", "过敏", "慢性"],     # 既往史
+        ]
+        covered = sum(1 for kws in dimension_keywords if any(kw in all_text for kw in kws))
+        return covered >= 5 and len(self.questions_asked) >= 5
+
+    def _build_topic_coverage_map(self) -> str:
+        """生成话题覆盖状态图，帮助LLM直观判断哪些维度已覆盖、哪些仍缺失。"""
+        all_text = " ".join([
+            str(self.collected_info.get("chief_complaint", "")),
+            str(self.collected_info.get("duration", "")),
+            json.dumps(self.collected_info.get("symptoms", []), ensure_ascii=False),
+            json.dumps(self.collected_info.get("history", {}), ensure_ascii=False),
+            " ".join(c.get("answer", "") for c in self.collected_info.get("conversation_history", []))
+        ]).lower()
+
+        dimensions = [
+            ("主诉/症状描述",     ["症状", "不舒服", "痛", "疼", "胀", "麻", "晕"]),
+            ("发病时间/持续时长", ["多久", "天", "周", "月", "开始", "什么时候"]),
+            ("症状程度",          ["分", "程度", "严重", "厉害", "轻", "重"]),
+            ("加重/缓解因素",     ["加重", "缓解", "诱发", "什么情况", "好转"]),
+            ("伴随症状",          ["还有", "其他", "伴随", "发烧", "恶心", "头晕"]),
+            ("危险征象",          ["发烧", "体重", "晕倒", "意识", "呼吸困难", "黑矇"]),
+            ("既往史/用药史",     ["以前", "历史", "既往", "药物", "手术", "过敏"]),
+        ]
+        lines = []
+        for dim, kws in dimensions:
+            covered = any(kw in all_text for kw in kws)
+            lines.append(f"  {'✅' if covered else '❌'} {dim}")
+        return "\n".join(lines)
+
     def generate_question_based_on_tests(
         self,
         test_results: list[dict[str, Any]],
@@ -636,9 +692,6 @@ class DoctorAgent:
         Returns:
             单个问题字符串，如果不需要继续问则返回空字符串
         """
-        
-        if not self._llm:
-            return ""
         
         # 构建已问问题列表
         asked_summary = "\n".join([f"Q{i+1}: {q}" for i, q in enumerate(self.questions_asked)])
@@ -801,8 +854,8 @@ class DoctorAgent:
             overlap = new_keywords & asked_keywords
             overlap_ratio = len(overlap) / min(len(new_keywords), len(asked_keywords))
             
-            # 如果重叠度超过70%，认为是重复问题
-            if overlap_ratio > 0.7:
+            # 如果重叠度超过55%，认为是重复问题（阈值从0.7降至0.55，减少漏网）
+            if overlap_ratio > 0.55:
                 return True
         
         return False

@@ -38,7 +38,7 @@ def main(
     """医院智能体系统 - 三智能体医疗诊断系统
     
     所有配置请在 config.yaml 中修改
-    配置优先级: CLI --config > 环境变量 > config.yaml > 默认值
+    配置优先级: 环境变量 > config.yaml > 默认值
     """
     # 1. 加载配置
     config = Config.load(config_file=config_file)
@@ -87,7 +87,7 @@ def main(
         logger.info("🏥 准备就诊流程...\n")
     else:
         interval_display = f"{patient_interval} 秒" if patient_interval < 60 else f"{patient_interval/60:.1f} 分钟"
-        logger.info(f"⏰ 患者将每隔 {interval_display} 进入系统（每个患者启动独立线程，竞争共享资源）\n")
+        logger.info(f"⏰ 患者将每隔 {interval_display} 进入医院环境\n")
     
     logger.info("="*80)
     workflow.schedule_patients(case_ids, patient_interval)
@@ -107,12 +107,12 @@ def main(
     if num_patients == 1:
         logger.info("\n⏳ 等待患者完成诊断流程...")
     else:
-        logger.info("\n⏳ 等待所有患者完成 LangGraph 诊断流程...")
+        logger.info("\n⏳ 等待所有患者完成诊断流程...")
     
     if should_log(2, "main", "monitor"):
-        logger.info("💡 提示: 系统每30秒显示一次实时状态（详细模式）\n")
+        logger.info("💡 提示: 系统每30秒显示一次实时状态\n")
     else:
-        logger.info("💡 提示: 系统每2分钟显示一次简要状态（详情见各患者日志文件）\n")
+        logger.info("💡 提示:详情见各患者日志文件\n")
     
     results = workflow.wait_for_completion(num_patients)
     workflow.stop_monitoring(monitor_thread)

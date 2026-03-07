@@ -212,8 +212,25 @@ class DynamicChunker:
         else:
             return self._fixed_chunk(text, config)
     
+    def _find_sentence_boundary_overlap(self, text: str, overlap: int) -> str:
+        """从句子边界处开始截取重叠文本，避免从词中间截断"""
+        if len(text) <= overlap:
+            return text
+        # 取末尾 overlap 个字符作为候选区域
+        overlap_region = text[-overlap:]
+        # 在候选区域内找第一个句子结束符，从其后开始作为重叠起点
+        match = re.search(r'[。！？；.!?;]\s*', overlap_region)
+        if match:
+            return overlap_region[match.end():]
+        # 没有句子边界时退而求换行符
+        newline_match = re.search(r'\n', overlap_region)
+        if newline_match:
+            return overlap_region[newline_match.end():]
+        # 实在找不到边界，返回整个候选区（保持原行为）
+        return overlap_region
+
     def _fixed_chunk(self, text: str, config: ChunkConfig) -> List[str]:
-        """固定大小分块（带智能重叠）"""
+        """固定大小分块（带智能重叠，重叠起点对齐句子边界）"""
         chunks = []
         chunk_size = config.chunk_size
         overlap = config.chunk_overlap
@@ -229,13 +246,17 @@ class DynamicChunker:
                 if current_chunk:
                     chunks.append(current_chunk.strip())
                 
-                # 添加重叠（取当前块的最后部分）
-                overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                # 取当前块末尾作为重叠，对齐到句子边界，避免截词
+                overlap_text = self._find_sentence_boundary_overlap(current_chunk, overlap)
                 current_chunk = overlap_text + sentence
         
         # 添加最后一块
         if current_chunk:
             chunks.append(current_chunk.strip())
+        
+        # 过滤并合并过短的块
+        min_size = getattr(config, 'min_chunk_size', 50)
+        chunks = self._merge_short_chunks(chunks, min_size)
         
         return chunks
     
@@ -272,6 +293,10 @@ class DynamicChunker:
         if current_chunk:
             chunks.append(current_chunk.strip())
         
+        # 过滤并合并过短的块
+        min_size = getattr(config, 'min_chunk_size', 50)
+        chunks = self._merge_short_chunks(chunks, min_size)
+        
         return chunks
     
     def _hierarchical_chunk(self, text: str, config: ChunkConfig) -> List[str]:
@@ -286,6 +311,7 @@ class DynamicChunker:
         lines = text.split('\n')
         current_section = ""
         current_header = ""
+        min_size = getattr(config, 'min_chunk_size', 50)
         
         for line in lines:
             line = line.strip()
@@ -294,9 +320,14 @@ class DynamicChunker:
             is_header = self._is_header(line)
             
             if is_header:
-                # 保存之前的章节
-                if current_section:
-                    chunks.append(f"{current_header}\n{current_section}".strip())
+                # 保存之前的章节（只有当 section 内容足够时才保存）
+                if current_section and current_section.strip():
+                    chunk_text = f"{current_header}\n{current_section}".strip() if current_header else current_section.strip()
+                    chunks.append(chunk_text)
+                elif current_header and not current_section.strip():
+                    # 前一个标题没有正文内容，将标题追加到下一个 chunk 的 header 里
+                    # 通过把它纳入 current_header 的方式保留
+                    pass  # current_header 会在下面被覆盖；暂时丢弃孤立标题
                 
                 # 开始新章节
                 current_header = line
@@ -306,14 +337,25 @@ class DynamicChunker:
                 
                 # 如果当前章节过长，分块
                 if len(current_section) > config.chunk_size:
-                    chunk_text = f"{current_header}\n{current_section}".strip()
+                    chunk_text = f"{current_header}\n{current_section}".strip() if current_header else current_section.strip()
                     sub_chunks = self._semantic_chunk(chunk_text, config)
                     chunks.extend(sub_chunks)
                     current_section = ""
+                    current_header = ""  # 标题已包含在子块中，不再重复
         
         # 添加最后一个章节
-        if current_section:
-            chunks.append(f"{current_header}\n{current_section}".strip())
+        if current_section and current_section.strip():
+            chunk_text = f"{current_header}\n{current_section}".strip() if current_header else current_section.strip()
+            chunks.append(chunk_text)
+        elif current_header and not current_section.strip():
+            # 文档末尾有孤立标题：将其合并到最后一块
+            if chunks:
+                chunks[-1] = chunks[-1] + "\n" + current_header
+            else:
+                chunks.append(current_header)
+        
+        # 过滤并合并过短的块（< min_chunk_size）
+        chunks = self._merge_short_chunks(chunks, min_size)
         
         return chunks if chunks else [text]
     
@@ -346,6 +388,39 @@ class DynamicChunker:
         
         return False
     
+    def _merge_short_chunks(self, chunks: List[str], min_size: int) -> List[str]:
+        """将过短的 chunk 合并到相邻的块中（向后合并优先）"""
+        if not chunks or min_size <= 0:
+            return chunks
+        
+        merged = []
+        pending = ""
+        
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            
+            if pending:
+                # pending 是上一个太短的块，先尝试和当前块合并
+                combined = pending + "\n" + chunk
+                pending = ""
+                merged.append(combined)
+            elif len(chunk) < min_size:
+                # 当前块太短，暂存等待与下一块合并
+                pending = chunk
+            else:
+                merged.append(chunk)
+        
+        # 还有剩余的短块：合并到最后一块，或直接保留（宁可保留也不要丢弃）
+        if pending:
+            if merged:
+                merged[-1] = merged[-1] + "\n" + pending
+            else:
+                merged.append(pending)
+        
+        return merged
+
     def _split_sentences(self, text: str) -> List[str]:
         """智能句子分割（保留标点）"""
         # 中英文句子结束符

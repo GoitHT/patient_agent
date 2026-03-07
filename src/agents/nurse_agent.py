@@ -12,14 +12,12 @@ class NurseAgent:
         "neurology"
     ]
     
-    def __init__(self, llm: LLMClient, max_triage_questions: int = 3):
+    def __init__(self, llm: LLMClient):
         """
         Args:
             llm: 语言模型客户端（必需，用于智能分诊）
-            max_triage_questions: 分诊时最多可以问患者的问题数（默认3个）
         """
         self._llm = llm
-        self._max_triage_questions = max_triage_questions
     
     def reset(self) -> None:
         """重置分诊历史（用于处理新患者）

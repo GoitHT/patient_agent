@@ -10,8 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
-# 导入时间管理系统
-from simulation.time_manager import TimeManager, EventType, TimeEvent
+
 
 
 @dataclass
@@ -635,9 +634,6 @@ class HospitalWorld:
         
         self.current_time = start_time or datetime.now().replace(hour=8, minute=0, second=0, microsecond=0)
         
-        # ===== 时间管理系统 - 新增 =====
-        self.time_manager = TimeManager(start_time=self.current_time)
-        
         # 定义医院房间（简化版 - 字典结构）
         self.locations = {
             "lobby": {
@@ -933,23 +929,34 @@ class HospitalWorld:
         self._log_equipment_initialization()
     
     def _log_equipment_initialization(self):
-        """记录设备初始化统计信息（调试用）"""
+        """记录设备初始化统计信息"""
         import logging
+        import re
         logger = logging.getLogger('hospital_agent.world')
-        
-        # 按类型统计设备
-        equipment_by_type = {}
+
+        category_label = {
+            "imaging":         "影像",
+            "neurophysiology": "神经电生理",
+            "lab":             "检验",
+        }
+
+        # location_id -> exam_type -> list[Equipment]
+        grouped: dict = {}
         for eq in self.equipment.values():
-            if eq.exam_type not in equipment_by_type:
-                equipment_by_type[eq.exam_type] = []
-            equipment_by_type[eq.exam_type].append(eq)
-        
-        # 统计总数
+            grouped.setdefault(eq.location_id, {}).setdefault(eq.exam_type, []).append(eq)
+
         total_equipment = len(self.equipment)
         total_daily_capacity = sum(eq.max_daily_usage for eq in self.equipment.values())
-        avg_duration = sum(eq.duration_minutes for eq in self.equipment.values()) / total_equipment
-        
-        logger.info(f"   → 设备: {total_equipment}台 | 容量{total_daily_capacity}例/天 | 平均{avg_duration:.1f}分/例")
+
+        for loc, types in grouped.items():
+            label = category_label.get(loc, loc)
+            parts = []
+            for exam_type, eqs in types.items():
+                base_name = re.sub(r'\d+号$', '', eqs[0].name).strip()
+                parts.append(f"{base_name}×{len(eqs)}")
+            logger.info(f"   → {label}: {', '.join(parts)}")
+
+        logger.info(f"   → 合计: {total_equipment}台 | 容量{total_daily_capacity}例/天")
     
     def is_working_hours(self) -> bool:
         """检查是否在工作时间"""
@@ -967,9 +974,6 @@ class HospitalWorld:
         with self._lock:
             old_time = self.current_time
             self.current_time += timedelta(minutes=minutes)
-            
-            # 同步时间管理器
-            self.time_manager.advance_time(minutes, reason=f"系统时间推进")
             
             # 检查是否跨天
             if old_time.date() != self.current_time.date():
@@ -1435,27 +1439,6 @@ class HospitalWorld:
             total_equipment = len(all_equipment)
             busy_equipment = len([eq for eq in all_equipment if eq.is_occupied])
             
-            # ===== 时间管理：记录检查开始事件 =====
-            success, error_msg = self.time_manager.allocate_resource(
-                patient_id=patient_id,
-                resource_id=equipment.id,
-                resource_type="equipment",
-                duration_minutes=equipment.duration_minutes,
-                location=patient_loc,
-                event_type=EventType.EXAM_START,
-                metadata={
-                    "exam_type": exam_type,
-                    "equipment_name": equipment.name,
-                    "priority": priority,
-                    "resource_status": f"{busy_equipment}/{total_equipment}"
-                }
-            )
-            
-            if not success:
-                import logging
-                logger = logging.getLogger('hospital_agent.world')
-                logger.warning(f"⚠️ 设备分配时间冲突：{error_msg}")
-            
             self._log_event("exam_start", {
                 "patient_id": patient_id,
                 "equipment": equipment.name,
@@ -1567,10 +1550,6 @@ class HospitalWorld:
         # 直接设置初始位置（首次进入不需要移动验证）
         self.agents[agent_id] = initial_location
         
-        # ===== 时间管理：注册患者到时间线 =====
-        if agent_type == "patient":
-            self.time_manager.register_patient(agent_id, self.current_time)
-        
         # 根据Agent类型初始化不同的生理状态
         if agent_type == "patient":
             # 患者：完整的生理状态（症状、生命体征、体力等）
@@ -1582,27 +1561,6 @@ class HospitalWorld:
             self.physical_states[agent_id] = state
             # 生理状态会在 __post_init__ 中自动初始化默认生命体征
             
-        elif agent_type in ["doctor", "nurse", "lab_technician"]:
-            # 医护人员：简化的工作状态（体力、工作负荷）
-            state = PhysicalState(
-                patient_id=agent_id,
-                agent_type=agent_type,
-                last_update=self.current_time
-            )
-            # 医护人员初始状态良好，无症状
-            state.energy_level = 10.0  # 满体力
-            state.consciousness_level = "alert"
-            state.pain_level = 0.0
-            state.work_load = 0.0  # 初始无工作负荷
-            state.consecutive_work_minutes = 0
-            state.patients_served_today = 0
-            state.last_rest_time = self.current_time
-            # 清除默认症状（医护人员健康）
-            state.symptoms.clear()
-            # 清除生命体征（医护人员不需要监测）
-            state.vital_signs.clear()
-            self.physical_states[agent_id] = state
-        
         # 记录添加成功日志
         self._log_event("add_agent", {
             "agent_id": agent_id,
@@ -1804,22 +1762,6 @@ class HospitalWorld:
             - type: 事件类型 ('move', 'device', 'conversation')
             - details: 事件详情
         """
-        # ===== 优先使用时间管理器的时间线 =====
-        timeline_obj = self.time_manager.get_patient_timeline(agent_id)
-        if timeline_obj:
-            # 打印详细的时间线报告
-            import logging
-            logger = logging.getLogger('hospital_agent.world')
-            logger.info(timeline_obj.generate_report())
-            
-            # 返回事件列表（用于兼容旧代码）
-            return [{
-                "time": event.timestamp.strftime("%H:%M:%S"),
-                "type": event.event_type.value,
-                "details": f"{event.event_type.value} - {event.resource_type or ''} {event.resource_id or ''} @ {event.location or ''}"
-            } for event in timeline_obj.events]
-        
-        # ===== 如果时间管理器没有记录，回退到旧的日志系统 =====
         timeline = []
         
         # 收集移动记录
@@ -2071,23 +2013,6 @@ class HospitalWorld:
                 self.doctor_pool[dept][best_doctor]['current_patient'] = patient_id
                 self.doctor_pool[dept][best_doctor]['daily_patients'] += 1
                 
-                # ===== 时间管理：记录就诊开始事件 =====
-                consultation_duration = 15  # 预计就诊时间
-                success, error_msg = self.time_manager.allocate_resource(
-                    patient_id=patient_id,
-                    resource_id=best_doctor,
-                    resource_type="doctor",
-                    duration_minutes=consultation_duration,
-                    location=dept,
-                    event_type=EventType.CONSULTATION_START,
-                    metadata={"dept": dept, "priority": priority}
-                )
-                
-                if not success:
-                    import logging
-                    logger = logging.getLogger('hospital_agent.world')
-                    logger.warning(f"⚠️ 医生分配时间冲突：{error_msg}")
-                
                 # 医生分配成功（日志由协调器统一输出）
                 return best_doctor, 0
             
@@ -2095,18 +2020,6 @@ class HospitalWorld:
             queue_entry = QueueEntry(patient_id=patient_id, priority=priority, enqueue_time=self.current_time)
             self.doctor_pool[dept][best_doctor]['queue'].append(queue_entry)
             self.doctor_pool[dept][best_doctor]['queue'].sort()
-            
-            # ===== 时间管理：记录排队事件 =====
-            self.time_manager.record_event(TimeEvent(
-                event_type=EventType.RESOURCE_QUEUED,
-                timestamp=self.current_time,
-                patient_id=patient_id,
-                resource_id=best_doctor,
-                resource_type="doctor",
-                location=dept,
-                metadata={"queue_position": len(self.doctor_pool[dept][best_doctor]['queue']), 
-                         "estimated_wait": int(min_wait_time)}
-            ))
             
             # 医生忙碌，加入队列（日志由协调器统一输出）
             return best_doctor, int(min_wait_time)
@@ -2257,9 +2170,9 @@ class HospitalWorld:
                 busy_count = len([eq for eq in all_same_type if eq.is_occupied])
                 total_count = len(all_same_type)
                 
-                # 精简设备分配输出
+                # 设备分配信息仅写入 debug 日志（终端不展示，由患者详细日志单独记录）
                 patient_display = f"P{dataset_id}" if dataset_id is not None else patient_id
-                logger.info(f"[{patient_display}] ✅ 设备分配: {best_equipment.name} ({duration}分钟)")
+                logger.debug(f"[{patient_display}] ✅ 设备分配: {best_equipment.name} ({duration}分钟)")
                 
                 return best_equipment.id, 0
             

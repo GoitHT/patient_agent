@@ -16,6 +16,14 @@ os.environ['TRANSFORMERS_OFFLINE'] = '1'
 # 禁用不必要的警告
 logging.getLogger("chromadb").setLevel(logging.ERROR)
 
+# 导入患者历史CSV存储模块
+try:
+    from .patient_history_csv import get_patient_history_csv
+    PATIENT_CSV_AVAILABLE = True
+except ImportError:
+    PATIENT_CSV_AVAILABLE = False
+    logging.warning("⚠️  PatientHistoryCSV 模块未找到")
+
 
 class QueryType(Enum):
     """查询类型（用于分层检索）"""
@@ -307,7 +315,7 @@ class EnhancedRAGRetriever:
         diagnosis: str = None,
         treatment: str = None
     ):
-        """更新患者历史记忆库
+        """更新患者历史记忆库 - 使用CSV文件存储
         
         Args:
             patient_id: 患者 ID
@@ -315,40 +323,41 @@ class EnhancedRAGRetriever:
             diagnosis: 诊断结果（可选）
             treatment: 治疗方案（可选）
         """
+        if not PATIENT_CSV_AVAILABLE:
+            self._logger.warning("⚠️  患者历史CSV模块不可用，无法更新历史")
+            return
+        
         try:
-            from langchain_chroma import Chroma
-            from langchain_core.documents import Document
+            # 获取CSV管理器
+            csv_storage_path = self.spllm_root.parent / "patient_history_csv"
+            csv_manager = get_patient_history_csv(csv_storage_path)
             
-            retriever = self._get_retriever()
-            if hasattr(retriever, '_init_embeddings'):
-                retriever._init_embeddings()
-            
-            db_path = self.spllm_root / "chroma" / "UserHistory_db"
-            db = Chroma(
-                persist_directory=str(db_path),
-                embedding_function=retriever._embeddings,
-                collection_metadata={"hnsw:space": "cosine"}
-            )
-            
-            # 构建摘要文档
+            # 构建摘要文本
             summary_text = f"患者 {patient_id} 就诊记录：\n{dialogue_summary}"
+            answer_text = ""
             if diagnosis:
-                summary_text += f"\n诊断：{diagnosis}"
+                answer_text += f"诊断：{diagnosis}\n"
             if treatment:
-                summary_text += f"\n治疗：{treatment}"
+                answer_text += f"治疗：{treatment}"
             
-            doc = Document(
-                page_content=summary_text,
-                metadata={
-                    "patient_id": patient_id,
-                    "type": "dialogue_summary",
-                    "diagnosis": diagnosis or "",
-                    "treatment": treatment or ""
-                }
+            # 存储为CSV记录
+            metadata = {
+                "type": "dialogue_summary",
+                "diagnosis": diagnosis or "",
+                "treatment": treatment or ""
+            }
+            
+            success = csv_manager.store_conversation(
+                patient_id=patient_id,
+                question=dialogue_summary,
+                answer=answer_text or "（无诊断信息）",
+                metadata=metadata
             )
             
-            db.add_documents([doc])
-            self._logger.info(f"✅ 患者 {patient_id} 历史记忆已更新")
+            if success:
+                self._logger.info(f"✅ 患者 {patient_id} 历史记忆已更新到CSV")
+            else:
+                self._logger.warning(f"⚠️  患者 {patient_id} 历史记忆更新失败")
         
         except Exception as e:
             self._logger.error(f"❌ 更新历史记忆失败: {e}")
@@ -382,6 +391,7 @@ class EnhancedRAGRetriever:
             db = Chroma(
                 persist_directory=str(db_path),
                 embedding_function=retriever._embeddings,
+                collection_name="HighQualityQA",
                 collection_metadata={"hnsw:space": "cosine"}
             )
             

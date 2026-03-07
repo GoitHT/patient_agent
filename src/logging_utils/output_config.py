@@ -15,6 +15,12 @@
 
 import logging
 
+# ========== 输出级别语义常量 ==========
+LEVEL_SILENT  = 0  # 静默（不显示）
+LEVEL_MINIMAL = 1  # 最简（仅显示节点名称）
+LEVEL_BRIEF   = 2  # 简洁（节点 + 关键状态）
+LEVEL_VERBOSE = 3  # 详细（所有信息）
+
 # ========== 全局设置 ==========
 # 推荐值：0（完全静默）或 1（仅节点名称）
 DEFAULT_OUTPUT_LEVEL = 0  # 默认静默，所有详细信息在患者日志文件中
@@ -32,32 +38,15 @@ MODULE_OUTPUT_LEVELS = {
 }
 
 # ========== 节点级别设置 ==========
-# 可以为特定节点设置不同的输出级别
-NODE_OUTPUT_LEVELS = {
-    # === 通用流程节点 ===
-    "C1": 2,  # 开始 - 详细输出
-    "C2": 2,  # 预约挂号 - 详细输出
-    "C3": 2,  # 签到候诊 - 详细输出
-    "C4": 2,  # 叫号入诊 - 详细输出
-    "C5": 2,  # 问诊准备 - 详细输出
-    "C6": 2,  # 专科流程调度 - 详细输出
-    "C7": 2,  # 路径决策 - 详细输出
-    "C8": 2,  # 开单说明 - 详细输出
-    "C9": 2,  # 缴费预约 - 详细输出
-    "C10": 2,  # 执行检查并增强报告 - 详细输出
-    "C11": 2,  # 复诊查看报告 - 详细输出
-    "C12": 2,  # 综合分析诊断 - 详细输出
-    "C13": 2,  # 治疗方案 - 详细输出
-    "C14": 2,  # 文书记录 - 详细输出
-    "C15": 2,  # 患者宣教 - 详细输出
-    "C16": 2,  # 结束 - 详细输出
-    
-    # === 专科节点 ===
-    "S4": 2,  # 专科问诊 - 详细输出
-    "S5": 2,  # 体格检查 - 详细输出
-    "S6": 2,  # 初步判断 - 详细输出
-    "S7": 2,  # 其他专科节点 - 详细输出（如果存在）
-}
+# 可以为特定节点设置不同的输出级别（默认所有节点为 LEVEL_BRIEF=2）
+_ALL_NODES = [
+    # 通用流程节点
+    "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8",
+    "C9", "C10", "C11", "C12", "C13", "C14", "C15", "C16",
+    # 专科节点
+    "S4", "S5", "S6", "S7",
+]
+NODE_OUTPUT_LEVELS: dict[str, int] = dict.fromkeys(_ALL_NODES, LEVEL_BRIEF)
 
 
 def get_output_level(module_name: str = "", node_name: str = "") -> int:
@@ -72,13 +61,11 @@ def get_output_level(module_name: str = "", node_name: str = "") -> int:
         输出级别 (0-3)
     """
     # 优先级：节点级别 > 模块级别 > 全局级别
-    if node_name and node_name in NODE_OUTPUT_LEVELS:
-        return NODE_OUTPUT_LEVELS[node_name]
-    
-    if module_name and module_name in MODULE_OUTPUT_LEVELS:
-        return MODULE_OUTPUT_LEVELS[module_name]
-    
-    return DEFAULT_OUTPUT_LEVEL
+    return (
+        NODE_OUTPUT_LEVELS.get(node_name)
+        or MODULE_OUTPUT_LEVELS.get(module_name)
+        or DEFAULT_OUTPUT_LEVEL
+    )
 
 
 def should_log(level_required: int, module_name: str = "", node_name: str = "") -> bool:
@@ -98,7 +85,7 @@ def should_log(level_required: int, module_name: str = "", node_name: str = "") 
 
 
 # ========== Logger过滤器 ==========
-class OutputFilter(object):
+class OutputFilter(logging.Filter):
     """
     日志过滤器 - 用于抑制common_opd_graph和specialty_subgraph中未被should_log包装的logger.info
     
@@ -111,27 +98,27 @@ class OutputFilter(object):
            logger.addFilter(OutputFilter("specialty_subgraph"))
     """
     def __init__(self, module_name: str):
+        super().__init__()
         self.module_name = module_name
-    
-    def filter(self, record):
+
+    def filter(self, record) -> bool:
         """
-        过滤日志记录
-        只允许以下日志通过：
-        1. ERROR/WARNING级别的日志
-        2. 来自langgraph_multi_patient_processor的日志
-        3. 已经被should_log检查过的日志（通过特殊标记）
+        过滤日志记录，只允许以下日志通过：
+        1. SUPPRESS_UNCHECKED_LOGS=False 时放行所有日志
+        2. ERROR/WARNING 及以上级别的日志
+        3. 来自 langgraph_multi_patient 执行器的日志
         """
-        # 允许ERROR和WARNING级别的日志
-        if record.levelno >= logging.WARNING:
-            return True
-        
-        # 如果是来自患者执行器的日志，允许通过
-        if "langgraph_multi_patient" in record.name:
-            return True
-        
-        # 如果SUPPRESS_UNCHECKED_LOGS为False，允许所有日志
+        # 若未启用抑制，放行所有日志
         if not SUPPRESS_UNCHECKED_LOGS:
             return True
-        
-        # 否则抑制该日志（common_opd_graph中未被should_log包装的日志）
+
+        # 允许 WARNING/ERROR 级别的日志
+        if record.levelno >= logging.WARNING:
+            return True
+
+        # 允许来自患者执行器的日志
+        if "langgraph_multi_patient" in record.name:
+            return True
+
+        # 抑制其余未经 should_log 包装的日志
         return False

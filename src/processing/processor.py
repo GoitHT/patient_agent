@@ -20,7 +20,7 @@ from agents import PatientAgent, DoctorAgent, NurseAgent, LabAgent
 from environment import HospitalWorld
 from graphs.router import build_common_graph, build_dept_subgraphs, build_services
 from coordination import HospitalCoordinator, PatientStatus
-from loaders import load_diagnosis_arena_case
+from loaders import load_diagnosis_arena_case, _build_case_info_text
 from logging_utils import create_patient_detail_logger, close_patient_detail_logger, get_patient_detail_logger
 from rag import AdaptiveRAGRetriever
 from services.llm_client import LLMClient
@@ -157,76 +157,35 @@ class LangGraphPatientExecutor:
             "timeslot": timeslot
         }
     
-    def _extract_patient_info_from_case(self, case_info: str, case_data: dict) -> dict:
+    def _extract_patient_info_from_case(self, case_data: dict) -> dict:
         """
-        从病例文本中提取患者基本信息（姓名、年龄、性别）
+        从新结构化字段中提取患者基本信息（姓名、年龄、性别）
         
         Args:
-            case_info: 病例文本信息
-            case_data: 原始病例数据
+            case_data: 原始病例数据（from known_case）
         
         Returns:
             包含 name, age, gender 的字典
         """
-        import re
+        # ---- 仅从新结构化字段获取 ----
+        name: Any = case_data.get("姓名") or case_data.get("name") or case_data.get("patient_name")
+        # 年龄字段可能是字符串（如 "45岁" 或 "45"）
+        _age_raw = case_data.get("年龄") or case_data.get("age")
+        if _age_raw:
+            _age_str = str(_age_raw).replace("岁", "").strip()
+            try:
+                age: Any = int(_age_str)
+            except ValueError:
+                age = None
+        else:
+            age = None
+        gender: Any = case_data.get("性别") or case_data.get("gender") or case_data.get("sex")
         
-        # 优先从 case_data 字段中获取
-        name = case_data.get("name") or case_data.get("patient_name")
-        age = case_data.get("age")
-        gender = case_data.get("gender") or case_data.get("sex")
-        
-        # 如果 case_data 中没有，尝试从文本中解析
-        if not name or not age or not gender:
-            # 模式1: "患者，女性，45岁" 或 "患者，男，60岁"
-            pattern1 = r'患者[，,]\s*([男女])[性]?[，,]\s*(\d+)岁'
-            match1 = re.search(pattern1, case_info)
-            if match1:
-                if not gender:
-                    gender = match1.group(1)
-                if not age:
-                    age = int(match1.group(2))
-            
-            # 模式2: "姓名：张三" "年龄：50" "性别：男"
-            if not name:
-                name_match = re.search(r'姓名[：:]\s*([^，,\s]+)', case_info)
-                if name_match:
-                    name = name_match.group(1)
-            
-            if not age:
-                age_match = re.search(r'年龄[：:]\s*(\d+)', case_info)
-                if age_match:
-                    age = int(age_match.group(1))
-            
-            if not gender:
-                gender_match = re.search(r'性别[：:]\s*([男女])', case_info)
-                if gender_match:
-                    gender = gender_match.group(1)
-            
-            # 模式3: "45岁女性" 或 "60岁男性患者"
-            if not age or not gender:
-                pattern3 = r'(\d+)岁([男女])性'
-                match3 = re.search(pattern3, case_info)
-                if match3:
-                    if not age:
-                        age = int(match3.group(1))
-                    if not gender:
-                        gender = match3.group(2)
-        
-        # 如果仍然没有提取到，使用合理的默认值
+        # 缺失值填充
         if not name:
             name = f"患者{self.patient_id}"
         if not age or age == 0:
-            # 尝试提取任何年龄数字（作为最后手段）
-            age_match = re.search(r'(\d{1,3})岁', case_info)
-            if age_match:
-                extracted_age = int(age_match.group(1))
-                # 合理性检查：年龄应该在 0-120 之间
-                if 0 < extracted_age <= 120:
-                    age = extracted_age
-                else:
-                    age = 0  # 不合理的年龄，保持为0
-            else:
-                age = 0
+            age = 0
         if not gender:
             gender = "未知"
         
@@ -303,10 +262,15 @@ class LangGraphPatientExecutor:
             patient_hash = hash(str(self.case_id)) % 5
             fg_color, bg_color = Colors.get_patient_color(patient_hash)
             
-            # 终端显示简洁的开始信息
+            # 终端显示开始信息
             patient_tag = f"{bg_color} P{self.case_id} {Colors.RESET}"
-            
-            self.logger.info(f"{fg_color}▶ {patient_tag} 就诊开始{Colors.RESET}")
+            priority_icon = "🚨" if self.priority >= 9 else "⚠️" if self.priority >= 7 else "📋"
+            self.logger.info(
+                f"{fg_color}▶ {patient_tag} 就诊开始 | "
+                f"患者ID: {self.patient_id} | "
+                f"科室: {self.dept} | "
+                f"{priority_icon} 优先级: P{self.priority}{Colors.RESET}"
+            )
             
             # 记录开始时间
             import time
@@ -327,21 +291,51 @@ class LangGraphPatientExecutor:
             case_bundle = load_diagnosis_arena_case(self.case_id)
             known_case = case_bundle["known_case"]
             ground_truth = case_bundle["ground_truth"]
+            medical_data = case_bundle["medical_data"]      # 患者不可见：体格检查 + 辅助检查
+            _ref_full_case = case_bundle["full_case"]       # Excel原始完整数据（仅用于日志参考）
+
+            # 新版结构化字段日志输出（兼容旧版）
+            basic_info_parts = []
+            for label in ["姓名", "性别", "年龄", "民族", "职业", "病史陈述者"]:
+                value = str(known_case.get(label, "")).strip()
+                if value:
+                    basic_info_parts.append(f"{label}: {value}")
+            if basic_info_parts:
+                self.detail_logger.info(f"👤 基本信息: {' | '.join(basic_info_parts)}")
+
+            # 现病史结构化摘要
+            present_illness_items = []
+            for label in ["现病史_详细描述", "现病史_起病情况", "现病史_病程", "现病史_病情发展"]:
+                value = str(known_case.get(label, "")).strip()
+                if value:
+                    present_illness_items.append(f"{label.replace('现病史_', '')}: {value}")
+            if present_illness_items:
+                self.detail_logger.info("🩺 现病史摘要:")
+                for item in present_illness_items:
+                    self.detail_logger.info(f"    {item}")
+
+            # 既往史/个人史/家族史结构化摘要（仅展示非空字段）
+            history_items = []
+            for label in [
+                "既往史_疾病史", "既往史_手术史", "既往史_过敏史",
+                "个人史_饮酒史", "个人史_抽烟史", "个人史_月经史",
+                "婚育史", "家族史_疾病"
+            ]:
+                value = str(known_case.get(label, "")).strip()
+                if value:
+                    history_items.append(f"{label}: {value}")
+            if history_items:
+                self.detail_logger.info("📚 病史要点:")
+                for item in history_items[:6]:
+                    self.detail_logger.info(f"    {item}")
+                if len(history_items) > 6:
+                    self.detail_logger.info(f"    ... 还有 {len(history_items) - 6} 项")
             
             # 提取原始主诉
-            case_info = known_case.get("Case Information", "")
-            if "主诉：" in case_info:
-                start_idx = case_info.find("主诉：") + 3
-                remaining = case_info[start_idx:]
-                end_markers = ["现病史：", "既往史：", "个人史：", "家族史：", "体格检查：", "\n\n"]
-                end_idx = len(remaining)
-                for marker in end_markers:
-                    pos = remaining.find(marker)
-                    if pos != -1 and pos < end_idx:
-                        end_idx = pos
-                original_chief_complaint = remaining[:end_idx].strip()
-            else:
-                original_chief_complaint = case_info[:200].strip()
+            case_info = _build_case_info_text(known_case)
+            original_chief_complaint = str(known_case.get("主诉", "")).strip()
+            if not original_chief_complaint:
+                raise ValueError("病例缺少新字段'主诉'，无法继续问诊流程")
             
             # 详细日志中记录完整病例信息
             # 处理原始主诉的显示
@@ -350,13 +344,14 @@ class LangGraphPatientExecutor:
                 formatted_complaint = formatted_complaint[:300] + "..."
             self.detail_logger.info(f"📋 原始主诉:\n    {formatted_complaint}")
             
-            # 参考诊断
-            if ground_truth.get('diagnosis'):
-                self.detail_logger.info(f"\n🎯 参考诊断: {ground_truth['diagnosis']}")
+            # 参考诊断（仅新字段）
+            ref_diagnosis = ground_truth.get('初步诊断', '')
+            if ref_diagnosis:
+                self.detail_logger.info(f"\n🎯 参考诊断: {ref_diagnosis}")
             
-            # 参考治疗方案 - 改进格式化
-            if ground_truth.get('treatment_plan'):
-                treatment_plan = ground_truth['treatment_plan']
+            # 参考治疗方案（来自 Excel 原始数据，仅用于初始日志输出。实际治疗内容将由 LLM 生成后写入数据库）
+            if _ref_full_case.get('治疗原则'):
+                treatment_plan = _ref_full_case.get('治疗原则', '')
                 # 处理转义的换行符
                 treatment_plan = treatment_plan.replace('\\n', '\n    ')
                 # 智能截断
@@ -367,11 +362,27 @@ class LangGraphPatientExecutor:
                         truncate_pos = 250
                     treatment_plan = treatment_plan[:truncate_pos+1] + "..."
                 self.detail_logger.info(f"\n💡 参考治疗方案:\n    {treatment_plan}")
+
+            # 参考辅助检查（来自 medical_data，患者不可见）
+            auxiliary_exam = str(medical_data.get('辅助检查', '')).strip()
+            if auxiliary_exam:
+                display_aux = auxiliary_exam.replace('\\n', '\n    ')
+                if len(display_aux) > 250:
+                    display_aux = display_aux[:250] + "..."
+                self.detail_logger.info(f"\n🔬 参考辅助检查:\n    {display_aux}")
+
+            # 参考医患问答（坥自 Excel 原始数据，不属于 ground_truth 评估字段）
+            qa_ref_q = str(_ref_full_case.get('医患问答参考_问', '')).strip()
+            qa_ref_a = str(_ref_full_case.get('医患问答参考_答', '')).strip()
+            if qa_ref_q or qa_ref_a:
+                self.detail_logger.info("\n💬 医患问答参考:")
+                if qa_ref_q:
+                    show_q = qa_ref_q if len(qa_ref_q) <= 120 else qa_ref_q[:120] + "..."
+                    self.detail_logger.info(f"    问: {show_q}")
+                if qa_ref_a:
+                    show_a = qa_ref_a if len(qa_ref_a) <= 160 else qa_ref_a[:160] + "..."
+                    self.detail_logger.info(f"    答: {show_a}")
             
-            # 建议检查
-            if ground_truth.get('recommended_tests'):
-                self.detail_logger.info(f"\n🔬 建议检查: {', '.join(ground_truth['recommended_tests'])}")
-            self.detail_logger.info("")
             
             # 2. 使用共享物理环境
             world = self.world  # 使用传入的共享 world
@@ -392,6 +403,7 @@ class LangGraphPatientExecutor:
                 chief_complaint="",
                 case_data=known_case,
                 ground_truth=ground_truth,
+                medical_data=medical_data,
                 patient_id=self.patient_id,
                 current_location="lobby",
                 agent_config={
@@ -413,7 +425,7 @@ class LangGraphPatientExecutor:
             state.doctor_agents = self.doctor_agents
             
             # 准备患者基本信息（从病例文本中智能提取）
-            extracted_info = self._extract_patient_info_from_case(case_info, state.case_data)
+            extracted_info = self._extract_patient_info_from_case(state.case_data)
             patient_profile = {
                 "name": extracted_info["name"],
                 "age": extracted_info["age"],
@@ -421,6 +433,7 @@ class LangGraphPatientExecutor:
                 "case_id": self.case_id,
                 "dataset_id": state.case_data.get("dataset_id"),
                 "run_id": run_id,
+                "case_data": state.case_data,  # 传递结构化病例字段给数据库层
             }
             
             # 更新state.patient_profile以包含提取的患者信息
@@ -430,18 +443,8 @@ class LangGraphPatientExecutor:
                 "gender": extracted_info["gender"],
             })
             
-            # 获取已创建的病例（在 coordinator.register_patient 时已创建）
-            existing_record = self.medical_record_service.get_record(self.patient_id)
-            if existing_record:
-                record_id = existing_record.record_id
-                self.detail_logger.info(f"✅ 使用已创建的病例: {record_id}")
-            else:
-                # 容错：如果病例不存在（不应发生），则创建
-                record_id = medical_record_integration.on_patient_entry(self.patient_id, patient_profile)
-                self.detail_logger.warning(f"⚠️  病例不存在，已创建新病例: {record_id}")
-            
             # 详细日志记录病例和患者信息（合并为一行，减少重复）
-            self.detail_logger.info(f"\n👤 患者信息: {extracted_info['name']}, {extracted_info['age']}岁, {extracted_info['gender']} | 病例ID: {record_id}")
+            self.detail_logger.info(f"\n👤 患者信息: {extracted_info['name']}, {extracted_info['age']}岁, {extracted_info['gender']}")
             self.detail_logger.info(f"📅 预约信息: {appointment_info['channel']}预约 | 就诊时段: {appointment_info['timeslot']}")
             self.detail_logger.info("")  # 空行分隔
             
@@ -459,77 +462,49 @@ class LangGraphPatientExecutor:
             
             # ===== 5. 执行护士分诊 =====
             nurse_agent = self.nurse_agent
-            
+            dept_cn_names = {"neurology": "神经内科"}
+
             self.detail_logger.section("护士分诊")
-            # 记录分诊护士信息
-            nurse_id = "nurse_001"
-            nurse_name = "分诊护士"
-            self.detail_logger.staff_info("分诊护士", nurse_id, nurse_name)
+            self.detail_logger.staff_info("护士", "nurse_001", "护士")
             world.move_agent(self.patient_id, "triage")
-            
+
             patient_description = patient_agent.describe_to_nurse()
-            
-            
-            # 调用分诊（使用LLM判断）
-            triaged_dept = nurse_agent.triage(
-                patient_description=patient_description
-            )
-            
-            # 更新科室和 run_id
+            triaged_dept = nurse_agent.triage(patient_description=patient_description)
+
+            # 更新科室、run_id 及病历会话
             state.dept = triaged_dept
             run_id = make_run_id(triaged_dept)
             state.run_id = run_id
-            # 患者的详细描述保存到present_illness，chief_complaint留给医生总结
+            patient_profile["run_id"] = run_id
+
+            record_id = medical_record_integration.on_patient_entry(self.patient_id, patient_profile)
             state.history["present_illness"] = patient_description
             state.chief_complaint = ""  # 留空，等待医生总结
-            
+
+            # 获取分诊摘要及理由
             triage_summary = nurse_agent.get_triage_summary()
             state.agent_interactions["nurse_triage"] = triage_summary
-            
-            # 从分诊历史中获取分诊理由
             triage_reason = ""
             if triage_summary.get("history"):
-                latest_triage = triage_summary["history"][-1]
-                triage_reason = latest_triage.get("reason", "")
-                # 详细日志：记录分诊理由
-                self.detail_logger.info(f"LLM分诊分析: {triage_reason}")
-            
+                triage_reason = triage_summary["history"][-1].get("reason", "")
+
             if state.medical_record_integration:
                 state.medical_record_integration.on_triage(
-                    state, 
-                    nurse_id="nurse_001",
-                    nurse_name="分诊护士"
+                    state, nurse_id="nurse_001", nurse_name="护士"
                 )
-            
-            # 终端显示分诊结果
-            dept_cn_names = {
-                "neurology": "神经内科",
-                "cardiology": "心内科",
-                "gastroenterology": "消化内科",
-                "respiratory": "呼吸内科",
-                "endocrinology": "内分泌科"
-            }
+
+            # 终端简要显示
             dept_display = dept_cn_names.get(triaged_dept, triaged_dept)
             self.logger.info(f"{fg_color}├ {patient_tag} 分诊→{dept_display}{Colors.RESET}")
-            
-            # 详细日志记录分诊信息
-            self.detail_logger.info("")
-            self.detail_logger.info("📋 患者主诉:")
-            self.detail_logger.info(f"    {patient_description}")
-            self.detail_logger.info("")
-            self.detail_logger.info("✅ 分诊结果:")
-            dept_name_map = {
-                'neurology': '神经内科',
-                'cardiology': '心内科',
-                'gastroenterology': '消化内科',
-                'respiratory': '呼吸内科',
-                'endocrinology': '内分泌科'
-            }
-            self.detail_logger.info(f"    科室代码: {triaged_dept}")
-            self.detail_logger.info(f"    科室名称: {dept_name_map.get(triaged_dept, triaged_dept)}")
+
+            # 详细日志
+            self.detail_logger.info(f"📋 患者主诉:\n    {patient_description}\n")
+            self.detail_logger.info(
+                f"✅ 就诊会话已创建，病例ID: {record_id} | 科室: {triaged_dept}({dept_display})"
+            )
             if triage_reason:
                 self.detail_logger.info(f"    分诊理由: {triage_reason}")
-            
+
             # ===== 6. 通过 Coordinator 注册患者 =====
             
             # 准备患者数据（复用已提取的信息）
@@ -572,13 +547,6 @@ class LangGraphPatientExecutor:
             self.detail_logger.info(f"    流程图: {state.dept}_specialty_graph")
             self.detail_logger.info(f"    配置参数: max_questions={self.max_questions}, use_agents=True")
             
-            # 创建患者专属的 PatientAgent
-            patient_agent = PatientAgent(
-                known_case=state.case_data,
-                llm=self.llm,
-                chief_complaint=original_chief_complaint
-            )
-            
             # 注入 patient_agent 到 state
             state.patient_agent = patient_agent
             
@@ -609,15 +577,20 @@ class LangGraphPatientExecutor:
             # 8. 执行 LangGraph 流程
             self.logger.info(f"{fg_color}🏥 {patient_tag} {fg_color}| 门诊流程开始{Colors.RESET}")
             
+            # 记录流程开始时的模拟世界时钟，作为最终兜底用于计算就诊时长
+            _world_start_time = self.world.current_time if self.world else None
+            
             self.detail_logger.section("执行门诊流程")
             self.detail_logger.info("🔄 开始执行 LangGraph 工作流...")
             self.detail_logger.info("")
             
             node_count = 0
             node_names = []  # 记录节点名称
+            node_time_map: dict = {}  # 记录每个节点完成时的模拟时钟 HH:MM
             out = None
             final_state = state  # 保存最终状态，初始为输入状态
             last_diagnosis_state = None  # 记录最近一次产生诊断的状态
+            last_simulated_minutes = None  # 追踪最新的模拟就诊时长
             
             for chunk in graph.stream(state):
                 node_count += 1
@@ -625,6 +598,9 @@ class LangGraphPatientExecutor:
                     node_name = list(chunk.keys())[0]
                     node_names.append(node_name)
                     out = chunk[node_name]
+                    # 记录该节点完成时的模拟时钟（节点内部已推进完毕）
+                    if self.world:
+                        node_time_map[node_name] = self.world.current_time.strftime('%H:%M')
                     
                     # 更新最终状态（接受BaseState或字典类型）
                     if isinstance(out, BaseState):
@@ -633,6 +609,11 @@ class LangGraphPatientExecutor:
                         # 跟踪最近有诊断的状态
                         if isinstance(out.diagnosis, dict) and out.diagnosis.get("name"):
                             last_diagnosis_state = out
+                        # 追踪模拟就诊时长（防止后续节点更新覆盖丢失）
+                        if hasattr(out, 'appointment') and isinstance(out.appointment, dict):
+                            val = out.appointment.get('simulated_duration_minutes')
+                            if val is not None:
+                                last_simulated_minutes = val
                     elif isinstance(out, dict):
                         # 【修复】LangGraph可能返回字典而非Pydantic对象
                         # 尝试将字典转换为BaseState
@@ -642,9 +623,19 @@ class LangGraphPatientExecutor:
                             # 跟踪最近有诊断的状态
                             if isinstance(final_state.diagnosis, dict) and final_state.diagnosis.get("name"):
                                 last_diagnosis_state = final_state
+                            # 追踪模拟就诊时长
+                            if isinstance(final_state.appointment, dict):
+                                val = final_state.appointment.get('simulated_duration_minutes')
+                                if val is not None:
+                                    last_simulated_minutes = val
                         except Exception as e:
                             if node_name in ["C12", "C13", "C14", "C15", "C16"]:
                                 self.detail_logger.warning(f"⚠️  [{node_name}] 从字典转换为BaseState失败: {e}")
+                        # 即使转换失败，也尝试从字典直接提取
+                        if isinstance(out, dict) and isinstance(out.get('appointment'), dict):
+                            val = out['appointment'].get('simulated_duration_minutes')
+                            if val is not None:
+                                last_simulated_minutes = val
                     
                     # 详细日志记录每个节点的执行
                     self.detail_logger.info(f"{'─'*80}")
@@ -692,10 +683,27 @@ class LangGraphPatientExecutor:
             import time
             program_execution_time = time.time() - start_time if 'start_time' in locals() else 0
             
-            # 获取患者就诊时间（如果有）
-            simulated_minutes = None
-            if final_state and hasattr(final_state, 'appointment'):
+            # 获取患者就诊时间（优先使用循环中追踪到的最新值，防止被后续节点覆盖丢失）
+            simulated_minutes = last_simulated_minutes
+            if simulated_minutes is None and final_state and hasattr(final_state, 'appointment'):
                 simulated_minutes = final_state.appointment.get('simulated_duration_minutes')
+            # 兜底：直接通过物理世界时钟和预约开始时间计算
+            if simulated_minutes is None and self.world is not None:
+                visit_start_str = None
+                if final_state and hasattr(final_state, 'appointment'):
+                    visit_start_str = final_state.appointment.get('visit_start_time')
+                if visit_start_str is None and hasattr(state, 'appointment'):
+                    visit_start_str = state.appointment.get('visit_start_time')
+                if visit_start_str:
+                    try:
+                        import datetime as _dt
+                        visit_start = _dt.datetime.fromisoformat(visit_start_str)
+                        simulated_minutes = (self.world.current_time - visit_start).total_seconds() / 60
+                    except Exception:
+                        pass
+            # 最终兜底：用流程开始前记录的世界时钟起点计算
+            if simulated_minutes is None and _world_start_time is not None and self.world is not None:
+                simulated_minutes = (self.world.current_time - _world_start_time).total_seconds() / 60
             
             # 用于终端简要显示
             total_time_seconds = simulated_minutes * 60 if simulated_minutes else program_execution_time
@@ -849,7 +857,169 @@ class LangGraphPatientExecutor:
             if hasattr(out, 'test_results'):
                 self.detail_logger.info(f"📊 完成检查: {len(out.test_results)}项")
             self.detail_logger.info("")
-            
+
+            # ─── 就诊时间线 ──────────────────────────────────────────────────────
+            self.detail_logger.section("就诊时间线")
+            _node_zh = {
+                "C1": "开始就诊", "C2": "挂号登记", "C3": "候诊签到",
+                "C4": "呼叫就诊", "C5": "问诊准备", "C6": "专科接诊",
+                "C7": "路径决策", "C8": "开具检查", "C9": "缴费预约",
+                "C10": "执行检查", "C11": "复诊回诊", "C12": "综合诊断",
+                "C13": "制定方案", "C14": "开具文书", "C15": "健康教育",
+                "C16": "完成就诊",
+                # 专科子图节点（通过C6调用，一般不直接出现）
+                "S4": "专科问诊", "S5": "体格检查", "S6": "初步判断",
+            }
+            _node_desc = {
+                "C1": "患者入院，初始化就诊流程",
+                "C2": "完成预约挂号，生成就诊序号",
+                "C3": "签到并进入候诊队列",
+                "C4": "被呼叫进入诊室",
+                "C5": "医生准备，阅读病历",
+                "C6": "专科问诊+体检+初步判断",
+                "C7": "判断是否需要辅助检查",
+                "C8": "向患者解释检查项目",
+                "C9": "缴费并预约检查时段",
+                "C10": "前往各科室完成检查",
+                "C11": "携带报告返回诊室",
+                "C12": "结合检查结果综合诊断",
+                "C13": "制定诊疗处置方案",
+                "C14": "开具处方/检查单/住院证",
+                "C15": "健康宣教及随访安排",
+                "C16": "办理离院，结束就诊",
+            }
+            _movements = (
+                (final_state.movement_history or [])
+                if (final_state and hasattr(final_state, 'movement_history'))
+                else []
+            )
+            # 就诊基准时间（分钟数）
+            _base_min: Optional[int] = None
+            if final_state and hasattr(final_state, 'appointment') and isinstance(final_state.appointment, dict):
+                _vst_str = final_state.appointment.get('visit_start_time')
+                if _vst_str:
+                    try:
+                        _vst_dt = datetime.fromisoformat(_vst_str)
+                        _base_min = _vst_dt.hour * 60 + _vst_dt.minute
+                    except Exception:
+                        pass
+
+            def _hhmm_to_min(s: str) -> Optional[int]:
+                try:
+                    h, m = map(int, str(s).split(':'))
+                    return h * 60 + m
+                except Exception:
+                    return None
+
+            # 构建 node -> movement list 映射
+            _move_by_node: dict = {}
+            for _mv in _movements:
+                _mn = _mv.get('node', '')
+                _move_by_node.setdefault(_mn, []).append(_mv)
+
+            # 构建统一事件列表：movement nodes 使用移动记录时间，in-place nodes 使用 node_time_map
+            _cur_loc = "入院"
+            _timeline_events = []
+            # 读取专科子图各节点完成时钟（由子图节点写入 appointment）
+            _appt_times = (
+                final_state.appointment
+                if (final_state and hasattr(final_state, 'appointment') and isinstance(final_state.appointment, dict))
+                else {}
+            )
+            _subgraph_times = {
+                'S4': _appt_times.get('_s4_end_time'),
+                'S5': _appt_times.get('_s5_end_time'),
+                'S6': _appt_times.get('_s6_end_time'),
+            }
+            # S4/S5/S6 节点描述
+            _subgraph_meta = {
+                'S4': ('专科问诊', '多轮医患对话，问诊+质量评估'),
+                'S5': ('体格检查', '体征采集，生命体征+专科查体'),
+                'S6': ('初步判断', '综合分析，决定是否需要辅助检查'),
+            }
+            for _nd in node_names:
+                _lbl  = _node_zh.get(_nd, _nd)
+                _desc = _node_desc.get(_nd, '')
+                _mvs  = _move_by_node.get(_nd, [])
+                # C6 是专科子图入口，展开为 S4/S5/S6 子事件
+                if _nd == 'C6':
+                    _sub_expanded = False
+                    for _snd in ('S4', 'S5', 'S6'):
+                        _st = _subgraph_times.get(_snd)
+                        if _st:
+                            _slbl, _sdesc = _subgraph_meta[_snd]
+                            _timeline_events.append({
+                                'time': _st,
+                                'node': _snd, 'label': _slbl, 'desc': _sdesc,
+                                'kind': 'stay', 'loc': _cur_loc,
+                            })
+                            _sub_expanded = True
+                    if not _sub_expanded:
+                        # 子图时钟未记录，回退到整个 C6 显示
+                        _t_node = node_time_map.get(_nd, '--:--')
+                        _timeline_events.append({
+                            'time': _t_node,
+                            'node': _nd, 'label': _lbl, 'desc': _desc,
+                            'kind': 'stay', 'loc': _cur_loc,
+                        })
+                    continue
+                if _mvs:
+                    for _mv in _mvs:
+                        _fr_n = _mv.get('from', _cur_loc)
+                        _to_n = _mv.get('to', '?')
+                        _cur_loc = _to_n
+                        _timeline_events.append({
+                            'time': _mv.get('time', '--:--'),
+                            'node': _nd, 'label': _lbl, 'desc': _desc,
+                            'kind': 'move', 'fr': _fr_n, 'to': _to_n,
+                        })
+                else:
+                    _t_node = node_time_map.get(_nd, '--:--')
+                    _timeline_events.append({
+                        'time': _t_node,
+                        'node': _nd, 'label': _lbl, 'desc': _desc,
+                        'kind': 'stay', 'loc': _cur_loc,
+                    })
+
+            if _timeline_events:
+                _hdr = f"  {'时间':^5}  {'累计':^7}  {'耗时':^5}  {'节点':<14}  {'位置 / 说明'}"
+                _sep = f"  {'─'*5}  {'─'*7}  {'─'*5}  {'─'*14}  {'─'*30}"
+                self.detail_logger.info(_hdr)
+                self.detail_logger.info(_sep)
+                for _i, _ev in enumerate(_timeline_events):
+                    _t   = _ev['time']
+                    _nd  = _ev['node']
+                    _tc  = _hhmm_to_min(_t)
+                    # 累计（相对就诊基准）
+                    _elap_s = ''
+                    if _base_min is not None and _tc is not None:
+                        _e = (_tc - _base_min) % 1440
+                        _elap_s = f'+{_e}min'
+                    # 耗时 = 本节点完成时刻 − 上一事件完成时刻（本节点自己占用的模拟时间）
+                    _dur_s = ''
+                    if _i > 0:
+                        for _j in range(_i - 1, -1, -1):
+                            _tp = _hhmm_to_min(_timeline_events[_j]['time'])
+                            if _tp is not None and _tc is not None:
+                                _d = (_tc - _tp) % 1440
+                                _dur_s = f'{_d}min'
+                                break
+                    # 位置/说明文本
+                    if _ev['kind'] == 'move':
+                        _loc_s = f"{_ev['fr']} → {_ev['to']}"
+                    else:
+                        _loc_s = f"@ {_ev['loc']}  {_ev['desc']}"
+                    _nd_lbl = f"[{_nd}]{_ev['label']}"
+                    self.detail_logger.info(
+                        f"  {_t:^5}  {_elap_s:^7}  {_dur_s:^5}  {_nd_lbl:<14}  {_loc_s}"
+                    )
+                self.detail_logger.info(f"  {'─'*65}")
+                if simulated_minutes is not None:
+                    self.detail_logger.info(f"  总就诊时长: {simulated_minutes:.0f} 分钟")
+            else:
+                self.detail_logger.info("  （无执行记录）")
+            self.detail_logger.info("")
+
             return result
             
         except Exception as e:
@@ -954,7 +1124,7 @@ class LangGraphMultiPatientProcessor:
         self._setup_shared_equipment()
         
         # 创建共享的 Nurse 和 Lab Agent（所有患者共用）
-        self.shared_nurse_agent = NurseAgent(llm=self.llm, max_triage_questions=3)
+        self.shared_nurse_agent = NurseAgent(llm=self.llm)
         self.shared_lab_agent = LabAgent(llm=self.llm)
         
         # 为每个医生创建 DoctorAgent 实例（映射到 coordinator 的医生）
@@ -1046,54 +1216,6 @@ class LangGraphMultiPatientProcessor:
         
         return patient_id
     
-    def submit_batch(self, patients: List[Dict[str, Any]]) -> List[str]:
-        """
-        批量提交患者任务
-        
-        Args:
-            patients: 患者列表，每个元素包含:
-                - patient_id: 患者ID
-                - case_id: 病例ID
-                - dept: 科室（可选，默认为 "internal_medicine"，会被护士分诊覆盖）
-                - priority: 优先级（可选，默认为 5）
-        
-        Returns:
-            任务ID列表
-        """
-        task_ids = []
-        
-        for patient_info in patients:
-            patient_id = patient_info["patient_id"]
-            case_id = patient_info["case_id"]
-            dept = patient_info.get("dept", "internal_medicine")  # 默认科室，会被护士分诊覆盖
-            priority = patient_info.get("priority", 5)
-            
-            task_id = self.submit_patient(patient_id, case_id, dept, priority)
-            task_ids.append(task_id)
-            
-            # 稍微错开提交时间，避免资源竞争
-            time.sleep(0.1)
-        
-        logger.info(f"✅ 批量提交完成: {len(task_ids)} 个患者")
-        
-        return task_ids
-    
-    def wait_for_patient(self, patient_id: str, timeout: Optional[int] = None) -> Dict[str, Any]:
-        """等待单个患者任务完成"""
-        with self._lock:
-            future = self.active_tasks.get(patient_id)
-        
-        if not future:
-            return {"status": "not_found", "patient_id": patient_id}
-        
-        try:
-            result = future.result(timeout=timeout)
-            return result
-        except concurrent.futures.TimeoutError:
-            return {"status": "timeout", "patient_id": patient_id}
-        except Exception as e:
-            logger.error(f"任务执行失败 ({patient_id}): {e}")
-            return {"status": "error", "patient_id": patient_id, "error": str(e)}
     
     def wait_all(self, timeout: Optional[int] = None) -> List[Dict[str, Any]]:
         """等待所有任务完成"""

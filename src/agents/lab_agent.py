@@ -59,16 +59,16 @@ class LabAgent:
         if not ordered_tests:
             return []
         
-        # 构造伪病例数据结构以复用现有逻辑
+        # 构造检验上下文结构
         case_data = {
-            "Case Information": case_info_text,
+            "辅助检查": case_info_text,
             "dept": dept,
             "patient_id": patient_id
         }
         
-        # 如果有真实检查结果参考，将其附加到Case Information中
+        # 如果有真实检查结果参考，将其附加到辅助检查文本
         if real_tests_reference:
-            case_data["Case Information"] = case_info_text + "\n\n真实检查结果参考:\n" + real_tests_reference
+            case_data["辅助检查"] = case_info_text + "\n\n真实检查结果参考:\n" + real_tests_reference
         
         # 调用现有的process_test_orders方法
         return self.process_test_orders(
@@ -92,7 +92,7 @@ class LabAgent:
         
         Args:
             ordered_tests: 医生开具的检查列表 [{"name": "血常规", "type": "lab", ...}, ...]
-            case_data: 病例数据（包含Case Information等）
+            case_data: 病例数据（包含结构化字段与辅助检查文本）
             chief_complaint: 患者主诉
             physical_state: 患者物理状态快照
             existing_results: 已有的检查结果列表
@@ -158,8 +158,8 @@ class LabAgent:
         if not case_data:
             return None
         
-        # 从 Case Information 中查找
-        case_info = case_data.get("Case Information", "")
+        # 从辅助检查字段中查找
+        case_info = case_data.get("辅助检查", "")
         if not case_info:
             return None
         
@@ -426,7 +426,7 @@ class LabAgent:
         if not case_data:
             return "无病例信息"
         
-        case_info = case_data.get("Case Information", "")
+        case_info = case_data.get("辅助检查", "")
         
         # 提取关键部分（前300字符）
         summary = case_info[:300].strip()

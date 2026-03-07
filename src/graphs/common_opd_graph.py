@@ -25,7 +25,6 @@ from rag.keyword_generator import RAGKeywordGenerator, NodeContext
 from services.appointment import AppointmentService
 from services.billing import BillingService
 from services.llm_client import LLMClient
-from simulation.time_manager import TimeEvent, EventType
 from state.schema import BaseState, make_audit_entry
 from logging_utils import should_log, get_output_level, OutputFilter, SUPPRESS_UNCHECKED_LOGS
 from utils import (
@@ -36,6 +35,15 @@ from utils import (
     disclaimer_text,
     contains_any_positive,
 )
+
+# 导入患者对话CSV存储
+try:
+    from rag.patient_history_csv import PatientHistoryCSV
+    PATIENT_CONVERSATION_CSV_AVAILABLE = True
+except ImportError:
+    PATIENT_CONVERSATION_CSV_AVAILABLE = False
+    import logging
+    logging.warning("⚠️  PatientHistoryCSV 模块未找到，无法保存对话历史")
 
 # 初始化logger
 logger = get_logger("hospital_agent.graph")
@@ -378,6 +386,17 @@ class CommonOPDGraph:
             if detail_logger:
                 detail_logger.subsection("C2: 预约挂号")
             
+            # 物理环境：移动到挂号处
+            if self.world and state.patient_id:
+                from_loc = state.current_location
+                success, msg = self.world.move_agent(state.patient_id, "registration")
+                if success:
+                    self._record_movement(state, from_loc, "registration", "C2")
+                    _log_detail(f"  🚶 移动: 门诊大厅 → 挂号处", state, 2, "C2")
+                    state.current_location = "registration"
+                    state.sync_physical_state()
+                    self.world.advance_time(minutes=1)
+            
             # 显示物理环境状态
             _log_physical_state(state, "C2", level=2)
             
@@ -390,23 +409,16 @@ class CommonOPDGraph:
             appt = self.services.appointment.create_appointment(
                 channel=channel, dept=state.dept, timeslot=timeslot
             )
+            # 保留 C1 写入的关键时间戳，防止被覆盖
+            for _key in ("visit_start_time", "simulated_duration_minutes", "visit_duration_minutes"):
+                if _key in state.appointment and _key not in appt:
+                    appt[_key] = state.appointment[_key]
             state.appointment = appt
             
             # 推进时间（挂号约需3分钟）
             if self.world:
                 self.world.advance_time(minutes=3)
                 state.sync_physical_state()
-                
-                # ===== 时间管理：记录挂号事件 =====
-                if self.world.time_manager:
-                    self.world.time_manager.record_event(TimeEvent(
-                        event_type=EventType.PATIENT_REGISTRATION,
-                        timestamp=self.world.current_time,
-                        patient_id=state.patient_id,
-                        location="lobby",
-                        duration_minutes=3,
-                        metadata={"appointment_id": appt.get("appointment_id"), "channel": channel}
-                    ))
             
             if detail_logger:
                 detail_logger.info(f"挂号成功 - 预约ID: {appt.get('appointment_id')}")
@@ -438,7 +450,7 @@ class CommonOPDGraph:
                 success, msg = self.world.move_agent(state.patient_id, "waiting_area")
                 if success:
                     self._record_movement(state, from_loc, "waiting_area", "C3")
-                    _log_detail(f"  🚶 移动: 门诊大厅 → 候诊区", state, 2, "C3")
+                    _log_detail(f"  🚶 移动: 挂号处 → 候诊区", state, 2, "C3")
                     state.current_location = "waiting_area"
                     state.sync_physical_state()
                     self.world.advance_time(minutes=2)
@@ -448,34 +460,12 @@ class CommonOPDGraph:
             
             state.appointment = self.services.appointment.checkin(state.appointment)
             
-            # ===== 时间管理：记录签到事件 =====
-            if self.world and self.world.time_manager:
-                self.world.time_manager.record_event(TimeEvent(
-                    event_type=EventType.PATIENT_REGISTRATION,
-                    timestamp=self.world.current_time,
-                    patient_id=state.patient_id,
-                    location="waiting_area",
-                    metadata={"appointment_id": state.appointment.get("appointment_id")}
-                ))
-            
             if should_log(1, "common_opd_graph", "C3"):
                 logger.info(f"✅ 签到成功 - 状态: {state.appointment.get('status')}")
             
             # 候诊等待（5-10分钟）
             if self.world and state.patient_id:
                 wait_time = 7  # 固定等待7分钟
-                
-                # ===== 时间管理：记录候诊开始事件 =====
-                if self.world.time_manager:
-                    self.world.time_manager.record_event(TimeEvent(
-                        event_type=EventType.PATIENT_WAITING,
-                        timestamp=self.world.current_time,
-                        patient_id=state.patient_id,
-                        location="waiting_area",
-                        duration_minutes=wait_time,
-                        metadata={"wait_type": "consultation"}
-                    ))
-                
                 success, msg = self.world.wait(state.patient_id, wait_time)
                 if success:
                     logger.info(f"  ⏳ 候诊等待: {wait_time}分钟")
@@ -617,6 +607,7 @@ class CommonOPDGraph:
                     
                     # 推进时间（叫号和入诊大约2分钟）
                     self.world.advance_time(minutes=2)
+                    
                 else:
                     _log_detail(f"⚠️  患者移动失败: {msg}", state, 2, "C4")
             
@@ -637,7 +628,7 @@ class CommonOPDGraph:
             )
             _log_node_end("C4", state)
             return state
-            return state
+            
 
         def c5_prepare_intake(state: BaseState) -> BaseState:
             """C5: 问诊准备 - 检索通用SOP并初始化问诊记录（实际问诊在C6专科子图中进行）"""
@@ -908,18 +899,16 @@ class CommonOPDGraph:
             C9: 缴费与预约调度
             职责：
             1. 生成订单并完成缴费
-            2. 调度检查项目预约时间
+            2. 基于设备实时队列状态预测等待时间，为 C10 执行检查提供调度计划
             3. 生成检查准备清单（checklist）
             """
             state.world_context = self.world
             _log_node_start("C9", "缴费与预约", state)
-            
-            # 导入 timedelta 用于预约时间计算
+
             from datetime import timedelta
-            
+
             # 物理环境：移动到收费处
             if self.world and state.patient_id:
-                # 移动到收费处
                 from_loc = state.current_location
                 success, msg = self.world.move_agent(state.patient_id, "cashier")
                 if success:
@@ -928,21 +917,21 @@ class CommonOPDGraph:
                     state.current_location = "cashier"
                     state.sync_physical_state()
                     self.world.advance_time(minutes=2)
-            
+
             # 显示物理环境状态
             _log_physical_state(state, "C9", level=2)
-            
+
             # 1. 生成订单并缴费
             order_id = f"ORD-{state.run_id}-{len(state.ordered_tests)}"
             logger.info(f"📝 订单ID: {order_id}")
-            
+
             payment = self.services.billing.pay(order_id=order_id)
             logger.info(f"✅ 缴费完成 - 金额: {payment.get('amount', 0)}元")
             state.appointment["billing"] = payment
-            
-            # 缴费等待（3-5分钟）
+
+            # 缴费等待（固定4分钟）
             if self.world and state.patient_id:
-                wait_time = 4  # 固定等待4分钟
+                wait_time = 4
                 success, msg = self.world.wait(state.patient_id, wait_time)
                 if success:
                     logger.info(f"  ⏳ 缴费等待: {wait_time}分钟")
@@ -950,34 +939,86 @@ class CommonOPDGraph:
                     logger.info(f"  🕐 当前时间: {self.world.current_time.strftime('%H:%M')}")
                 logger.info("")
 
-            # 2. 预约调度与准备清单生成
-            logger.info("\n📅 调度检查预约...")
-            
+            # 2. 基于设备实时状态的调度预测
+            logger.info("\n📅 基于设备实时状态预测检查调度...")
+
             # 验证test_prep和ordered_tests长度一致
             if len(state.test_prep) != len(state.ordered_tests):
                 logger.error(f"⚠️  数据不一致: test_prep({len(state.test_prep)}) != ordered_tests({len(state.ordered_tests)})")
                 raise ValueError("test_prep和ordered_tests长度不匹配")
-            
+
             scheduled_count = 0
             for prep, t in zip(state.test_prep, state.ordered_tests, strict=False):
-                test_name = t.get("name")
-                test_type = t.get("type")
-                
-                # 处理需要预约的检查
+                test_name = t.get("name", "")
+                test_type = t.get("type", "lab")
+
+                # 映射到物理设备类型与位置
+                exam_type = self._map_test_to_equipment_type(test_name, test_type)
+                target_location = self._get_location_for_exam_type(exam_type)
+                location_name = self._get_location_name(target_location)
+
                 if t.get("need_schedule"):
-                    logger.info(f"  🕒 预约: {test_name}")
-                    
-                    if test_type == "endoscopy":
-                        # 内镜检查：生成预约信息（24小时后）
-                        scheduled_time = self.world.current_time + timedelta(hours=24)
-                        prep["schedule"] = {
-                            "procedure": test_name,
-                            "scheduled": True,
-                            "schedule_id": f"END-{int(time.time() * 1000) % 100000}",
-                            "scheduled_at": scheduled_time.strftime("%Y-%m-%d %H:%M"),
-                            "location": "内镜中心",
-                        }
-                        # 根据检查类型生成准备清单
+                    # ── 查询设备实时状态（只读，不占用设备，留给 C10 实际分配）──
+                    schedule_info: dict[str, Any] = {
+                        "scheduled": True,
+                        "procedure": test_name,
+                        "location": location_name,
+                        "exam_type": exam_type,
+                    }
+
+                    if self.world:
+                        matching_equip = [
+                            eq for eq in self.world.equipment.values()
+                            if eq.exam_type == exam_type and eq.status != "offline"
+                        ]
+                        if matching_equip:
+                            # 选等待时间最短的设备
+                            best_eq = min(
+                                matching_equip,
+                                key=lambda eq: eq.get_wait_time(self.world.current_time),
+                            )
+                            estimated_wait = best_eq.get_wait_time(self.world.current_time)
+                            queue_len = len(best_eq.queue)
+                            busy_count = sum(1 for eq in matching_equip if eq.is_occupied)
+                            total_count = len(matching_equip)
+
+                            estimated_start = self.world.current_time + timedelta(minutes=estimated_wait)
+                            estimated_end = estimated_start + timedelta(minutes=best_eq.duration_minutes)
+                            same_day = estimated_start.date() == self.world.current_time.date()
+
+                            schedule_info.update({
+                                "equipment_name": best_eq.name,
+                                "estimated_wait_minutes": estimated_wait,
+                                "estimated_start": estimated_start.strftime("%Y-%m-%d %H:%M"),
+                                "estimated_end": estimated_end.strftime("%Y-%m-%d %H:%M"),
+                                "duration_minutes": best_eq.duration_minutes,
+                                "queue_ahead": queue_len,
+                                "device_busy": f"{busy_count}/{total_count}台使用中",
+                                "same_day": same_day,
+                            })
+
+                            if queue_len == 0 and not best_eq.is_occupied:
+                                logger.info(f"  ✅ {test_name}: 设备空闲，可立即检查")
+                                logger.info(f"     📍 {location_name} | {best_eq.name} | 约{best_eq.duration_minutes}分钟")
+                            else:
+                                logger.info(f"  🕒 {test_name}: 预计等待 {estimated_wait} 分钟")
+                                logger.info(f"     📍 {location_name} | {best_eq.name} | 排队{queue_len}人 | {busy_count}/{total_count}台使用中")
+                                logger.info(f"     ⏰ 预计开始: {estimated_start.strftime('%H:%M')} | 预计完成: {estimated_end.strftime('%H:%M')}")
+                        else:
+                            # 无对应设备信息，记录警告并给出保守估算
+                            logger.warning(f"  ⚠️  {test_name}: 未找到 {exam_type} 设备信息，等待时间不可预测")
+                            schedule_info.update({
+                                "estimated_wait_minutes": None,
+                                "note": f"无{exam_type}设备信息，C10执行时实际分配",
+                            })
+                    else:
+                        schedule_info["note"] = "物理世界未启用，C10执行时实际分配"
+
+                    prep["schedule"] = schedule_info
+                    scheduled_count += 1
+
+                    # 生成内镜专项准备清单
+                    if test_type == "endoscopy" and "prep_checklist" not in prep:
                         if "结肠" in test_name or "肠镜" in test_name:
                             prep["prep_checklist"] = [
                                 {"item": "检查前3天低渣饮食", "required": True},
@@ -990,55 +1031,44 @@ class CommonOPDGraph:
                                 {"item": "检查前6-8小时禁食禁饮", "required": True},
                                 {"item": "如需镇静需家属陪同", "required": True},
                             ]
-                        logger.info(f"     ✅ 预约时间: {scheduled_time.strftime('%H:%M')} (明天)")
-                    elif test_type == "imaging":
-                        # 影像检查：通用预约（2小时后）
-                        scheduled_time = self.world.current_time + timedelta(hours=2)
-                        prep["schedule"] = {
-                            "scheduled": True,
-                            "procedure": test_name,
-                            "scheduled_at": scheduled_time.strftime("%Y-%m-%d %H:%M"),
-                            "location": "影像科",
-                        }
-                        logger.info(f"     ✅ 预约时间: {scheduled_time.strftime('%H:%M')} (约2小时)")
-                    elif test_type == "neurophysiology":
-                        # 神经电生理检查（24小时后）
-                        scheduled_time = self.world.current_time + timedelta(hours=24)
-                        prep["schedule"] = {
-                            "scheduled": True,
-                            "procedure": test_name,
-                            "scheduled_at": scheduled_time.strftime("%Y-%m-%d %H:%M"),
-                            "location": "神经电生理室",
-                        }
-                        logger.info(f"     ✅ 预约时间: {scheduled_time.strftime('%H:%M')} (明天)")
-                    else:
-                        # 其他检查（2小时后）
-                        scheduled_time = self.world.current_time + timedelta(hours=2)
-                        prep["schedule"] = {
-                            "scheduled": True,
-                            "procedure": test_name,
-                            "scheduled_at": scheduled_time.strftime("%Y-%m-%d %H:%M"),
-                        }
-                        logger.info(f"     ✅ 预约完成: {scheduled_time.strftime('%H:%M')} (约2小时)")
-                    
-                    scheduled_count += 1
                 else:
-                    # 不需要预约（如普通检验）
-                    prep["schedule"] = {
+                    # 无需预约（如普通检验）：仍查询设备状态告知大致等候时间
+                    immediate_info: dict[str, Any] = {
                         "scheduled": False,
                         "immediate": True,
-                        "location": "检验科" if test_type == "lab" else "相关科室",
+                        "location": location_name,
                     }
-                
-                # 生成准备清单（如果需要且还没有）
+                    if self.world:
+                        matching_equip = [
+                            eq for eq in self.world.equipment.values()
+                            if eq.exam_type == exam_type and eq.status != "offline"
+                        ]
+                        if matching_equip:
+                            best_eq = min(
+                                matching_equip,
+                                key=lambda eq: eq.get_wait_time(self.world.current_time),
+                            )
+                            estimated_wait = best_eq.get_wait_time(self.world.current_time)
+                            queue_len = len(best_eq.queue)
+                            immediate_info["estimated_wait_minutes"] = estimated_wait
+                            immediate_info["queue_ahead"] = queue_len
+                            status_str = "可即时检查" if estimated_wait == 0 else f"预计等待{estimated_wait}分钟（排队{queue_len}人）"
+                            logger.info(f"  ✅ {test_name}: 无需预约，{status_str}")
+                        else:
+                            logger.info(f"  ✅ {test_name}: 无需预约，直接前往{location_name}")
+                    else:
+                        logger.info(f"  ✅ {test_name}: 无需预约，直接前往{location_name}")
+                    prep["schedule"] = immediate_info
+
+                # 生成通用准备清单（如果需要且还没有）
                 if t.get("need_prep") and "prep_checklist" not in prep:
                     prep["prep_checklist"] = [
                         {"item": "按医生建议完成检查准备", "required": True},
                         {"item": "检查前阅读注意事项", "required": True},
                     ]
-            
-            logger.info(f"\n✅ 预约调度完成：{scheduled_count}/{len(state.ordered_tests)} 项需要预约")
-            
+
+            logger.info(f"\n✅ 调度预测完成：{scheduled_count}/{len(state.ordered_tests)} 项需要预约")
+
             state.add_audit(
                 make_audit_entry(
                     node_name="C9 Billing & Scheduling",
@@ -1051,8 +1081,9 @@ class CommonOPDGraph:
                         "amount": payment.get("amount"),
                         "scheduled_count": scheduled_count,
                         "total_tests": len(state.ordered_tests),
+                        "schedule_source": "equipment_realtime" if self.world else "no_world",
                     },
-                    decision="完成缴费与检查项目预约调度，生成准备清单",
+                    decision="完成缴费，基于设备实时状态预测调度计划，生成准备清单",
                     chunks=[],
                 )
             )
@@ -1073,20 +1104,35 @@ class CommonOPDGraph:
                 
                 # 获取数据集中的真实检查结果作为参考（如果有）
                 real_diagnostic_tests = state.ground_truth.get("Diagnostic Tests", "").strip()
-                
-                # 按检查项目逐个处理
+
+                # ── 阶段一：物理执行（移动 / 等队 / 占用设备）────────────────────
+                # 只做时钟推进，不调用 LLM，避免 LLM 等待期间被其他并发患者拉动时钟
+                pending_tests: list[dict] = []  # 保存每项检查的上下文，供阶段二生成报告
+
+                # 读取 C9 写入的调度预测（按顺序与 ordered_tests 对应）
+                c9_schedules: list[dict] = [
+                    p.get("schedule", {}) for p in state.test_prep
+                ] if len(state.test_prep) == len(state.ordered_tests) else [{}] * len(state.ordered_tests)
+
+                # 汇总 C9 预测精度（供审计日志）
+                schedule_accuracy_log: list[dict[str, Any]] = []
+
                 for idx, test in enumerate(state.ordered_tests, 1):
                     test_name = test.get("test_name", test.get("name", ""))
                     test_type = test.get("test_type", test.get("type", "lab"))
-                    
+                    c9_sched = c9_schedules[idx - 1]
+
                     _log_detail(f"\n  [{idx}/{len(state.ordered_tests)}] 执行检查: {test_name}", state, 2, "C10")
-                    
-                    # 映射检查类型到设备类型
-                    exam_type = self._map_test_to_equipment_type(test_name, test_type)
-                    
+
+                    # ── 优先使用 C9 预测的 exam_type，避免重复映射 ──
+                    exam_type = c9_sched.get("exam_type") or self._map_test_to_equipment_type(test_name, test_type)
+                    c9_predicted_wait: int | None = c9_sched.get("estimated_wait_minutes")
+                    c9_source = "C9预测" if c9_sched.get("exam_type") else "重新映射"
+                    _log_detail(f"    🔖 设备类型: {exam_type}（来源: {c9_source}）", state, 2, "C10")
+
                     # 确定目标位置（根据设备类型）
                     target_location = self._get_location_for_exam_type(exam_type)
-                    
+
                     # 移动到检查位置
                     if state.current_location != target_location:
                         from_loc = state.current_location
@@ -1098,39 +1144,50 @@ class CommonOPDGraph:
                             state.current_location = target_location
                             state.sync_physical_state()
                             self.world.advance_time(minutes=2)
-                    
-                    # 请求设备（会尝试该位置所有可用设备）
+
+                    # ── 请求设备（获取真实等待时间）──
                     case_id = state.case_data.get("id") if state.case_data else None
+                    is_emergency = "emergency" in state.escalations
                     equipment_id, wait_time = self.world.request_equipment(
                         patient_id=state.patient_id,
                         exam_type=exam_type,
-                        priority=3 if "emergency" in state.escalations else 5,
-                        dataset_id=case_id  # 传入case_id用于日志显示
+                        priority=3 if is_emergency else 5,
+                        dataset_id=case_id
                     )
-                    
+
+                    # ── C9预测 vs 实际对比日志 ──
+                    if c9_predicted_wait is not None:
+                        delta = wait_time - c9_predicted_wait
+                        accuracy_symbol = "✅" if abs(delta) <= 5 else ("⬆️" if delta > 0 else "⬇️")
+                        _log_detail(
+                            f"    📊 调度对比: C9预测 {c9_predicted_wait}分钟 → 实际 {wait_time}分钟 "
+                            f"({'+' if delta >= 0 else ''}{delta}分钟) {accuracy_symbol}",
+                            state, 2, "C10"
+                        )
+                        schedule_accuracy_log.append({
+                            "test": test_name,
+                            "predicted_wait": c9_predicted_wait,
+                            "actual_wait": wait_time,
+                            "delta": delta,
+                        })
+
                     if equipment_id:
-                        # 获取设备信息
                         eq = self.world.equipment.get(equipment_id)
                         if eq:
-                            # 记录设备分配信息
                             all_same_type = [e for e in self.world.equipment.values() if e.exam_type == eq.exam_type]
                             busy_count = len([e for e in all_same_type if e.is_occupied])
                             total_count = len(all_same_type)
-                            
+
                             if wait_time > 0:
-                                # 需要排队
                                 queue_len = len(eq.queue)
                                 _log_detail(f"    ⏳ 设备忙碌: {eq.name}", state, 2, "C10")
                                 _log_detail(f"       • 队列状态: 当前{queue_len}人排队", state, 2, "C10")
                                 _log_detail(f"       • 资源状态: {busy_count}/{total_count}台使用中", state, 2, "C10")
-                                _log_detail(f"       • 预计等待: {wait_time}分钟", state, 2, "C10")
-                                
-                                # 等待排队
+                                _log_detail(f"       • 实际等待: {wait_time}分钟", state, 2, "C10")
                                 self.world.wait(state.patient_id, wait_time)
                                 state.sync_physical_state()
                                 _log_detail(f"    ✓ 排队完成，轮到患者使用设备", state, 2, "C10")
                             else:
-                                # 直接分配
                                 start_time = self.world.current_time.strftime('%H:%M') if self.world.current_time else '未知'
                                 end_time = eq.occupied_until.strftime('%H:%M') if eq.occupied_until else '未知'
                                 _log_detail(f"    ✅ 设备分配: {eq.name}", state, 2, "C10")
@@ -1138,87 +1195,93 @@ class CommonOPDGraph:
                                 _log_detail(f"       • 预计完成: {end_time}", state, 2, "C10")
                                 _log_detail(f"       • 检查时长: {eq.duration_minutes}分钟", state, 2, "C10")
                                 _log_detail(f"       • 资源状态: {busy_count}/{total_count}台使用中", state, 2, "C10")
-                            
-                            # 执行检查（设备占用期间）
+
+                            # 执行检查（按设备时长推进时钟）
                             check_duration = eq.duration_minutes
                             _log_detail(f"    🔬 开始检查（预计{check_duration}分钟）", state, 2, "C10")
                             self.world.wait(state.patient_id, check_duration)
                             state.sync_physical_state()
-                            
-                            # 立即生成该项检查的结果（使用lab_agent）
-                            _log_detail(f"    📝 生成检查结果...", state, 2, "C10")
-                            
-                            # 准备单项检查的上下文
+
+                            # 释放设备（时钟已到位，报告稍后统一生成）
+                            actual_end_time = self.world.current_time.strftime('%H:%M') if self.world.current_time else '未知'
+                            released = self.world.release_equipment(equipment_id)
+                            if released:
+                                _log_detail(f"    ✅ 检查完成，释放设备: {eq.name}", state, 2, "C10")
+                                _log_detail(f"       • 结束时间: {actual_end_time}", state, 2, "C10")
+                                if len(eq.queue) > 0:
+                                    _log_detail(f"       • 队列中还有{len(eq.queue)}人等待", state, 2, "C10")
+                            else:
+                                _log_detail(f"    ✅ 检查完成", state, 2, "C10")
+
+                            pending_tests.append({
+                                "test": test,
+                                "has_equipment": True,
+                            })
+                        else:
+                            pending_tests.append({"test": test, "has_equipment": False})
+                    else:
+                        _log_detail(f"    ⚠️  暂无可用{exam_type}设备", state, 2, "C10")
+                        pending_tests.append({"test": test, "has_equipment": False})
+
+                # ── 调度预测精度汇总 ──
+                if schedule_accuracy_log:
+                    total_delta = sum(abs(r["delta"]) for r in schedule_accuracy_log)
+                    avg_delta = total_delta / len(schedule_accuracy_log)
+                    accurate_count = sum(1 for r in schedule_accuracy_log if abs(r["delta"]) <= 5)
+                    _log_detail(
+                        f"\n  📈 C9调度预测精度: {accurate_count}/{len(schedule_accuracy_log)} 项误差≤5分钟"
+                        f"，平均误差 {avg_delta:.1f}分钟",
+                        state, 2, "C10"
+                    )
+                    state.appointment["schedule_accuracy"] = {
+                        "items": schedule_accuracy_log,
+                        "accurate_count": accurate_count,
+                        "total_count": len(schedule_accuracy_log),
+                        "avg_delta_minutes": round(avg_delta, 1),
+                    }
+
+                # ── 阶段二：统一生成检查报告（LLM 调用集中在此，不夹在移动之间）─
+                _log_detail(f"\n  📝 生成检查报告（{len(pending_tests)}项）...", state, 2, "C10")
+                for pt in pending_tests:
+                    test = pt["test"]
+                    single_result = None
+                    if self.lab_agent:
+                        try:
                             single_test_context = {
-                                "ordered_tests": [test],  # 只包含当前检查
+                                "ordered_tests": [test],
                                 "chief_complaint": state.chief_complaint,
                                 "case_info": state.patient_profile.get("case_text", ""),
                                 "real_tests_reference": real_diagnostic_tests if real_diagnostic_tests else None,
                                 "dept": state.dept,
                                 "patient_id": state.patient_id,
                             }
-                            
-                            # 调用检验科Agent生成单项结果
-                            single_result = None
-                            if self.lab_agent:
-                                try:
-                                    lab_results = self.lab_agent.generate_test_results(single_test_context)
-                                    if lab_results and isinstance(lab_results, list) and len(lab_results) > 0:
-                                        single_result = lab_results[0]
-                                        single_result["source"] = "lab_agent"
-                                        if real_diagnostic_tests:
-                                            single_result["reference_data"] = "dataset"
-                                        
-                                        # 显示结果状态
-                                        abnormal = single_result.get("abnormal", False)
-                                        status = "⚠️ 异常" if abnormal else "✓ 正常"
-                                        _log_detail(f"    {status} 结果已生成", state, 2, "C10")
-                                except Exception as e:
-                                    logger.error(f"    ❌ 检验科Agent生成失败: {e}")
-                            
-                            # 如果生成失败，使用备用方案
-                            if not single_result:
-                                single_result = {
-                                    "test_name": test.get("name"),
-                                    "test": test.get("name"),
-                                    "type": test.get("type"),
-                                    "body_part": test.get("body_part", ["未知"]),
-                                    "summary": "检查已完成，详见报告",
-                                    "abnormal": False,
-                                    "detail": f"{test.get('name')}检查已完成，结果正常范围内。",
-                                    "source": "fallback_simple",
-                                    "reference_data": "dataset" if real_diagnostic_tests else None,
-                                }
-                            
-                            results.append(single_result)
-                            
-                            # 释放设备
-                            released = self.world.release_equipment(equipment_id)
-                            actual_end_time = self.world.current_time.strftime('%H:%M') if self.world.current_time else '未知'
-                            if released:
-                                _log_detail(f"    ✅ 检查完成，释放设备: {eq.name}", state, 2, "C10")
-                                _log_detail(f"       • 结束时间: {actual_end_time}", state, 2, "C10")
-                                # 检查是否有队列中的下一个患者
-                                if len(eq.queue) > 0:
-                                    _log_detail(f"       • 队列中还有{len(eq.queue)}人等待", state, 2, "C10")
-                            else:
-                                _log_detail(f"    ✅ 检查完成", state, 2, "C10")
-                    else:
-                        _log_detail(f"    ⚠️  暂无可用{exam_type}设备", state, 2, "C10")
-                        
-                        # 即使没有设备，也生成一个基础结果
-                        fallback_result = {
+                            lab_results = self.lab_agent.generate_test_results(single_test_context)
+                            if lab_results and isinstance(lab_results, list) and len(lab_results) > 0:
+                                single_result = lab_results[0]
+                                single_result["source"] = "lab_agent"
+                                if real_diagnostic_tests:
+                                    single_result["reference_data"] = "dataset"
+                                abnormal = single_result.get("abnormal", False)
+                                status = "⚠️ 异常" if abnormal else "✓ 正常"
+                                test_name = test.get("test_name", test.get("name", ""))
+                                _log_detail(f"    {status} {test_name} 结果已生成", state, 2, "C10")
+                        except Exception as e:
+                            logger.error(f"    ❌ 检验科Agent生成失败: {e}")
+
+                    if not single_result:
+                        single_result = {
                             "test_name": test.get("name"),
                             "test": test.get("name"),
                             "type": test.get("type"),
                             "body_part": test.get("body_part", ["未知"]),
                             "summary": "检查已完成，详见报告",
                             "abnormal": False,
-                            "detail": f"{test.get('name')}检查已完成。",
+                            "detail": f"{test.get('name')}检查已完成，结果正常范围内。",
                             "source": "fallback_simple",
+                            "reference_data": "dataset" if real_diagnostic_tests else None,
                         }
-                        results.append(fallback_result)
-                
+                    results.append(single_result)
+
                 _log_detail(f"\n  ✅ 所有检查项目完成，共生成{len(results)}项结果", state, 2, "C10")
             else:
                 # 如果没有物理世界，使用原来的批量生成方式
@@ -1398,7 +1461,14 @@ class CommonOPDGraph:
                         "lab_agent_used": data_source == "lab_agent",
                         "enhanced_count": enhanced_count,
                         "failed_count": failed_count,
-                        "enhancement_rate": f"{enhanced_count}/{len(results)}"
+                        "enhancement_rate": f"{enhanced_count}/{len(results)}",
+                        **(
+                            {
+                                "schedule_accuracy_rate": f"{state.appointment['schedule_accuracy']['accurate_count']}/{state.appointment['schedule_accuracy']['total_count']}",
+                                "schedule_avg_delta_minutes": state.appointment["schedule_accuracy"]["avg_delta_minutes"],
+                            }
+                            if state.appointment.get("schedule_accuracy") else {}
+                        ),
                     },
                     decision=f"检验科Agent生成{len(results)}项检查结果，报告增强{enhanced_count}项成功",
                     chunks=[],
@@ -1844,7 +1914,19 @@ class CommonOPDGraph:
                             "异常": "是" if r.get("abnormal") else "否",
                             "叙述": r.get("narrative", "")
                         })
-                
+
+                # 引用 C11 复诊问诊记录（携带报告回诊的补充信息）
+                post_test_qa = [
+                    qa for qa in state.agent_interactions.get("doctor_patient_qa", [])
+                    if qa.get("stage") == "post_test_followup"
+                ]
+                if post_test_qa:
+                    evidence_summary["复诊问诊（携报告回诊）"] = [
+                        {"问": qa["question"], "答": qa["answer"][:150]}
+                        for qa in post_test_qa
+                    ]
+                    _log_detail(f"  ✓ 引用复诊问诊记录（{len(post_test_qa)}轮，C11携报告回诊）", state, 1, "C12")
+
                 # 安全加载专科方案模板（神经内科）
                 dept_plan_prompt = ""
                 try:
@@ -1861,7 +1943,8 @@ class CommonOPDGraph:
                     + "诊断必须明确引用以下证据来源：\n"
                     + "1. **问诊证据**：症状描述、持续时间、伴随症状等\n"
                     + "2. **检查证据**：具体检查项目名称、检查部位、异常结果\n"
-                    + "3. **排除依据**：哪些检查结果正常，排除了哪些疾病\n\n"
+                    + "3. **复诊证据**：患者携带检查报告回诊时提供的补充症状或新发现（若有）\n"
+                    + "4. **排除依据**：哪些检查结果正常，排除了哪些疾病\n\n"
                     + "在diagnosis字段中必须包含：\n"
                     + "- name: 明确的诊断名称（如存在多个假设，用'/'分隔或选主要假设）\n"
                     + "- evidence: 列出支持诊断的具体证据（格式：'问诊：XXX'、'检查：XXX部位XXX项目显示XXX'）\n"
@@ -1922,7 +2005,7 @@ class CommonOPDGraph:
                         logger.info(f"\n⚠️  诊断不确定（{diagnosis_uncertainty}），开始补充问诊...")
                         
                         qa_list = state.agent_interactions.get("doctor_patient_qa", [])
-                        max_c12_questions = min(2, remaining_global_questions)  # C12最多补充2轮
+                        max_c12_questions = min(5, remaining_global_questions)  # C12最多补充5轮
                         questions_asked_in_c12 = 0
                         
                         _log_detail(f"\n💬 诊断补充问诊（最多{max_c12_questions}轮）:", state, 1, "C12")
@@ -2009,8 +2092,9 @@ class CommonOPDGraph:
                                 + "诊断必须明确引用以下证据来源：\n"
                                 + "1. **问诊证据**：症状描述、持续时间、伴随症状等\n"
                                 + "2. **检查证据**：具体检查项目名称、检查部位、异常结果\n"
-                                + "3. **补充问诊**：基于补充问诊获得的关键信息\n"
-                                + "4. **排除依据**：哪些检查结果正常，排除了哪些疾病\n\n"
+                                + "3. **复诊证据**：患者携带检查报告回诊时提供的补充症状或新发现（若有）\n"
+                                + "4. **补充问诊**：基于诊断不确定性追问获得的关键信息\n"
+                                + "5. **排除依据**：哪些检查结果正常，排除了哪些疾病\n\n"
                                 + "在diagnosis字段中必须包含：\n"
                                 + "- name: 明确的诊断名称（如存在多个假设，用'/'分隔或选主要假设）\n"
                                 + "- evidence: 列出支持诊断的具体证据（格式：'问诊：XXX'、'检查：XXX部位XXX项目显示XXX'）\n"
@@ -2160,6 +2244,10 @@ class CommonOPDGraph:
                     else (["LLM_USED"] if self.llm else []),
                 )
             )
+            # 推进时间（医生综合分析与诊断约需10分钟）
+            if self.world:
+                self.world.advance_time(minutes=10)
+                state.sync_physical_state()
             _log_node_end("C12", state)
             return state
 
@@ -2232,15 +2320,50 @@ class CommonOPDGraph:
             # 3. 处置决定
             _log_detail("\n🏥 处置决定:", state, 1, "C13")
             disposition: list[str] = []
-            if "急诊" in state.escalations:
-                disposition.append("建议立即急诊评估")
-                _log_detail("  ⚠️  建议立即急诊评估", state, 1, "C13")
-            if "住院" in state.escalations:
-                disposition.append("建议住院进一步检查治疗")
-                _log_detail("  ⚠️  建议住院治疗", state, 1, "C13")
+
+            # ── 优先级最高：急诊 ──
+            if any(k in state.escalations for k in ("急诊", "emergency")):
+                disposition.append("急诊")
+                _log_detail("  🚨 急诊：建议立即转急诊科评估", state, 1, "C13")
+
+            # ── 次之：住院 ──
+            if any(k in state.escalations for k in ("住院", "admission")):
+                disposition.append("住院")
+                _log_detail("  🏨 住院：建议收入院进一步检查治疗", state, 1, "C13")
+
+            # ── 转诊（有转诊建议且非住院/急诊情形）──
+            if referral and "急诊" not in disposition and "住院" not in disposition:
+                disposition.append("转诊")
+                _log_detail(f"  🔀 转诊：{referral[0] if isinstance(referral, list) and referral else referral}", state, 1, "C13")
+
+            # ── 门诊普通处置（无需急诊/住院时，逐项细化）──
             if not disposition:
-                disposition.append("门诊对症处理/取药/观察")
-                _log_detail("  ✅ 门诊对症处理/取药/观察", state, 1, "C13")
+                has_medication = bool(
+                    state.treatment_plan.get("symptomatic")
+                    or state.treatment_plan.get("etiology")
+                    or state.treatment_plan.get("medications")
+                )
+                needs_observation = any(
+                    kw in str(state.diagnosis.get("uncertainty", ""))
+                    for kw in ("high", "medium")
+                ) or any(
+                    kw in str(state.followup_plan.get("monitoring", ""))
+                    for kw in ("观察", "监测", "复查")
+                )
+                needs_followup_test = bool(state.treatment_plan.get("tests"))
+
+                if has_medication:
+                    disposition.append("取药")
+                    _log_detail("  💊 取药：前往药房取药", state, 1, "C13")
+                if needs_followup_test:
+                    disposition.append("门诊复查")
+                    _log_detail("  🔬 门诊复查：按医嘱完成后续检查", state, 1, "C13")
+                if needs_observation:
+                    disposition.append("观察")
+                    _log_detail("  👁  观察：留观或密切关注症状变化", state, 1, "C13")
+                if not disposition:
+                    disposition.append("门诊对症处理")
+                    _log_detail("  ✅ 门诊对症处理：按医嘱处置后离院", state, 1, "C13")
             
             state.treatment_plan["disposition"] = disposition
             
@@ -2876,16 +2999,6 @@ class CommonOPDGraph:
                     "time": time_str,
                 })
             
-            # 显示移动轨迹
-            if hasattr(state, 'movement_history') and state.movement_history:
-                _log_detail("\n🚺 就诊移动轨迹:", state, 1, "C16")
-                for idx, move in enumerate(state.movement_history, 1):
-                    from_loc = move.get('from', '未知')
-                    to_loc = move.get('to', '未知')
-                    node = move.get('node', '')
-                    time_str = move.get('time', '')
-                    _log_detail(f"  [{idx}] {from_loc} → {to_loc}  ({node}, {time_str})", state, 1, "C16")
-            
             # 【资源释放】释放医生资源
             if self.world and state.patient_id:
                 released = self.world.release_doctor(state.patient_id)
@@ -2907,49 +3020,22 @@ class CommonOPDGraph:
                     logger.info(f"  检验次数: {summary['lab_tests_count']}")
                     logger.info(f"  处方次数: {summary['prescriptions_count']}")
             
-            # ===== 时间管理：记录出院事件并生成患者完整时间线报告 =====
-            if self.world and self.world.time_manager:
-                # 记录出院事件
-                self.world.time_manager.record_event(TimeEvent(
-                    event_type=EventType.PATIENT_DISCHARGE,
-                    timestamp=self.world.current_time,
-                    patient_id=state.patient_id,
-                    location=state.current_location,
-                    metadata={"diagnosis": state.diagnosis.get("name", "未明确")}
-                ))
-                
-                timeline = self.world.time_manager.get_patient_timeline(state.patient_id)
-                if timeline:
-                    case_id = state.case_data.get("id") if state.case_data else None
-                    patient_display = f"P{case_id}" if case_id is not None else state.patient_id
-                    
-                    logger.info(f"\n⏱️  {patient_display} 就诊时间线:")
-                    logger.info(f"  到达时间: {timeline.arrival_time.strftime('%H:%M:%S')}")
-                    if timeline.discharge_time:
-                        duration = timeline.get_total_duration()
-                        # 保存物理模拟时长到state（覆盖之前的真实时间计算）
-                        state.appointment["simulated_duration_minutes"] = duration
-                        logger.info(f"  离院时间: {timeline.discharge_time.strftime('%H:%M:%S')}")
-                        logger.info(f"  总就诊时长: {duration} 分钟")
-                    logger.info(f"  当前状态: {timeline.get_current_status()}")
-                    
-                    # 显示关键事件
-                    key_events = []
-                    for event in timeline.events:
-                        if event.event_type.value in ['patient_arrival', 'patient_registration', 'consultation_start', 
-                                                       'consultation_end', 'exam_start', 'exam_end', 'patient_discharge']:
-                            key_events.append(f"    [{event.timestamp.strftime('%H:%M:%S')}] {event.event_type.value}")
-                    
-                    if key_events:
-                        logger.info(f"  关键事件:")
-                        for evt in key_events[:10]:  # 只显示前10个关键事件
-                            logger.info(evt)
+            # 计算就诊总时长（基于物理世界时钟）
+            visit_start_str = state.appointment.get("visit_start_time")
+            if visit_start_str and self.world:
+                import datetime as _dt
+                visit_start = _dt.datetime.fromisoformat(visit_start_str)
+                duration = (self.world.current_time - visit_start).total_seconds() / 60
+                state.appointment["simulated_duration_minutes"] = duration
+                case_id = state.case_data.get("id") if state.case_data else None
+                patient_display = f"P{case_id}" if case_id is not None else state.patient_id
+                logger.info(f"\n⏱️  {patient_display} 就诊总时长: {duration:.0f} 分钟")
             
             # 评估诊断准确性
             if state.ground_truth:
                 logger.info("\n📊 评估诊断准确性...")
                 doctor_diagnosis = state.diagnosis.get("name", "")
-                correct_diagnosis = state.ground_truth.get("Final Diagnosis", "")
+                correct_diagnosis = state.ground_truth.get("初步诊断", "")  # ground_truth 仅含初步诊断字段
                 
                 logger.info(f"  👨‍⚕️  医生诊断: {doctor_diagnosis}")
                 
@@ -3022,6 +3108,59 @@ class CommonOPDGraph:
                 logger.debug(f"  💬 问诊轮数: {evaluation['questions_asked']}")
                 logger.debug(f"  🧪 开单数量: {evaluation['tests_ordered']}")
 
+            # 【对话历史CSV存储】保存患者对话历史到CSV
+            if PATIENT_CONVERSATION_CSV_AVAILABLE and state.patient_id:
+                try:
+                    import os
+                    from pathlib import Path
+                    
+                    # 获取项目根目录（common_opd_graph.py的上两级目录）
+                    current_file = Path(__file__).resolve()
+                    project_root = current_file.parent.parent.parent
+                    csv_storage_path = project_root / "patient_history_csv"
+                    
+                    csv_manager = PatientHistoryCSV(storage_root=csv_storage_path)
+                    
+                    # 获取所有问诊对话记录
+                    qa_list = state.agent_interactions.get("doctor_patient_qa", [])
+                    
+                    # 确定文件ID：优先使用case_id，否则使用patient_id
+                    case_id = state.case_data.get("id") if state.case_data else None
+                    file_id = case_id if case_id else state.patient_id
+                    
+                    # 批量保存所有问诊对话
+                    saved_count = 0
+                    for qa in qa_list:
+                        question = qa.get("question", "")
+                        answer = qa.get("answer", "")
+                        node = qa.get("node", "unknown")
+                        
+                        if question and answer:
+                            success = csv_manager.store_conversation(
+                                patient_id=state.patient_id,
+                                question=question,
+                                answer=answer,
+                                metadata={
+                                    "node": node,
+                                    "dept": state.dept,
+                                    "diagnosis": state.diagnosis.get("name", ""),
+                                    "session_id": state.run_id,
+                                    "case_id": case_id
+                                },
+                                file_id=file_id
+                            )
+                            if success:
+                                saved_count += 1
+                    
+                    if saved_count > 0:
+                        file_display = f"case_{case_id}" if case_id else f"patient_{state.patient_id}"
+                        _log_detail(f"  💾 已保存 {saved_count} 条对话历史到CSV ({file_display})", state, 2, "C16")
+                        logger.info(f"✅ 患者 {state.patient_id} ({file_display}) 的 {saved_count} 条对话历史已保存到CSV")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️  保存对话历史到CSV失败: {e}")
+            elif not PATIENT_CONVERSATION_CSV_AVAILABLE:
+                logger.debug("  ⏭️  PatientHistoryCSV 模块不可用，跳过CSV存储")
 
             
             state.add_audit(

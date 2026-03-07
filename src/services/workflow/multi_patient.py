@@ -9,7 +9,6 @@ from utils import get_logger
 from loaders import load_diagnosis_arena_case, _get_dataset_size
 from processing import LangGraphMultiPatientProcessor
 from display import format_patient_log, get_patient_color
-from logging_utils import should_log
 from config import Config
 
 
@@ -87,7 +86,7 @@ class MultiPatientWorkflow:
         return available_case_ids[:num_patients]
     
     def calculate_priority_by_symptoms(self, chief_complaint: str) -> int:
-        """根据主诉中的症状严重程度判断优先级
+        """根据主诉判断就诊优先级，优先使用LLM语义理解，失败时降级为默认优先级为5
         
         Args:
             chief_complaint: 主诉
@@ -95,25 +94,32 @@ class MultiPatientWorkflow:
         Returns:
             优先级（1-10，数字越大越紧急）
         """
-        urgent_keywords = ["胸痛", "胸闷", "呼吸困难", "气促", "昏迷", "意识不清",
-                          "大出血", "出血不止", "休克", "抽搐", "癫痫发作",
-                          "窒息", "严重外伤", "骨折", "剧烈头痛"]
-        severe_keywords = ["剧烈疼痛", "持续发热", "高热", "呕血", "黑便", "便血",
-                          "咯血", "晕厥", "持续呕吐", "腹痛加重", "无法忍受",
-                          "突发", "急性"]
-        moderate_keywords = ["疼痛", "不适", "发热", "咳嗽", "头晕", "乏力",
-                            "腹泻", "恶心", "反酸", "烧心"]
-        
-        complaint_lower = chief_complaint.lower()
-        
-        if any(keyword in complaint_lower for keyword in urgent_keywords):
-            return random.randint(9, 10)
-        elif any(keyword in complaint_lower for keyword in severe_keywords):
-            return random.randint(7, 8)
-        elif any(keyword in complaint_lower for keyword in moderate_keywords):
-            return random.randint(5, 6)
-        else:
-            return random.randint(3, 4)
+        # 优先使用LLM语义判断
+        if self.llm:
+            try:
+                system_prompt = (
+                    "你是急诊分诊护士，根据患者主诉判断就诊紧急程度。\n"
+                    "评分标准：\n"
+                    "  9-10分：危及生命，需立即处理（昏迷、休克、大出血、严重呼吸困难等）\n"
+                    "  7-8分：病情严重，需尽快处理（高热、剧烈疼痛、晕厥、呕血等）\n"
+                    "  5-6分：病情中等，需较快处理（发热、头晕、持续疼痛、恶心呕吐等）\n"
+                    "  3-4分：病情较轻，可正常排队（轻微不适、慢性症状复查等）\n"
+                    "只返回JSON，格式：{\"priority\": <整数>, \"reason\": \"<简短理由>\"}"
+                )
+                obj, _, _ = self.llm.generate_json(
+                    system_prompt=system_prompt,
+                    user_prompt=f"患者主诉：{chief_complaint}",
+                    fallback=lambda: {"priority": 5, "reason": "fallback"},
+                    temperature=0.1,
+                )
+                priority = int(obj.get("priority", 5))
+                priority = max(1, min(10, priority))  # 限制在1-10范围内
+                logger.debug(f"  🤖 LLM优先级评估: {priority}分 - {obj.get('reason', '')}")
+                return priority
+            except Exception as e:
+                logger.debug(f"  ⚠️  LLM优先级评估失败，返回默认值5: {e}")
+
+        return 5  # LLM不可用或失败时返回中等优先级
     
     def submit_patient(self, i: int, case_id: int, total_patients: int) -> str:
         """提交一个患者到处理队列
@@ -126,33 +132,17 @@ class MultiPatientWorkflow:
         Returns:
             任务ID
         """
-        # 加载病例获取主诉和 Patient-SN
+        # 加载病例获取主诉
         try:
             case_bundle = load_diagnosis_arena_case(case_id)
             known_case = case_bundle["known_case"]
-            case_info = known_case.get("Case Information", "")
-            dataset_index = known_case.get('id', 'unknown')
-            original_case_id = known_case.get('Patient-SN', 'N/A')
+            dataset_index = known_case.get('id', case_id)
+            patient_id = f"patient_{case_id:03d}"
             
-            # 使用 Patient-SN 作为患者ID（如果可用）
-            if original_case_id and original_case_id != 'N/A':
-                patient_id = f"patient_{original_case_id}"
-            else:
-                patient_id = f"patient_{case_id:03d}"
-            
-            # 提取主诉
-            if "主诉：" in case_info:
-                start_idx = case_info.find("主诉：") + 3
-                remaining = case_info[start_idx:]
-                end_markers = ["现病史：", "既往史：", "个人史：", "家族史：", "体格检查：", "\n\n"]
-                end_idx = len(remaining)
-                for marker in end_markers:
-                    pos = remaining.find(marker)
-                    if pos != -1 and pos < end_idx:
-                        end_idx = pos
-                chief_complaint = remaining[:end_idx].strip()
-            else:
-                chief_complaint = case_info[:100].strip()
+            # 仅使用新字段主诉
+            chief_complaint = str(known_case.get("主诉", "")).strip()
+            if not chief_complaint:
+                raise ValueError("病例缺少新字段'主诉'")
             
             priority = self.calculate_priority_by_symptoms(chief_complaint)
         except Exception as e:
@@ -160,16 +150,24 @@ class MultiPatientWorkflow:
             priority = random.randint(5, 7)
             chief_complaint = "未知"
             dataset_index = case_id
-            original_case_id = "N/A"
+            patient_id = f"patient_{case_id:03d}"
         
-        # 显示患者到达信息（简洁版）
+        # 显示患者到达信息
         color = get_patient_color(i)
         priority_icon = "🚨" if priority >= 9 else "⚠️" if priority >= 7 else "📋"
-        
+        priority_label = f"{priority_icon} 优先级 P{priority}"
+        complaint_preview = chief_complaint[:]
+
         if total_patients == 1:
-            logger.info(f"{color}▶ P{dataset_index} 就诊 ({priority_icon}P{priority})\033[0m")
+            logger.info(
+                f"{color}▶ 患者到达 | 病例编号: P{dataset_index} | ID: {patient_id} | "
+                f"{priority_label}\033[0m"
+            )
         else:
-            logger.info(f"{color}▶ P{dataset_index} [{i+1}/{total_patients}] ({priority_icon}P{priority})\033[0m")
+            logger.info(
+                f"{color}▶ 患者到达 [{i+1}/{total_patients}] | 病例编号: P{dataset_index} | ID: {patient_id} | "
+                f"{priority_label}\033[0m"
+            )
         
         # 提交患者
         task_id = self.processor.submit_patient(
@@ -184,36 +182,27 @@ class MultiPatientWorkflow:
         
         return task_id
     
-    def schedule_patients(self, case_ids: List[int], interval: float) -> List[str]:
+    def schedule_patients(self, case_ids: List[int], interval: float) -> None:
         """按时间间隔调度患者
         
         Args:
             case_ids: 病例ID列表
             interval: 患者间隔时间（秒）
-        
-        Returns:
-            任务ID列表
         """
-        task_ids = []
-        timers = []
         total_patients = len(case_ids)
+        timers = []
         
         for i, case_id in enumerate(case_ids):
             delay = i * interval
             timer = threading.Timer(
                 delay,
-                lambda idx=i, cid=case_id: task_ids.append(
-                    self.submit_patient(idx, cid, total_patients)
-                )
+                lambda idx=i, cid=case_id: self.submit_patient(idx, cid, total_patients)
             )
             timer.start()
             timers.append(timer)
         
-        # 等待所有定时器完成
         for timer in timers:
             timer.join()
-        
-        return task_ids
     
     def start_monitoring(self) -> threading.Thread:
         """启动状态监控线程
@@ -227,30 +216,48 @@ class MultiPatientWorkflow:
         return monitor_thread
     
     def _monitor_loop(self) -> None:
-        """监控循环（内部方法）"""
-        iteration = 0
+        """监控循环（内部方法）- 每完成一例患者时显示系统状态"""
+        def _sleep_interruptible(seconds: int) -> bool:
+            end_time = time.time() + seconds
+            while self.monitoring_active.is_set() and time.time() < end_time:
+                time.sleep(0.2)
+            return self.monitoring_active.is_set()
+
+        prev_completed = 0
         while self.monitoring_active.is_set():
-            time.sleep(60)
-            iteration += 1
-            
+            if not _sleep_interruptible(15):
+                break
+
             # 检查是否有活跃患者，但要考虑患者可能还在路上
             active_count = self.processor.get_active_count()
             if active_count == 0:
                 # 等待一段时间，防止患者还未到达就退出
-                time.sleep(10)
+                if not _sleep_interruptible(10):
+                    break
                 active_count = self.processor.get_active_count()
                 if active_count == 0:
                     break
-            
-            if not should_log(2, "main", "monitor") and iteration % 4 != 0:
-                continue
-            
-            self._display_system_status(active_count)
+
+            # 检测完成数量变化，有新患者完成时显示状态
+            sys_stats = self.coordinator.get_system_stats()
+            current_completed = sys_stats['total_consultations_completed']
+            if current_completed > prev_completed:
+                prev_completed = current_completed
+                self._display_system_status(active_count)
     
     def _display_system_status(self, active_count: int) -> None:
         """显示系统状态（内部方法）"""
         sys_stats = self.coordinator.get_system_stats()
-        logger.info(f"🟢 活动:{active_count} | 医生:{sys_stats['available_doctors']}/{sys_stats['total_doctors']} | 完成:{sys_stats['total_consultations_completed']}")
+        available = sys_stats['available_doctors']
+        total = sys_stats['total_doctors']
+        busy = total - available
+        completed = sys_stats['total_consultations_completed']
+        logger.info(
+            f"📊 系统状态 | "
+            f"🏃 就诊中: {active_count}人 | "
+            f"👨‍⚕️ 医生: {available}空闲/{busy}忙碌/{total}总计 | "
+            f"✅ 已完成: {completed}例"
+        )
     
     def stop_monitoring(self, monitor_thread: threading.Thread) -> None:
         """停止监控
@@ -259,7 +266,7 @@ class MultiPatientWorkflow:
             monitor_thread: 监控线程对象
         """
         self.monitoring_active.clear()
-        monitor_thread.join(timeout=2)
+        monitor_thread.join(timeout=30)
     
     def wait_for_completion(self, num_patients: int, timeout: int = None) -> List[Dict[str, Any]]:
         """等待所有患者完成

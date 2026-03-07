@@ -1,6 +1,6 @@
 """
 配置管理模块
-支持多层级配置：默认值 < config.yaml < 环境变量 < CLI参数
+支持多层级配置：默认值 < config.yaml < 环境变量
 """
 from __future__ import annotations
 
@@ -20,20 +20,17 @@ except ImportError:
 class LLMConfig:
     """LLM配置"""
     backend: str = "deepseek"
-    enable_reports: bool = False
 
 
 @dataclass
 class AgentConfig:
     """智能体配置"""
-    max_questions: int = 10  # 医生最多问几个问题（最底层默认值，优先级：CLI > 环境变量 > config.yaml > 此默认值）
-    max_triage_questions: int = 3  # 护士分诊时最多问几个问题
+    max_questions: int = 10  # 医生最多问几个问题（最底层默认值，优先级：环境变量 > config.yaml > 此默认值）
 
 
 @dataclass
 class RAGConfig:
     """RAG配置（Adaptive RAG 系统）"""
-    skip_rag: bool = False
     # Adaptive RAG 配置
     spllm_root: Path = field(default_factory=lambda: Path("SPLLM-RAG1"))  # SPLLM-RAG1 项目路径
     adaptive_cache_folder: Optional[Path] = None  # 模型缓存目录（默认为 spllm_root/model_cache）
@@ -81,13 +78,12 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     
     @classmethod
-    def load(cls, config_file: Optional[Path] = None, cli_args=None) -> Config:
+    def load(cls, config_file: Optional[Path] = None) -> Config:
         """
-        加载配置，优先级：CLI参数 > 环境变量 > config.yaml > 默认值
+        加载配置，优先级：环境变量 > config.yaml > 默认值
         
         Args:
             config_file: 配置文件路径
-            cli_args: argparse解析的命令行参数
         """
         config = cls()
         
@@ -101,10 +97,6 @@ class Config:
         
         # 2. 从环境变量加载
         config._load_from_env()
-        
-        # 3. 从CLI参数加载（最高优先级）
-        if cli_args:
-            config._load_from_args(cli_args)
         
         return config
     
@@ -122,26 +114,16 @@ class Config:
                 llm_data = data["llm"]
                 if "backend" in llm_data:
                     self.llm.backend = llm_data["backend"]
-                if "enable_reports" in llm_data:
-                    self.llm.enable_reports = llm_data["enable_reports"]
             
             # Agent配置
             if "agent" in data:
                 agent_data = data["agent"]
                 if "max_questions" in agent_data:
                     self.agent.max_questions = agent_data["max_questions"]
-                if "max_triage_questions" in agent_data:
-                    self.agent.max_triage_questions = agent_data["max_triage_questions"]
             
             # RAG配置
             if "rag" in data:
                 rag_data = data["rag"]
-                if "persist_dir" in rag_data:
-                    self.rag.persist_dir = Path(rag_data["persist_dir"])
-                if "collection_name" in rag_data:
-                    self.rag.collection_name = rag_data["collection_name"]
-                if "skip_rag" in rag_data:
-                    self.rag.skip_rag = rag_data["skip_rag"]
                 # Adaptive RAG 配置
                 if "spllm_root" in rag_data:
                     self.rag.spllm_root = Path(rag_data["spllm_root"])
@@ -183,8 +165,6 @@ class Config:
                     self.database.connection_string = db_data["connection_string"]
                 if "backup_to_file" in db_data:
                     self.database.backup_to_file = db_data["backup_to_file"]
-                if "echo" in db_data:
-                    self.database.echo = db_data["echo"]
                     
         except Exception as e:
             # 静默失败，使用默认值
@@ -195,54 +175,12 @@ class Config:
         # LLM配置
         if os.getenv("HOSPITAL_LLM_BACKEND"):
             self.llm.backend = os.getenv("HOSPITAL_LLM_BACKEND")
-        if os.getenv("HOSPITAL_LLM_REPORTS"):
-            self.llm.enable_reports = os.getenv("HOSPITAL_LLM_REPORTS").lower() in ("true", "1", "yes")
         
         # Agent配置
         if os.getenv("HOSPITAL_MAX_QUESTIONS"):
             self.agent.max_questions = int(os.getenv("HOSPITAL_MAX_QUESTIONS"))
         
-        # RAG配置
-        if os.getenv("HOSPITAL_CHROMA_DIR"):
-            self.rag.persist_dir = Path(os.getenv("HOSPITAL_CHROMA_DIR"))
-        if os.getenv("HOSPITAL_COLLECTION"):
-            self.rag.collection_name = os.getenv("HOSPITAL_COLLECTION")
-    
-    def _load_from_args(self, args) -> None:
-        """从CLI参数加载配置（最高优先级）"""
-        # LLM配置
-        if hasattr(args, "llm") and args.llm:
-            self.llm.backend = args.llm
-        if hasattr(args, "llm_reports") and args.llm_reports:
-            self.llm.enable_reports = args.llm_reports
-        
-        # Agent配置
-        if hasattr(args, "max_questions") and args.max_questions is not None:
-            self.agent.max_questions = args.max_questions
-        
-        # RAG配置
-        if hasattr(args, "persist") and args.persist:
-            self.rag.persist_dir = args.persist
-        if hasattr(args, "collection") and args.collection:
-            self.rag.collection_name = args.collection
-        if hasattr(args, "skip_rag"):
-            self.rag.skip_rag = args.skip_rag
-        
-        # Mode配置
-        if hasattr(args, "multi_patient"):
-            self.mode.multi_patient = args.multi_patient
-        if hasattr(args, "num_patients") and args.num_patients is not None:
-            self.mode.num_patients = args.num_patients
-        if hasattr(args, "patient_interval") and args.patient_interval is not None:
-            self.mode.patient_interval = args.patient_interval
-        
-        # Physical配置
-        if hasattr(args, "interactive"):
-            self.physical.interactive = args.interactive
-        
-        # 系统配置
-        if hasattr(args, "verbose"):
-            self.system.verbose = args.verbose
+
     
     def summary(self) -> str:
         """生成配置摘要"""
@@ -251,23 +189,11 @@ class Config:
             "🔧 系统配置:",
             f"  - 运行模式: {mode}",
             f"  - LLM后端: {self.llm.backend}",
-            f"  - 增强报告: {'是' if self.llm.enable_reports else '否'}",
             f"  - 最多问题数: {self.agent.max_questions}",
-            f"  - 数据源: HuggingFace DiagnosisArena",
-            f"  - RAG集合: {self.rag.collection_name}",
+            f"  - Adaptive RAG 阈值: {self.rag.adaptive_threshold}",                                                                        
         ]
         if self.mode.multi_patient:
             lines.append(f"  - 患者数量: {self.mode.num_patients}")
             lines.append(f"  - 进入间隔: {self.mode.patient_interval}秒")
-        
-        # 微服务配置
-        if self.microservices.enabled:
-            lines.append("\n🏢 架构模式: 微服务 (Microservices)")
-            lines.append(f"  - 病例服务: {self.microservices.record_service_url}")
-            lines.append(f"  - 患者服务: {self.microservices.patient_service_url}")
-            lines.append(f"  - 医生服务: {self.microservices.doctor_service_url}")
-            lines.append(f"  - 通知服务: {self.microservices.notification_service_url}")
-        else:
-            lines.append("\n🏢 架构模式: 单体 (Monolithic)")
         
         return "\n".join(lines)

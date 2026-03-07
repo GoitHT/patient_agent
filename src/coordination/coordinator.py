@@ -18,6 +18,10 @@ from queue import PriorityQueue, Queue, Empty
 from typing import Dict, List, Optional, Any, Set
 from datetime import datetime
 
+# 优先级老化常量：每等待 PRIORITY_AGING_INTERVAL 秒，有效优先级提升 1 点，上限 PRIORITY_MAX
+PRIORITY_AGING_INTERVAL: int = 300  # 5 分钟
+PRIORITY_MAX: int = 10
+
 from utils import get_logger, now_iso
 
 logger = get_logger("hospital_agent.coordinator")
@@ -107,11 +111,13 @@ class PatientSession:
     consultation_doctors: Set[str] = field(default_factory=set)  # 参与会诊的医生
     lab_results_ready: bool = False     # 检验结果是否就绪
     imaging_results_ready: bool = False # 影像结果是否就绪
-    
+    queue_entry_time: float = 0.0       # 进入等候队列的时间戳（用于老化计算）
+    effective_priority: int = 0         # 老化后的有效优先级（动态更新）
+
     def __lt__(self, other):
-        """优先级队列排序（优先级高的排前面）"""
-        if self.priority != other.priority:
-            return self.priority > other.priority  # 优先级高的先
+        """优先级队列排序（使用老化后的有效优先级，防止饥饿）"""
+        if self.effective_priority != other.effective_priority:
+            return self.effective_priority > other.effective_priority  # 有效优先级高的先
         return self.arrival_time < other.arrival_time  # 同优先级按到达时间
 
 
@@ -290,7 +296,9 @@ class HospitalCoordinator:
             
             dept = session.dept
             session.status = PatientStatus.WAITING
-            
+            session.queue_entry_time = time.time()
+            session.effective_priority = session.priority  # 初始有效优先级等于原始优先级
+
             # 加入优先级队列
             self.waiting_queues[dept].put(session)
             
@@ -311,21 +319,59 @@ class HospitalCoordinator:
     
     # ========== 医生-患者匹配调度 ==========
     
+    def _apply_aging_to_queue(self, dept: str) -> None:
+        """对等候队列应用优先级老化：每等待 PRIORITY_AGING_INTERVAL 秒提升 1 点有效优先级。
+
+        由于 PriorityQueue 内部堆不会自动重排，需在每次分配前重建队列。
+        此方法必须在持有 self._lock 的情况下调用。
+        """
+        if dept not in self.waiting_queues:
+            return
+        queue = self.waiting_queues[dept]
+        if queue.empty():
+            return
+
+        current_time = time.time()
+        items: list = []
+        while not queue.empty():
+            try:
+                session = queue.get_nowait()
+                wait_seconds = current_time - session.queue_entry_time
+                aging_bonus = int(wait_seconds / PRIORITY_AGING_INTERVAL)
+                new_effective = min(PRIORITY_MAX, session.priority + aging_bonus)
+                if new_effective != session.effective_priority:
+                    case_id = session.patient_data.get("case_id")
+                    patient_display = f"P{case_id}" if case_id is not None else session.patient_id
+                    logger.info(
+                        f"[{patient_display}] ⏫ 优先级老化: {session.effective_priority} → {new_effective}"
+                        f"（已等待 {wait_seconds:.0f}s）"
+                    )
+                    session.effective_priority = new_effective
+                items.append(session)
+            except Empty:
+                break
+
+        # 将重新计算后的患者放回队列（heapq 会按 effective_priority 重新排序）
+        for item in items:
+            queue.put(item)
+
     def _try_assign_doctor(self, dept: str) -> bool:
         """
         尝试为等候患者分配医生（自动调度）
         优化：循环分配直到队列为空或无可用医生
-        
+
         Args:
             dept: 科室
-            
+
         Returns:
             bool: 是否成功分配至少一个
         """
         assigned_count = 0
-        
+
         while True:
             with self._lock:
+                # 分配前更新所有等候患者的有效优先级（老化）
+                self._apply_aging_to_queue(dept)
                 # 查找空闲医生
                 available_doctors = [
                     d for d in self.doctors.values()

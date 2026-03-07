@@ -88,10 +88,6 @@ class DeepSeekLLMClient:
         max_retries = int(os.getenv("DEEPSEEK_MAX_RETRIES", "3"))
         retry_delay = float(os.getenv("DEEPSEEK_RETRY_DELAY", "2.0"))
         
-        # 输出实际使用的配置（用于调试）
-        # 改为debug级别，避免终端重复输出
-        # logger.debug(f"🔧 LLM配置: URL={base_url}, Model={model}, Key={api_key[:12]}...")
-        
         return DeepSeekLLMClient(
             DeepSeekConfig(
                 api_key=api_key, 
@@ -100,6 +96,45 @@ class DeepSeekLLMClient:
                 timeout_s=timeout_s,
                 max_retries=max_retries,
                 retry_delay=retry_delay
+            )
+        )
+
+    @staticmethod
+    def from_env_chatgpt() -> "DeepSeekLLMClient":
+        """使用 .env 中 CHATGPT_* 环境变量构建客户端（OpenAI 兼容接口）。"""
+        api_key = os.getenv("CHATGPT_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "缺少环境变量: CHATGPT_API_KEY\n"
+                "请在 .env 文件中设置: CHATGPT_API_KEY=your-api-key"
+            )
+
+        base_url = os.getenv("CHATGPT_API_BASE_URL", "").strip()
+        if not base_url:
+            raise RuntimeError(
+                "缺少环境变量: CHATGPT_API_BASE_URL\n"
+                "请在 .env 文件中设置: CHATGPT_API_BASE_URL=https://api.apiyi.com/v1"
+            )
+
+        model = os.getenv("CHATGPT_MODEL", "").strip()
+        if not model:
+            raise RuntimeError(
+                "缺少环境变量: CHATGPT_MODEL\n"
+                "请在 .env 文件中设置: CHATGPT_MODEL=gpt-4o"
+            )
+
+        timeout_s = float(os.getenv("CHATGPT_TIMEOUT_S", "120"))
+        max_retries = int(os.getenv("CHATGPT_MAX_RETRIES", "3"))
+        retry_delay = float(os.getenv("CHATGPT_RETRY_DELAY", "2.0"))
+
+        return DeepSeekLLMClient(
+            DeepSeekConfig(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                timeout_s=timeout_s,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
             )
         )
 
@@ -244,12 +279,12 @@ class DeepSeekLLMClient:
         )
 
 
-def build_llm_client(mode: str | None) -> LLMClient | None:
-    """Factory used by CLI/router. `mode` can be: None/'mock'/'deepseek'."""
+def build_llm_client(mode: str | None) -> LLMClient:
+    """Factory used by CLI/router. `mode` can be: 'deepseek'/'chatgpt'."""
 
-    if mode is None or mode == "mock":
-        return None
     if mode == "deepseek":
         return DeepSeekLLMClient.from_env()
-    raise ValueError(f"Unknown LLM mode: {mode}")
+    if mode == "chatgpt":
+        return DeepSeekLLMClient.from_env_chatgpt()
+    raise ValueError(f"Unknown LLM mode: {mode!r}，可选值: deepseek / chatgpt")
 

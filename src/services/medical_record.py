@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field, asdict
+import uuid
 
 from utils import now_iso, get_logger
 
@@ -119,7 +120,6 @@ class MedicalRecordService:
             storage_dir: 病例存储目录，默认为 ./medical_records/
         """
         self.storage_dir = storage_dir or Path("./medical_records")
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         # 内存缓存（当前会话的活跃病例）
         self._active_records: Dict[str, MedicalRecord] = {}
@@ -137,7 +137,7 @@ class MedicalRecordService:
         Returns:
             新创建的病例对象
         """
-        record_id = self._generate_record_id(patient_id)
+        record_id = self._generate_record_id(patient_id, patient_profile)
         now = now_iso()
         
         record = MedicalRecord(
@@ -676,10 +676,16 @@ class MedicalRecordService:
     
     # ===== 内部辅助方法 =====
     
-    def _generate_record_id(self, patient_id: str) -> str:
-        """生成病例号"""
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        return f"MR-{patient_id}-{timestamp}"
+    def _generate_record_id(self, patient_id: str, patient_profile: Optional[Dict[str, Any]] = None) -> str:
+        """生成病例号（稳定）：MR-{UUID12}-{case_id}
+
+        规则：同一患者 + 同一 case_id 生成同一个病历号，可跨多次门诊复用。
+        """
+        profile = patient_profile or {}
+        case_id = str(profile.get("case_id", "unknown_case"))
+        stable_name = f"{patient_id}:{case_id}"
+        stable_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, stable_name).hex[:12]
+        return f"MR-{stable_uuid}-{case_id}"
     
     def _add_entry(self, record: MedicalRecord, entry_type: str,
                    location: str, operator: str, content: Dict[str, Any], notes: str = ""):

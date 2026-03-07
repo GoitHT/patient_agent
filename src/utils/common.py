@@ -7,6 +7,7 @@ import logging
 import random
 import re
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -27,64 +28,44 @@ def _extract_json_object(text: str) -> str | None:
 
 
 def _clean_json_string(text: str) -> str:
-    """清理JSON字符串中的问题字符，确保可以正确解析"""
+    """清理JSON字符串中的控制字符（换行、制表符），以标准JSON规范处理引号边界。
+    
+    注意：不尝试修复字符串内部的裸引号，避免因启发式判断失误导致后续JSON全部解析错误。
+    结构性问题（缺失逗号、截断）由 _repair_json 负责。
+    """
     if not text:
         return text
     
     # 移除BOM标记
     text = text.replace('\ufeff', '')
     
-    # 处理字符串字段中的换行符和未转义的引号
     result = []
     in_string = False
     escape_next = False
-    string_start_quote = None  # 记录字符串开始时的引号类型
     
     for i, char in enumerate(text):
         if escape_next:
             result.append(char)
             escape_next = False
             continue
-            
+        
         if char == '\\':
             result.append(char)
             escape_next = True
             continue
-            
+        
         if char == '"':
-            if not in_string:
-                # 开始一个字符串
-                in_string = True
-                string_start_quote = i
-                result.append(char)
-            else:
-                # 可能是字符串结束
-                # 检查下一个非空白字符，判断是否真的结束
-                next_meaningful = None
-                for j in range(i + 1, min(i + 10, len(text))):
-                    if text[j] not in ' \t\n\r':
-                        next_meaningful = text[j]
-                        break
-                
-                # 如果后面是逗号、冒号、}、]，说明是真正的字符串结束
-                if next_meaningful in (',', ':', '}', ']', None):
-                    in_string = False
-                    result.append(char)
-                else:
-                    # 可能是字符串内部的引号，需要转义
-                    result.append('\\"')
+            in_string = not in_string
+            result.append(char)
             continue
         
-        # 如果在字符串中且遇到特殊字符，转义它
         if in_string:
-            if char in ('\n', '\r'):
-                if char == '\n':
-                    result.append('\\n')
-                elif char == '\r':
-                    # 检查是否是\r\n，如果是则跳过\r
-                    if i + 1 < len(text) and text[i + 1] == '\n':
-                        continue
-                    result.append('\\n')
+            if char == '\n':
+                result.append('\\n')
+            elif char == '\r':
+                if i + 1 < len(text) and text[i + 1] == '\n':
+                    continue  # 跳过 \r\n 中的 \r
+                result.append('\\n')
             elif char == '\t':
                 result.append('\\t')
             else:
@@ -95,23 +76,74 @@ def _clean_json_string(text: str) -> str:
     return ''.join(result)
 
 
+def _repair_json(text: str) -> str:
+    """修复两类结构性JSON错误：
+    1. 属性间缺失逗号（LLM常见遗漏）
+    2. 字符串/括号未闭合（LLM输出被截断）
+    """
+    if not text:
+        return text
+    
+    # 修复缺失的逗号：值结束后直接跟着下一个属性键（没有逗号）
+    # 匹配：字符串/数字/真假值/null/}] 后跟换行空白再跟 "key":
+    text = re.sub(
+        r'("(?:[^"\\]|\\.)*"|\d+(?:\.\d+)?|true|false|null|[}\]])'  # 值
+        r'(\s*\n\s*)'                                                    # 换行
+        r'("(?:[^"\\]|\\.)*"\s*:)',                                   # 下一个键
+        r'\1,\2\3',
+        text
+    )
+    
+    # 修复截断：找出未闭合的字符串和括号，在末尾补全
+    stack: list[str] = []
+    in_string = False
+    escape_next = False
+    
+    for char in text:
+        if escape_next:
+            escape_next = False
+            continue
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+        if char == '"':
+            in_string = not in_string
+        elif not in_string:
+            if char in ('{', '['):
+                stack.append(char)
+            elif char == '}' and stack and stack[-1] == '{':
+                stack.pop()
+            elif char == ']' and stack and stack[-1] == '[':
+                stack.pop()
+    
+    suffix: list[str] = []
+    if in_string:
+        suffix.append('"')
+    for bracket in reversed(stack):
+        suffix.append('}' if bracket == '{' else ']')
+    
+    return text + ''.join(suffix)
+
+
 def parse_json_with_retry(
     text: str,
     *,
     fallback: Callable[[], dict[str, Any]],
-    max_attempts: int = 2,
+    max_attempts: int = 3,
 ) -> tuple[dict[str, Any], bool]:
-    """Parse JSON with 1 retry; fallback to a rule-based template.
+    """JSON解析，含多次重试策略：提取 → 结构修复 → 兜底。
+
+    重试策略：
+      attempt 0: 清理控制字符后直接解析
+      attempt 1: 从原始文本提取 {...} 块后重解析
+      attempt 2: 对提取块执行结构修复（补逗号、闭合截断）后重解析
 
     Returns: (parsed_dict, used_fallback)
     """
-    
     logger = logging.getLogger("hospital_agent.utils")
     last_err: Exception | None = None
-    candidate = (text or "").strip()
-    
-    # 首先清理JSON字符串
-    candidate = _clean_json_string(candidate)
+    raw = (text or "").strip()
+    candidate = _clean_json_string(raw)
     
     for attempt in range(max_attempts):
         try:
@@ -121,29 +153,33 @@ def parse_json_with_retry(
             return obj, False
         except Exception as e:  # noqa: BLE001 - fallback is required by spec
             last_err = e
-            if attempt == 0:
-                # 第一次失败，尝试提取JSON对象
-                extracted = _extract_json_object(candidate)
-                if extracted and extracted != candidate:
-                    candidate = extracted.strip()
-                    logger.debug(f"JSON解析失败（尝试{attempt+1}/{max_attempts}），提取JSON对象后重试")
-                else:
-                    logger.debug(f"JSON解析失败（尝试{attempt+1}/{max_attempts}），无法提取有效JSON")
+            if attempt < max_attempts - 1:
+                # 还有后续重试机会，准备下一个候选
+                if attempt == 0:
+                    # 第一次失败：提取 {...} 块，从原始文本重新清理
+                    extracted = _extract_json_object(raw)
+                    if extracted and extracted.strip() != raw:
+                        candidate = _clean_json_string(extracted.strip())
+                        logger.debug(f"JSON解析失败（尝试{attempt+1}/{max_attempts}），提取JSON对象后重试")
+                    else:
+                        logger.debug(f"JSON解析失败（尝试{attempt+1}/{max_attempts}），无法提取有效JSON")
+                elif attempt == 1:
+                    # 第二次失败：结构修复（补缺失逗号 + 闭合截断）
+                    base = _extract_json_object(raw) or raw
+                    repaired = _repair_json(base.strip())
+                    candidate = _clean_json_string(repaired)
+                    logger.debug(f"JSON解析失败（尝试{attempt+1}/{max_attempts}），尝试结构修复后重试")
             else:
                 # 最后一次失败，记录详细错误
                 logger.warning(f"JSON解析失败（所有{max_attempts}次尝试均失败）: {e}")
-                
-                # 尝试定位错误位置并显示上下文
                 if hasattr(e, 'pos') and e.pos:
                     error_pos = e.pos
-                    # 显示错误位置前后50个字符
                     start = max(0, error_pos - 50)
                     end = min(len(candidate), error_pos + 50)
                     context = candidate[start:end]
                     logger.warning(f"错误位置附近: ...{context}...")
                     logger.warning(f"            {' ' * (error_pos - start)}^ 错误在这里")
                 else:
-                    # 没有位置信息，显示前200字符
                     logger.warning(f"失败的文本预览: {candidate[:200]}...")
 
     return fallback(), True
@@ -281,22 +317,37 @@ class ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 
+_setup_logging_lock = threading.Lock()
+
 def setup_console_logging(console_level: int = logging.INFO) -> None:
     """设置终端日志系统：仅输出到控制台"""
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    root_logger.handlers.clear()
-    
-    # 终端处理器 - 显示重要信息
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(console_level)
-    console_formatter = ColoredFormatter(
-        "%(message)s",  # 简洁格式，不显示时间和日志级别
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    console_handler.setFormatter(console_formatter)
-    
-    root_logger.addHandler(console_handler)
+    with _setup_logging_lock:
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.DEBUG)
+        # 仅移除控制台处理器，保留文件处理器，避免重复输出
+        for handler in list(root_logger.handlers):
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                root_logger.removeHandler(handler)
+        
+        # 终端处理器 - 显示重要信息
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(console_level)
+        console_formatter = ColoredFormatter(
+            "%(message)s",  # 简洁格式，不显示时间和日志级别
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        console_handler.setFormatter(console_formatter)
+        console_handler._hospital_console = True
+        
+        # 防御性检查：避免意外添加重复 handler（正常情况不会触发）
+        for existing in root_logger.handlers:
+            if (
+                isinstance(existing, logging.StreamHandler)
+                and not isinstance(existing, logging.FileHandler)
+                and getattr(existing, '_hospital_console', False)
+            ):
+                return
+        root_logger.addHandler(console_handler)
 
 
 # 保留旧函数名作为别名，以保持向后兼容性

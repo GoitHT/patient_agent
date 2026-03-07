@@ -89,9 +89,11 @@ class BaseState(BaseModel):
     # 多智能体系统新增字段
     agent_interactions: dict[str, Any] = Field(default_factory=dict)  # 医患护对话记录
     agent_config: dict[str, Any] = Field(default_factory=dict)  # Agent配置（max_questions等）
-    ground_truth: dict[str, Any] = Field(default_factory=dict)  # 标准答案（用于评估）
+    ground_truth: dict[str, Any] = Field(default_factory=dict)  # 仅含初步诊断，用于后期评估
+    medical_data: dict[str, Any] = Field(default_factory=dict)  # 患者不可见的医疗数据（所有体格检查+辅助检查）供医生/系统参考
     case_data: dict[str, Any] = Field(default_factory=dict)  # 完整病例数据
     node_qa_counts: dict[str, int] = Field(default_factory=dict)  # 每个节点的问答轮数计数
+    interaction_state: list[dict[str, Any]] = Field(default_factory=list)  # 问诊对话记录（与 case_qa_records 表字段完全对应），用于后期评估
     
     # 物理环境集成字段
     world_context: Optional[Any] = Field(default=None, exclude=True)  # HospitalWorld实例（不序列化）
@@ -147,8 +149,10 @@ class BaseState(BaseModel):
             "agent_interactions",
             "agent_config",
             "ground_truth",
+            "medical_data",
             "case_data",
             "node_qa_counts",
+            "interaction_state",
             "physical_state_snapshot",
             "movement_history",
         }

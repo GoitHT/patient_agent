@@ -41,7 +41,7 @@ def display_startup_banner(config: Any) -> None:
     logger.info("\n" + "="*80)
     logger.info("🏥 医院智能体系统 - Hospital Agent System")
     logger.info("="*80)
-    logger.info(f"⚙️  配置: 问诊{config.agent.max_questions}轮 | 分诊{config.agent.max_triage_questions}轮 | LLM={config.llm.backend}")
+    logger.info(f"⚙️  配置: 问诊{config.agent.max_questions}轮 | LLM={config.llm.backend}")
 
 
 def display_mode_info(num_patients: int, patient_interval: float) -> None:
@@ -64,9 +64,10 @@ def display_results_table(results: List[Dict[str, Any]]) -> None:
     Args:
         results: 结果列表
     """
-    logger.info("┌" + "─"*78 + "┐")
-    logger.info("│ " + "患者ID".ljust(15) + "│ " + "案例".ljust(6) + "│ " + "科室".ljust(18) + "│ " + "状态".ljust(8) + "│ " + "节点数".ljust(8) + "│")
-    logger.info("├" + "─"*78 + "┤")
+    lines: List[str] = []
+    lines.append("┌" + "─"*78 + "┐")
+    lines.append("│ " + "患者ID".ljust(15) + "│ " + "案例".ljust(6) + "│ " + "科室".ljust(18) + "│ " + "状态".ljust(8) + "│ " + "节点数".ljust(8) + "│")
+    lines.append("├" + "─"*78 + "┤")
     
     COLOR_RESET = "\033[0m"
     
@@ -80,12 +81,13 @@ def display_results_table(results: List[Dict[str, Any]]) -> None:
             dept = result.get("dept", "N/A")
             node_count = result.get("node_count", 0)
             status_icon = f"{color}✅{COLOR_RESET}"
-            logger.info(f"│ {color}{patient_id[:15].ljust(15)}{COLOR_RESET}│ {str(case_id)[:6].ljust(6)}│ {dept[:18].ljust(18)}│ {status_icon}     │ {str(node_count)[:8].ljust(8)}│")
+            lines.append(f"│ {color}{patient_id[:15].ljust(15)}{COLOR_RESET}│ {str(case_id)[:6].ljust(6)}│ {dept[:18].ljust(18)}│ {status_icon}     │ {str(node_count)[:8].ljust(8)}│")
         else:
             status_icon = f"{color}❌{COLOR_RESET}"
-            logger.info(f"│ {color}{patient_id[:15].ljust(15)}{COLOR_RESET}│ {str(case_id)[:6].ljust(6)}│ {'N/A'[:18].ljust(18)}│ {status_icon}     │ {'N/A'[:8].ljust(8)}│")
+            lines.append(f"│ {color}{patient_id[:15].ljust(15)}{COLOR_RESET}│ {str(case_id)[:6].ljust(6)}│ {'N/A'[:18].ljust(18)}│ {status_icon}     │ {'N/A'[:8].ljust(8)}│")
     
-    logger.info("└" + "─"*78 + "┘\n")
+    lines.append("└" + "─"*78 + "┘")
+    logger.info("\n".join(lines) + "\n")
 
 
 def display_final_statistics(results: List[Dict[str, Any]], num_patients: int) -> None:
@@ -118,6 +120,7 @@ def display_log_files(num_results: int) -> None:
         reverse=True
     )
     if patient_logs:
-        logger.info(f"📋 详细日志: {patient_logs[0].name}")
+        lines = [f"📋 详细日志: {patient_logs[0].name}"]
         if num_results > 1:
-            logger.info(f"   (+{num_results-1} 个其他文件)")
+            lines.append(f"   (+{num_results-1} 个其他文件)")
+        logger.info("\n".join(lines))

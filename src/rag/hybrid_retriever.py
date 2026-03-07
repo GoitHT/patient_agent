@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import logging
+import threading
 from pathlib import Path
 from typing import Any, List, Dict
 from collections import defaultdict
@@ -15,6 +16,14 @@ os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
 # 禁用不必要的警告
 logging.getLogger("chromadb").setLevel(logging.ERROR)
+
+# 导入患者历史CSV存储模块
+try:
+    from .patient_history_csv import get_patient_history_csv
+    PATIENT_CSV_AVAILABLE = True
+except ImportError:
+    PATIENT_CSV_AVAILABLE = False
+    logging.warning("⚠️  PatientHistoryCSV 模块未找到")
 
 
 class HybridRetriever:
@@ -74,6 +83,7 @@ class HybridRetriever:
         self._embeddings = None
         self._dbs = {}
         self._bm25_indices = {}  # BM25 索引缓存
+        self._init_lock = threading.Lock()  # 防止并发初始化导致日志 handler 重复注册
         
         # 日志
         self._logger = logging.getLogger("hospital_agent.hybrid_rag")
@@ -83,44 +93,50 @@ class HybridRetriever:
         """延迟初始化嵌入模型"""
         if self._embeddings is not None:
             return
-        
-        try:
-            # 临时屏蔽嵌入模型的加载日志
+        with self._init_lock:
+            # double-checked locking：持锁后再次检查，避免多线程重复初始化
+            if self._embeddings is not None:
+                return
+
             import logging as std_logging
+            root_logger = std_logging.getLogger()
+            # 保存根 logger 的 handlers，防止第三方库导入时向 root 添加额外 handler 导致日志重复
+            _saved_root_handlers = list(root_logger.handlers)
+
             sentence_transformers_logger = std_logging.getLogger('sentence_transformers')
             transformers_logger = std_logging.getLogger('transformers')
             old_st_level = sentence_transformers_logger.level
             old_tf_level = transformers_logger.level
-            sentence_transformers_logger.setLevel(std_logging.WARNING)
-            transformers_logger.setLevel(std_logging.WARNING)
-            
-            from langchain_huggingface import HuggingFaceEmbeddings
-            
-            self._embeddings = HuggingFaceEmbeddings(
-                model_name=self.embed_model,
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={
-                    "normalize_embeddings": True,
-                    "batch_size": 32
-                },
-                cache_folder=str(self.cache_folder)
-            )
-            
-            # 恢复日志级别
-            sentence_transformers_logger.setLevel(old_st_level)
-            transformers_logger.setLevel(old_tf_level)
-            
-            test_vec = self._embeddings.embed_query("测试")
-            self._logger.info(f"✅ 嵌入模型加载成功（维度={len(test_vec)}）")
-        except Exception as e:
-            # 恢复日志级别（即使出错）
             try:
+                # 临时屏蔽嵌入模型的加载日志
+                sentence_transformers_logger.setLevel(std_logging.WARNING)
+                transformers_logger.setLevel(std_logging.WARNING)
+                
+                from langchain_huggingface import HuggingFaceEmbeddings
+                
+                self._embeddings = HuggingFaceEmbeddings(
+                    model_name=self.embed_model,
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={
+                        "normalize_embeddings": True,
+                        "batch_size": 32
+                    },
+                    cache_folder=str(self.cache_folder)
+                )
+                
+                test_vec = self._embeddings.embed_query("测试")
+                self._logger.debug(f"✅ 嵌入模型加载成功（维度={len(test_vec)}）")
+            except Exception as e:
+                self._logger.error(f"❌ 嵌入模型初始化失败: {e}")
+                raise RuntimeError(f"无法初始化嵌入模型: {e}")
+            finally:
+                # 恢复日志级别
                 sentence_transformers_logger.setLevel(old_st_level)
                 transformers_logger.setLevel(old_tf_level)
-            except:
-                pass
-            self._logger.error(f"❌ 嵌入模型初始化失败: {e}")
-            raise RuntimeError(f"无法初始化嵌入模型: {e}")
+                # 恢复根 logger 的 handlers（移除第三方库可能添加的额外 handler）
+                root_logger.handlers.clear()
+                for h in _saved_root_handlers:
+                    root_logger.addHandler(h)
     
     def _get_db(self, db_name: str):
         """获取或加载向量库"""
@@ -128,6 +144,17 @@ class HybridRetriever:
             return self._dbs[db_name]
         
         self._init_embeddings()
+        
+        # 数据库名称到collection名称的映射（与create_database_general.py保持一致）
+        db_to_collection = {
+            "MedicalGuide_db": "MedicalGuide",
+            "HospitalProcess_db": "HospitalProcess",
+            "ClinicalCase_db": "ClinicalCase",
+            "HighQualityQA_db": "HighQualityQA",
+            "UserHistory_db": "UserHistory"
+        }
+        
+        collection_name = db_to_collection.get(db_name, db_name.replace("_db", ""))
         
         try:
             from langchain_chroma import Chroma
@@ -140,10 +167,11 @@ class HybridRetriever:
             db = Chroma(
                 persist_directory=str(db_path),
                 embedding_function=self._embeddings,
+                collection_name=collection_name,
                 collection_metadata={"hnsw:space": "cosine"}
             )
             self._dbs[db_name] = db
-            self._logger.debug(f"✅ 向量库加载成功: {db_name}")
+            self._logger.debug(f"✅ 向量库加载成功: {db_name} (collection={collection_name})")
             return db
         except Exception as e:
             self._logger.error(f"❌ 向量库 {db_name} 加载失败: {e}")
@@ -364,7 +392,13 @@ class HybridRetriever:
                 "HighQualityQA_db": "HighQualityQA",
                 "UserHistory_db": "UserHistory",
             }
-            results = self.hybrid_retrieve(query, db_name, k=k)
+            
+            # UserHistory_db 特殊处理：从CSV读取
+            if db_name == "UserHistory_db" and patient_id:
+                results = self._retrieve_history_from_csv(query, patient_id, k)
+            else:
+                results = self.hybrid_retrieve(query, db_name, k=k)
+            
             for r in results:
                 r["meta"]["source"] = source_map.get(db_name, db_name)
                 if patient_id and db_name == "UserHistory_db":
@@ -373,9 +407,9 @@ class HybridRetriever:
         
         # 否则按照原有逻辑查询多个库
         
-        # 1. 患者历史记忆（如果有 patient_id）
+        # 1. 患者历史记忆（如果有 patient_id）- 从CSV读取
         if patient_id:
-            history_results = self.hybrid_retrieve(query, "UserHistory_db", k=2)
+            history_results = self._retrieve_history_from_csv(query, patient_id, k=2)
             for r in history_results:
                 r["meta"]["patient_id"] = patient_id
                 r["meta"]["source"] = "UserHistory"
@@ -409,6 +443,51 @@ class HybridRetriever:
         
         # 去重并格式化
         return self._format_results(all_results, k * 2)
+    
+    def _retrieve_history_from_csv(
+        self,
+        query: str,
+        patient_id: str,
+        k: int = 2
+    ) -> List[Dict[str, Any]]:
+        """从CSV文件检索患者历史记录"""
+        if not PATIENT_CSV_AVAILABLE:
+            self._logger.warning("⚠️  患者历史CSV模块不可用")
+            return []
+        
+        try:
+            # 获取CSV管理器
+            csv_storage_path = self.spllm_root.parent / "patient_history_csv"
+            csv_manager = get_patient_history_csv(csv_storage_path)
+            
+            # 从CSV检索历史记录
+            history_records = csv_manager.retrieve_history(
+                patient_id=patient_id,
+                query=query,
+                max_records=k
+            )
+            
+            # 转换为统一格式
+            results = []
+            for idx, record in enumerate(history_records):
+                results.append({
+                    "text": record["text"],
+                    "score": 0.8,  # CSV检索使用固定分数
+                    "rrf_score": 0.8,
+                    "meta": {
+                        "source": "UserHistory",
+                        "patient_id": patient_id,
+                        "chunk_id": str(idx),
+                        "timestamp": record["timestamp"],
+                        "question": record["question"],
+                        "answer": record["answer"]
+                    }
+                })
+            
+            return results
+        except Exception as e:
+            self._logger.warning(f"⚠️  患者历史CSV检索失败: {e}")
+            return []
     
     def _format_results(
         self,

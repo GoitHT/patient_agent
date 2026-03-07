@@ -14,7 +14,6 @@ from rag.keyword_generator import RAGKeywordGenerator, NodeContext
 from services.llm_client import LLMClient
 from state.schema import BaseState, make_audit_entry
 from utils import load_prompt, contains_any_positive, get_logger
-from environment.staff_tracker import StaffTracker  # 导入医护人员状态追踪器
 from logging_utils import should_log, OutputFilter, SUPPRESS_UNCHECKED_LOGS  # 导入输出配置
 
 # 初始化logger
@@ -126,7 +125,8 @@ def build_common_specialty_subgraph(
     llm: LLMClient | None = None,
     doctor_agent=None, 
     patient_agent=None, 
-    max_questions: int = 3  # 最底层默认值，通常从config.yaml传入
+    max_questions: int = 3,  # 最底层默认值，通常从config.yaml传入
+    enable_eval: bool = True,  # 是否对照参考数据评估开单准确率
 ):
     """构建通用专科子图，适用于所有科室
     
@@ -153,24 +153,17 @@ def build_common_specialty_subgraph(
         if detail_logger:
             detail_logger.section(f"{dept_name}专科问诊")
         
-        # 动态判断是否启用Agent模式（检查state中是否有Agent）
-        use_agents = (hasattr(state, 'doctor_agent') and state.doctor_agent is not None and
-                     hasattr(state, 'patient_agent') and state.patient_agent is not None)
-        
         # 从 state 中获取医生 Agent（C4 节点中分配的）
-        doctor_agent = None
-        patient_agent = None
-        if use_agents:
-            doctor_agent = state.doctor_agent
-            patient_agent = state.patient_agent
-            if hasattr(state, 'assigned_doctor_name'):
-                logger.info(f"  👨‍⚕️ 使用 C4 分配的医生 Agent: {state.assigned_doctor_name}")
-            else:
-                logger.info(f"  👨‍⚕️ 使用医生 Agent 进行问诊")
+        doctor_agent = getattr(state, 'doctor_agent', None)
+        patient_agent = getattr(state, 'patient_agent', None)
+        if doctor_agent is None or patient_agent is None:
+            raise RuntimeError("S4 节点缺少 DoctorAgent 或 PatientAgent，请检查 C4 节点是否正确分配医生")
+        
+        use_agents = True
+        if hasattr(state, 'assigned_doctor_name'):
+            logger.info(f"  👨‍⚕️ 使用 C4 分配的医生 Agent: {state.assigned_doctor_name}")
         else:
-            logger.info(f"  ℹ️  Agent模式未启用，将使用LLM模式")
-            if detail_logger:
-                detail_logger.info("未检测到Doctor Agent或Patient Agent，使用LLM模式提取信息")
+            logger.info(f"  👨‍⚕️ 使用医生 Agent 进行问诊")
         
         # 如果是Agent模式，确保医生智能体的科室设置正确
         if use_agents and doctor_agent:
@@ -448,19 +441,6 @@ def build_common_specialty_subgraph(
             
             state.agent_interactions["doctor_patient_qa"] = qa_list
             
-            # ===== StaffTracker集成：区生专科问诊工作 =====
-            if state.world_context:
-                actual_questions = state.node_qa_counts.get(node_key, 0) - questions_asked_this_node
-                if actual_questions > 0:
-                    # 每轮问诊约2-3分钟
-                    consultation_time = actual_questions * 2.5
-                    StaffTracker.update_doctor_consultation(
-                        world=state.world_context,
-                        duration_minutes=int(consultation_time),
-                        complexity=0.6  # 专科问诊复杂度中等偏上
-                    )
-                    logger.info(f"  👨‍⚕️  医生完成{dept_name}专科问诊（{actual_questions}轮，耗时{int(consultation_time)}分钟）")
-            
             # ===== 物理环境集成：问诊后更新物理状态 =====
             if state.world_context:
                 qa_count = len([qa for qa in qa_list if qa.get('stage') == f"{dept}_specialty"])
@@ -610,42 +590,6 @@ def build_common_specialty_subgraph(
             # 从 Agent 收集信息
             if detail_logger:
                 detail_logger.info("\n从 Agent收集的专科信息已整合")
-        
-        # 非Agent模式：使用LLM提取专科信息
-        else:
-            # 使用LLM提取
-            if detail_logger:
-                detail_logger.subsection("使用LLM提取专科信息")
-            system_prompt = load_prompt("common_system.txt")
-            
-            # 根据科室选择不同的prompt
-            specialty_prompt_file = f"{dept}_specialty.txt"
-            try:
-                specialty_prompt = load_prompt(specialty_prompt_file)
-            except:
-                specialty_prompt = f"请提取{dept_name}相关的专科信息。"
-            
-            # 简化的提示词
-            user_prompt = (
-                specialty_prompt
-                + f"\n\n【任务】从病例中提取{dept_name}专科结构化信息\n"
-                + f"【关注点】{', '.join(interview_keys)}\n"
-                + f"【警报症状】{', '.join(alarm_keywords)}\n\n"
-                + f"【病例】{cc}\n\n"
-                + "【参考知识】\n" + _chunks_for_prompt(chunks) + "\n\n"
-                + f"【输出】JSON格式，字段名: {dept}_interview，包含上述关注点及alarm_symptoms列表"
-            )
-            
-            obj, used_fallback, _raw = llm.generate_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                fallback=lambda: {f"{dept}_interview": {key: "不详" for key in interview_keys} | {"alarm_symptoms": []}},
-                temperature=0.2,
-            )
-            interview = dict(obj.get(f"{dept}_interview") or {})
-            # 提取完成
-            if detail_logger:
-                detail_logger.info("专科信息提取完成")
 
         state.dept_payload.setdefault(dept, {})
         state.dept_payload[dept]["interview"] = interview
@@ -679,9 +623,9 @@ def build_common_specialty_subgraph(
                 node_name=f"S4 {dept_name} Specialty Interview",
                 inputs_summary={"chief_complaint": state.chief_complaint, "use_agents": use_agents, "dept": dept, "max_questions": max_questions},
                 outputs_summary={"alarm_symptoms": alarm_list, "node_qa_turns": node_qa_turns},
-                decision=f"完成{dept_name}专科问诊（本节点{node_qa_turns}轮）" + ("（Agent模式）" if use_agents else ("（LLM模式）" if not used_fallback else "（Fallback）")),
+                decision=f"完成{dept_name}专科问诊（本节点{node_qa_turns}轮）（Agent模式）",
                 chunks=chunks,
-                flags=["AGENT_MODE"] if use_agents else (["LLM_PARSE_FALLBACK"] if used_fallback else ["LLM_USED"]),
+                flags=["AGENT_MODE"],
             )
         )
         
@@ -703,6 +647,9 @@ def build_common_specialty_subgraph(
         
         if should_log(1, "specialty_subgraph", "S4"):
             logger.info(f"  ✅ S4完成\n")
+        # 记录 S4 完成时的模拟时钟（供就诊时间线使用）
+        if state.world_context and isinstance(state.appointment, dict):
+            state.appointment["_s4_end_time"] = state.world_context.current_time.strftime('%H:%M')
         return state
 
     def s5_physical_exam(state: BaseState) -> BaseState:
@@ -722,11 +669,23 @@ def build_common_specialty_subgraph(
         if detail_logger:
             detail_logger.section(f"{dept_name}体格检查")
         
-        # 当前数据源只有case_character，使用LLM生成体检结果
-        data_source = "llm_generated"
-        real_physical_exam = None  # 数据集中没有体格检查数据
-        
-        logger.info(f"📋 使用LLM生成体检结果")
+        # 优先使用新结构化字段中的体格检查数据，缺失时再使用LLM生成
+        case_data = state.case_data if isinstance(state.case_data, dict) else {}
+        structured_exam_fields = {
+            "vital_signs": case_data.get("体格检查_生命体征", ""),
+            "skin_mucosa": case_data.get("体格检查_皮肤黏膜", ""),
+            "superficial_lymph_nodes": case_data.get("体格检查_浅表淋巴结", ""),
+            "head_neck": case_data.get("体格检查_头颈部", ""),
+            "cardiopulmonary_vascular": case_data.get("体格检查_心肺血管", ""),
+            "abdomen": case_data.get("体格检查_腹部", ""),
+            "spine_limbs": case_data.get("体格检查_脊柱四肢", ""),
+            "nervous_system": case_data.get("体格检查_神经系统", ""),
+        }
+        has_structured_exam = any(str(v).strip() for v in structured_exam_fields.values())
+        data_source = "dataset_structured_fields" if has_structured_exam else "llm_generated"
+        real_physical_exam = structured_exam_fields if has_structured_exam else None
+
+        logger.info("📋 使用数据集结构化体检结果" if has_structured_exam else "📋 使用LLM生成体检结果")
         
         # 统一结构化处理流程
         system_prompt = load_prompt("common_system.txt")
@@ -783,20 +742,31 @@ def build_common_specialty_subgraph(
         }
         temp = 0.2
         
-        # 检查LLM是否可用
-        if llm is None:
-            logger.error("⚠️  未LLM配置，无法生成体格检查结果")
-            exam = fallback_data["exam"]
-            exam["source"] = "no_llm"
-            used_fallback = True
-            
-            # 使用fallback时也输出到患者日志
-            if detail_logger:
-                detail_logger.warning("⚠️  LLM不可用，使用默认体检结果")
-                detail_logger.info("\n📋 体格检查结果:")
-                detail_logger.info(f"  【一般情况】{exam.get('general', '无')}")
-                if exam.get('vital_signs'):
-                    detail_logger.info(f"  【生命体征】正常范围")
+        # 推进时间（体格检查约5分钟）- 在LLM调用前推进，避免并发时钟漂移影响时间戳
+        if state.world_context:
+            state.world_context.advance_time(minutes=5)
+            state.sync_physical_state()
+            if isinstance(state.appointment, dict):
+                state.appointment["_s5_end_time"] = state.world_context.current_time.strftime('%H:%M')
+
+        used_fallback = False
+        if has_structured_exam:
+            exam = {
+                "vital_signs": structured_exam_fields["vital_signs"],
+                "general": "",
+                f"{exam_area}_exam": {
+                    "皮肤黏膜": structured_exam_fields["skin_mucosa"],
+                    "浅表淋巴结": structured_exam_fields["superficial_lymph_nodes"],
+                    "头颈部": structured_exam_fields["head_neck"],
+                    "心肺血管": structured_exam_fields["cardiopulmonary_vascular"],
+                    "腹部": structured_exam_fields["abdomen"],
+                    "脊柱四肢": structured_exam_fields["spine_limbs"],
+                    "神经系统": structured_exam_fields["nervous_system"],
+                },
+                "positive_signs": [],
+                "negative_signs": [],
+                "source": data_source,
+            }
         else:
             # 执行LLM调用
             obj, used_fallback, _raw = llm.generate_json(
@@ -807,55 +777,50 @@ def build_common_specialty_subgraph(
             )
             exam = dict(obj.get("exam") or {})
             exam["source"] = data_source
-            logger.info("  ✅ 体格检查处理完成")
+        logger.info("  ✅ 体格检查处理完成")
+        
+        # 输出体检结果到患者日志
+        if detail_logger and exam:
+            detail_logger.info("\n📋 体格检查结果:")
             
-            # 输出体检结果到患者日志
-            if detail_logger and exam:
-                detail_logger.info("\n📋 体格检查结果:")
-                
-                # 生命体征
-                vital_signs = exam.get("vital_signs", {})
-                if vital_signs:
-                    detail_logger.info("  【生命体征】")
-                    for key, value in vital_signs.items():
+            # 生命体征
+            vital_signs = exam.get("vital_signs", {})
+            if vital_signs:
+                detail_logger.info("  【生命体征】")
+                for key, value in vital_signs.items():
+                    detail_logger.info(f"    • {key}: {value}")
+            
+            # 一般情况
+            general = exam.get("general")
+            if general:
+                detail_logger.info(f"  【一般情况】{general}")
+            
+            # 专科体检
+            specialty_exam = exam.get(f"{exam_area}_exam")
+            if specialty_exam:
+                detail_logger.info(f"  【{dept_name}专科体检】")
+                if isinstance(specialty_exam, dict):
+                    for key, value in specialty_exam.items():
                         detail_logger.info(f"    • {key}: {value}")
-                
-                # 一般情况
-                general = exam.get("general")
-                if general:
-                    detail_logger.info(f"  【一般情况】{general}")
-                
-                # 专科体检
-                specialty_exam = exam.get(f"{exam_area}_exam")
-                if specialty_exam:
-                    detail_logger.info(f"  【{dept_name}专科体检】")
-                    if isinstance(specialty_exam, dict):
-                        for key, value in specialty_exam.items():
-                            detail_logger.info(f"    • {key}: {value}")
-                    else:
-                        detail_logger.info(f"    {specialty_exam}")
-                
-                # 阳性体征
-                positive_signs = exam.get("positive_signs", [])
-                if positive_signs:
-                    detail_logger.info("  【阳性体征】")
-                    for sign in positive_signs:
-                        detail_logger.info(f"    ✓ {sign}")
-                
-                # 阴性体征
-                negative_signs = exam.get("negative_signs", [])
-                if negative_signs:
-                    detail_logger.info("  【阴性体征】")
-                    for sign in negative_signs:  # 显示所有阴性体征
-                        detail_logger.info(f"    - {sign}")
+                else:
+                    detail_logger.info(f"    {specialty_exam}")
+            
+            # 阳性体征
+            positive_signs = exam.get("positive_signs", [])
+            if positive_signs:
+                detail_logger.info("  【阳性体征】")
+                for sign in positive_signs:
+                    detail_logger.info(f"    ✓ {sign}")
+            
+            # 阴性体征
+            negative_signs = exam.get("negative_signs", [])
+            if negative_signs:
+                detail_logger.info("  【阴性体征】")
+                for sign in negative_signs:
+                    detail_logger.info(f"    - {sign}")
         
         state.exam_findings.setdefault(exam_area, {})
         state.exam_findings[exam_area] = exam
-        
-        # 推进时间（体格检查约5分钟）
-        if state.world_context:
-            state.world_context.advance_time(minutes=5)
-            state.sync_physical_state()
 
         state.add_audit(
             make_audit_entry(
@@ -1023,28 +988,19 @@ def build_common_specialty_subgraph(
             + "6. 检查name应简洁明了，不超过50个字符（如：\"血常规\"、\"头颅MRI\"、\"抗核抗体\"）"
         )
         
-        # 检查LLM是否可用
-        if llm is None:
-            logger.error("⚠️  未LLM配置，无法生成检查方案")
-            # 使用保守的fallback
-            obj = {
-                "need_aux_tests": False,
-                "ordered_tests": [],
-                "specialty_summary": {
-                    "problem_list": [f"{dept_name}症状待评估"],
-                    "assessment": "LLM不可用，无法生成检查方案",
-                    "plan_direction": "需配置LLM",
-                    "red_flags": []
-                },
-            }
-            used_fallback = True
-        else:
-            # 优化fallback为保守策略
-            obj, used_fallback, _raw = llm.generate_json(
+        # 推进时间（医生初步判断与开单约5分钟）- 在LLM调用前推进，避免并发时钟漂移影响时间戳
+        if state.world_context:
+            state.world_context.advance_time(minutes=5)
+            state.sync_physical_state()
+            if isinstance(state.appointment, dict):
+                state.appointment["_s6_end_time"] = state.world_context.current_time.strftime('%H:%M')
+
+        # 优化fallback为保守策略
+        obj, used_fallback, _raw = llm.generate_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             fallback=lambda: {
-                "need_aux_tests": False,  # 改为保守策略：不确定时不开单
+                "need_aux_tests": False,
                 "ordered_tests": [],
                 "specialty_summary": {
                     "problem_list": [f"{dept_name}症状待评估"],
@@ -1059,11 +1015,6 @@ def build_common_specialty_subgraph(
         ordered = list(obj.get("ordered_tests") or [])
         summary = dict(obj.get("specialty_summary") or {})
         logger.info("  ✅ 检查方案生成完成")
-        
-        # 推进时间（医生初步判断与开单约5分钟）
-        if state.world_context:
-            state.world_context.advance_time(minutes=5)
-            state.sync_physical_state()
 
         # 标准化检查项目（不做白名单过滤，完全信任LLM判断）
         normalized: list[dict[str, Any]] = []
@@ -1087,7 +1038,66 @@ def build_common_specialty_subgraph(
         state.need_aux_tests = need_aux_tests
         state.ordered_tests = ordered
         state.specialty_summary = summary
-        
+
+        # ── S6 评估：对照 medical_data["辅助检查"] 评估开单的数量与准确率 ──
+        ref_aux_exam = str(state.medical_data.get("辅助检查", "")).strip() if state.medical_data else ""
+        s6_eval: dict[str, Any] = {}
+        if enable_eval and ref_aux_exam:
+            import re as _re
+            # 按常见中英文分隔符拆分参考检查项，过滤掉长描述文本（保留检查名称关键词）
+            ref_items = [
+                item.strip()
+                for item in _re.split(r'[；;、，,\n\r]+', ref_aux_exam)
+                if 2 <= len(item.strip()) <= 30
+            ]
+
+            ordered_names = [t.get("name", "") for t in ordered]
+            hit_list: list[str] = []
+            miss_list: list[str] = []
+            for ref_item in ref_items:
+                matched = any(ref_item in name or name in ref_item for name in ordered_names)
+                if matched:
+                    hit_list.append(ref_item)
+                else:
+                    miss_list.append(ref_item)
+
+            ref_count = len(ref_items)
+            ordered_count = len(ordered)
+            hit_count = len(hit_list)
+            # 覆盖率（召回率）：参考检查中被正确开具的比例
+            coverage_rate = round(hit_count / ref_count, 4) if ref_count > 0 else 0.0
+            # 精准率：已开单中与参考匹配的比例（防过度开单）
+            precision_rate = round(hit_count / ordered_count, 4) if ordered_count > 0 else 0.0
+
+            s6_eval = {
+                "ref_aux_exam_text": ref_aux_exam,
+                "ref_items": ref_items,
+                "ref_count": ref_count,
+                "ordered_count": ordered_count,
+                "hit_count": hit_count,
+                "hit_items": hit_list,
+                "miss_items": miss_list,
+                "coverage_rate": coverage_rate,
+                "precision_rate": precision_rate,
+            }
+
+            logger.info(f"\n📊 S6 开单评估（对照参考辅助检查）:")
+            logger.info(f"  参考检查项数: {ref_count}  |  实际开单: {ordered_count}  |  命中: {hit_count}")
+            logger.info(f"  覆盖率: {coverage_rate:.0%}  |  精准率: {precision_rate:.0%}")
+            if hit_list:
+                logger.info(f"  ✅ 命中: {', '.join(hit_list)}")
+            if miss_list:
+                logger.info(f"  ❌ 遗漏: {', '.join(miss_list)}")
+            if detail_logger:
+                detail_logger.info("")
+                detail_logger.info("📊 S6 开单评估（对照参考辅助检查）:")
+                detail_logger.info(f"  • 参考检查项数: {ref_count}  |  实际开单: {ordered_count}  |  命中: {hit_count}")
+                detail_logger.info(f"  • 覆盖率(召回率): {coverage_rate:.0%}  |  精准率: {precision_rate:.0%}")
+                if hit_list:
+                    detail_logger.info(f"  • 命中项: {', '.join(hit_list[:5])}")
+                if miss_list:
+                    detail_logger.info(f"  • 遗漏项: {', '.join(miss_list[:5])}")
+
         decision = "需要辅助检查以明确诊断" if need_aux_tests else "暂无需辅助检查，给出对症方向"
         
         logger.info(f"\n  📋 开单决策: need_aux_tests={state.need_aux_tests}")
@@ -1101,6 +1111,8 @@ def build_common_specialty_subgraph(
             "need_aux_tests": state.need_aux_tests,
             "ordered_tests_count": len(ordered),
         }
+        if s6_eval:
+            state.dept_payload[dept]["s6_eval"] = s6_eval
 
         state.add_audit(
             make_audit_entry(
@@ -1109,6 +1121,16 @@ def build_common_specialty_subgraph(
                 outputs_summary={
                     "need_aux_tests": state.need_aux_tests,
                     "ordered_tests": [t["name"] for t in ordered],
+                    **(
+                        {
+                            "s6_eval_ordered_count": s6_eval["ordered_count"],
+                            "s6_eval_ref_count": s6_eval["ref_count"],
+                            "s6_eval_hit_count": s6_eval["hit_count"],
+                            "s6_eval_coverage_rate": s6_eval["coverage_rate"],
+                            "s6_eval_precision_rate": s6_eval["precision_rate"],
+                        }
+                        if s6_eval else {}
+                    ),
                 },
                 decision=decision,
                 chunks=chunks,
@@ -1132,6 +1154,12 @@ def build_common_specialty_subgraph(
                     detail_logger.info(f"  • 问题列表: {', '.join(summary['problem_list'][:3])}")
                 if summary.get('assessment'):
                     detail_logger.info(f"  • 评估: {summary['assessment'][:80]}...")
+            if s6_eval:
+                detail_logger.info(
+                    f"  • 开单评估: 覆盖率 {s6_eval['coverage_rate']:.0%}"
+                    f" | 精准率 {s6_eval['precision_rate']:.0%}"
+                    f" | 命中 {s6_eval['hit_count']}/{s6_eval['ref_count']}"
+                )
             detail_logger.info(f"✅ S6 初步判断完成")
             detail_logger.info("")
         

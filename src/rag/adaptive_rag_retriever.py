@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 import logging
@@ -15,6 +16,14 @@ os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
 # 禁用不必要的警告
 logging.getLogger("chromadb").setLevel(logging.ERROR)
+
+# 导入患者历史CSV存储模块
+try:
+    from .patient_history_csv import get_patient_history_csv
+    PATIENT_CSV_AVAILABLE = True
+except ImportError:
+    PATIENT_CSV_AVAILABLE = False
+    logging.warning("⚠️  PatientHistoryCSV 模块未找到")
 
 
 class AdaptiveRAGRetriever:
@@ -37,14 +46,17 @@ class AdaptiveRAGRetriever:
         *,
         spllm_root: Path | str,
         cache_folder: Path | str | None = None,
-        cosine_threshold: float = 0.3,
+        cosine_threshold: float = 0.8,
         embed_model: str = "BAAI/bge-large-zh-v1.5",
     ):
         """
         Args:
             spllm_root: SPLLM-RAG1 项目根目录（包含 chroma/ 文件夹）
             cache_folder: 模型缓存目录（默认为 spllm_root/model_cache）
-            cosine_threshold: 余弦距离阈值（0-1，越小越严格）
+            cosine_threshold: 余弦距离阈值（0-2范围，建议0.6-1.0）
+                            distance = 1 - similarity
+                            distance < 0.5 表示 similarity > 0.5
+                            distance < 0.8 表示 similarity > 0.2
             embed_model: 嵌入模型名称
         """
         self.spllm_root = Path(spllm_root).resolve()
@@ -58,54 +70,61 @@ class AdaptiveRAGRetriever:
         # 延迟导入（避免启动时加载模型）
         self._embeddings = None
         self._dbs = {}
+        self._init_lock = threading.Lock()  # 防止并发初始化导致日志 handler 重复注册
         
         # 日志
         self._logger = logging.getLogger("hospital_agent.adaptive_rag")
-        self._logger.info(f"📦 AdaptiveRAG 初始化: spllm_root={self.spllm_root}")
+        self._logger.debug(f"📦 AdaptiveRAG 初始化: spllm_root={self.spllm_root}")
     
     def _init_embeddings(self):
         """延迟初始化嵌入模型（首次调用 retrieve 时触发）"""
         if self._embeddings is not None:
             return
-        
-        try:
-            # 临时屏蔽嵌入模型的加载日志
+        with self._init_lock:
+            # double-checked locking：持锁后再次检查，避免多线程重复初始化
+            if self._embeddings is not None:
+                return
+
             import logging as std_logging
+            root_logger = std_logging.getLogger()
+            # 保存根 logger 的 handlers，防止第三方库导入时向 root 添加额外 handler 导致日志重复
+            _saved_root_handlers = list(root_logger.handlers)
+
             sentence_transformers_logger = std_logging.getLogger('sentence_transformers')
             transformers_logger = std_logging.getLogger('transformers')
             old_st_level = sentence_transformers_logger.level
             old_tf_level = transformers_logger.level
-            sentence_transformers_logger.setLevel(std_logging.WARNING)
-            transformers_logger.setLevel(std_logging.WARNING)
-            
-            from langchain_huggingface import HuggingFaceEmbeddings
-            
-            self._embeddings = HuggingFaceEmbeddings(
-                model_name=self.embed_model,
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={
-                    "normalize_embeddings": True,
-                    "batch_size": 32
-                },
-                cache_folder=str(self.cache_folder)
-            )
-            
-            # 恢复日志级别
-            sentence_transformers_logger.setLevel(old_st_level)
-            transformers_logger.setLevel(old_tf_level)
-            
-            # 测试嵌入
-            test_vec = self._embeddings.embed_query("测试")
-            self._logger.info(f"✅ 嵌入模型加载成功（维度={len(test_vec)}）")
-        except Exception as e:
-            # 恢复日志级别（即使出错）
             try:
+                # 临时屏蔽嵌入模型的加载日志
+                sentence_transformers_logger.setLevel(std_logging.WARNING)
+                transformers_logger.setLevel(std_logging.WARNING)
+                
+                from langchain_huggingface import HuggingFaceEmbeddings
+                
+                self._embeddings = HuggingFaceEmbeddings(
+                    model_name=self.embed_model,
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={
+                        "normalize_embeddings": True,
+                        "batch_size": 32
+                    },
+                    cache_folder=str(self.cache_folder)
+                )
+                
+                # 测试嵌入
+                test_vec = self._embeddings.embed_query("测试")
+                self._logger.debug(f"✅ 嵌入模型加载成功（维度={len(test_vec)}）")
+            except Exception as e:
+                self._logger.error(f"❌ 嵌入模型初始化失败: {e}")
+                raise RuntimeError(f"无法初始化嵌入模型: {e}")
+            finally:
+                # 恢复日志级别
                 sentence_transformers_logger.setLevel(old_st_level)
                 transformers_logger.setLevel(old_tf_level)
-            except:
-                pass
-            self._logger.error(f"❌ 嵌入模型初始化失败: {e}")
-            raise RuntimeError(f"无法初始化嵌入模型: {e}")
+                # 恢复根 logger 的 handlers（移除第三方库可能添加的额外 handler）
+                root_logger.handlers.clear()
+                for h in _saved_root_handlers:
+                    root_logger.addHandler(h)
     
     def _get_db(self, db_name: str):
         """获取或加载向量库（带缓存）"""
@@ -113,6 +132,17 @@ class AdaptiveRAGRetriever:
             return self._dbs[db_name]
         
         self._init_embeddings()
+        
+        # 数据库名称到collection名称的映射（与create_database_general.py保持一致）
+        db_to_collection = {
+            "MedicalGuide_db": "MedicalGuide",
+            "HospitalProcess_db": "HospitalProcess",
+            "ClinicalCase_db": "ClinicalCase",
+            "HighQualityQA_db": "HighQualityQA",
+            "UserHistory_db": "UserHistory"
+        }
+        
+        collection_name = db_to_collection.get(db_name, db_name.replace("_db", ""))
         
         try:
             from langchain_chroma import Chroma
@@ -125,10 +155,11 @@ class AdaptiveRAGRetriever:
             db = Chroma(
                 persist_directory=str(db_path),
                 embedding_function=self._embeddings,
+                collection_name=collection_name,
                 collection_metadata={"hnsw:space": "cosine"}
             )
             self._dbs[db_name] = db
-            self._logger.debug(f"✅ 向量库加载成功: {db_name}")
+            self._logger.debug(f"✅ 向量库加载成功: {db_name} (collection={collection_name})")
             return db
         except Exception as e:
             self._logger.error(f"❌ 向量库 {db_name} 加载失败: {e}")
@@ -231,34 +262,39 @@ class AdaptiveRAGRetriever:
         patient_id: str,
         k: int = 2
     ) -> list[dict[str, Any]]:
-        """检索患者历史记忆"""
-        db = self._get_db("UserHistory_db")
-        if not db:
+        """检索患者历史记忆 - 从CSV文件读取"""
+        if not PATIENT_CSV_AVAILABLE:
+            self._logger.warning("⚠️  患者历史CSV模块不可用")
             return []
         
         try:
-            # similarity_search_with_score 返回 (doc, distance)
-            docs_and_distances = db.similarity_search_with_score(
-                query,
-                k=k,
-                filter={"patient_id": patient_id}
+            # 获取CSV管理器
+            csv_storage_path = self.spllm_root.parent / "patient_history_csv"
+            csv_manager = get_patient_history_csv(csv_storage_path)
+            
+            # 从CSV检索历史记录
+            history_records = csv_manager.retrieve_history(
+                patient_id=patient_id,
+                query=query,
+                max_records=k
             )
             
+            # 转换为统一格式
             results = []
-            for doc, distance in docs_and_distances:
-                if distance < self.cosine_threshold:
-                    similarity = max(0, 1 - distance)
-                    results.append({
-                        "doc_id": f"history_{patient_id}",
-                        "chunk_id": doc.metadata.get("chunk_id", "0"),
-                        "score": float(similarity),
-                        "text": doc.page_content,
-                        "meta": {
-                            "source": "UserHistory",
-                            "patient_id": patient_id,
-                            **doc.metadata
-                        }
-                    })
+            for idx, record in enumerate(history_records):
+                results.append({
+                    "doc_id": f"history_{patient_id}",
+                    "chunk_id": str(idx),
+                    "score": 0.8,  # CSV检索使用固定分数（基于关键词匹配）
+                    "text": record["text"],
+                    "meta": {
+                        "source": "UserHistory",
+                        "patient_id": patient_id,
+                        "timestamp": record["timestamp"],
+                        "question": record["question"],
+                        "answer": record["answer"]
+                    }
+                })
             
             if results:
                 self._logger.debug(f"📜 历史记忆检索: 找到 {len(results)} 条")
@@ -273,7 +309,7 @@ class AdaptiveRAGRetriever:
         test_keywords: list[str],
         k: int = 5
     ) -> list[dict[str, Any]]:
-        """检索患者历史检查记录（用于避免重复开单）
+        """检索患者历史检查记录（用于避免重复开单）- 从CSV文件读取
         
         Args:
             patient_id: 患者ID
@@ -286,37 +322,39 @@ class AdaptiveRAGRetriever:
         if not patient_id or not test_keywords:
             return []
         
-        # 构建查询语句
-        query = f"检查 检验 开单 {' '.join(test_keywords)}"
-        
-        db = self._get_db("UserHistory_db")
-        if not db:
+        if not PATIENT_CSV_AVAILABLE:
+            self._logger.warning("⚠️  患者历史CSV模块不可用")
             return []
         
         try:
-            docs_and_distances = db.similarity_search_with_score(
-                query,
-                k=k,
-                filter={"patient_id": patient_id}
+            # 获取CSV管理器
+            csv_storage_path = self.spllm_root.parent / "patient_history_csv"
+            csv_manager = get_patient_history_csv(csv_storage_path)
+            
+            # 从CSV检索历史检查记录
+            history_records = csv_manager.retrieve_test_history(
+                patient_id=patient_id,
+                test_keywords=test_keywords,
+                max_records=k
             )
             
+            # 转换为统一格式
             results = []
-            for doc, distance in docs_and_distances:
-                # 历史检查记录阈值放宽
-                if distance < self.cosine_threshold * 1.5:
-                    similarity = max(0, 1 - distance)
-                    results.append({
-                        "doc_id": f"test_history_{patient_id}",
-                        "chunk_id": doc.metadata.get("chunk_id", "0"),
-                        "score": float(similarity),
-                        "text": doc.page_content,
-                        "meta": {
-                            "source": "UserHistory",
-                            "patient_id": patient_id,
-                            "keywords": test_keywords,
-                            **doc.metadata
-                        }
-                    })
+            for idx, record in enumerate(history_records):
+                results.append({
+                    "doc_id": f"test_history_{patient_id}",
+                    "chunk_id": str(idx),
+                    "score": 0.85,  # 检查记录使用较高固定分数
+                    "text": record["text"],
+                    "meta": {
+                        "source": "UserHistory",
+                        "patient_id": patient_id,
+                        "keywords": test_keywords,
+                        "timestamp": record["timestamp"],
+                        "question": record["question"],
+                        "answer": record["answer"]
+                    }
+                })
             
             if results:
                 self._logger.info(f"🔍 历史检查记录: 找到 {len(results)} 条相关记录")
@@ -325,6 +363,9 @@ class AdaptiveRAGRetriever:
             self._logger.warning(f"⚠️  历史检查记录检索失败: {e}")
             return []
     
+    # 占位符内容标识（初始化时写入的dummy数据，需过滤掉）
+    _QA_PLACEHOLDER_QUESTIONS = {"初始化问题", "placeholder", ""}
+
     def _retrieve_high_quality_qa(self, query: str, k: int = 3) -> list[dict[str, Any]]:
         """检索高质量问答（核心知识库）"""
         db = self._get_db("HighQualityQA_db")
@@ -332,7 +373,8 @@ class AdaptiveRAGRetriever:
             return []
         
         try:
-            docs_and_distances = db.similarity_search_with_score(query, k=k)
+            # 多取几条以便过滤掉占位符后还能有足够结果
+            docs_and_distances = db.similarity_search_with_score(query, k=k + 3)
             
             results = []
             for doc, distance in docs_and_distances:
@@ -341,8 +383,22 @@ class AdaptiveRAGRetriever:
                     question = doc.metadata.get("question", "")
                     answer = doc.metadata.get("answer", "")
                     
+                    # 跳过占位符/初始化数据
+                    if question.strip() in self._QA_PLACEHOLDER_QUESTIONS:
+                        self._logger.debug(f"   ⏭️  跳过HighQualityQA占位符: question='{question}'")
+                        continue
+                    # 跳过内容本身就是占位符文本的块
+                    content = doc.page_content or ""
+                    if "初始化问题" in content or "初始化答案" in content:
+                        self._logger.debug(f"   ⏭️  跳过HighQualityQA占位符内容块")
+                        continue
+                    
                     # 格式化为问答对
-                    text = f"【历史问答】\n问：{question}\n答：{answer[:300]}..."
+                    if question and answer:
+                        text = f"【历史问答】\n问：{question}\n答：{answer[:300]}..."
+                    else:
+                        # 直接使用文档内容（新格式）
+                        text = content
                     
                     results.append({
                         "doc_id": "high_quality_qa",
@@ -356,9 +412,13 @@ class AdaptiveRAGRetriever:
                             "distance": distance,
                         }
                     })
+                    if len(results) >= k:
+                        break
             
             if results:
                 self._logger.debug(f"💎 高质量问答: 找到 {len(results)} 条")
+            else:
+                self._logger.debug(f"💎 高质量问答: 无有效结果（可能仅有占位符数据）")
             return results
         except Exception as e:
             self._logger.warning(f"⚠️  高质量问答检索失败: {e}")

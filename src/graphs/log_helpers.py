@@ -139,7 +139,8 @@ def _log_rag_retrieval(
     filters: dict[str, Any] | None = None,
     node_name: str = "",
     level: int = 2,
-    purpose: str = "检索"
+    purpose: str = "检索",
+    show_full_content: bool = False
 ):
     """详细记录 RAG 检索过程和结果
     
@@ -151,6 +152,7 @@ def _log_rag_retrieval(
         node_name: 节点名称
         level: 日志级别
         purpose: 检索目的描述（如"专科知识"，"历史记录"等）
+        show_full_content: 是否展示完整内容（用于重要的流程指导）
     """
     detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
     if not detail_logger:
@@ -179,56 +181,81 @@ def _log_rag_retrieval(
     detail_logger.info(f"  ✅ 检索到 {len(chunks)} 个知识片段")
     
     # 统计各数据库来源
-    db_sources = {}
+    db_name_map = {
+        'MedicalGuide': '医学指南库',
+        'ClinicalCase': '临床案例库',
+        'HighQualityQA': '高质量问答库',
+        'UserHistory': '患者历史库',
+        'HospitalProcess': '规则流程库',
+        'hospital_process': '规则流程库',
+        'guideline': '医学指南库',
+        'case': '临床案例库',
+        'unknown': '未知来源',
+    }
+
+    source_counts: dict[str, int] = {}
     for chunk in chunks:
-        meta = chunk.get('meta', {})
-        source = meta.get('source', 'unknown')
-        db_sources[source] = db_sources.get(source, 0) + 1
-    
-    if db_sources:
-        detail_logger.info(f"  📊 数据来源:")
-        db_name_map = {
-            'MedicalGuide': '医学指南库 (MedicalGuide_db)',
-            'ClinicalCase': '临床案例库 (ClinicalCase_db)',
-            'HighQualityQA': '高质量问答库 (HighQualityQA_db)',
-            'UserHistory': '患者历史库 (UserHistory_db)',
-            'unknown': '未知来源'
-        }
-        for source, count in sorted(db_sources.items(), key=lambda x: -x[1]):
-            source_name = db_name_map.get(source, f'{source}库')
-            detail_logger.info(f"     • {source_name}: {count}条")
+        src = chunk.get('meta', {}).get('source', 'unknown')
+        source_counts[src] = source_counts.get(src, 0) + 1
+
+    if source_counts:
+        detail_logger.info(f"  📊 数据来源 ({len(chunks)}条):")
+        for source, count in sorted(source_counts.items(), key=lambda x: -x[1]):
+            display = db_name_map.get(source, source)
+            detail_logger.info(f"     • {display}: {count}条")
     else:
-        # 如果没有source信息，记录警告
         detail_logger.info(f"  ⚠️  未能识别数据来源")
     
-    # 记录前3条高质量结果的详细信息
-    detail_logger.info(f"  📝 相关内容预览（前3条）:")
-    for i, chunk in enumerate(chunks[:3], 1):
-        score = chunk.get('score', 0.0)
-        text = chunk.get('text', '')
-        meta = chunk.get('meta', {})
-        source = meta.get('source', 'unknown')
-        
-        # 截取文本预览（最多100字）
-        preview = text[:100].replace('\n', ' ').strip()
-        if len(text) > 100:
-            preview += '...'
-        
-        # 格式化相关度显示
-        relevance = "高" if score > 0.8 else "中" if score > 0.6 else "低"
-        
-        detail_logger.info(f"     [{i}] 相关度: {relevance} ({score:.3f})")
-        detail_logger.info(f"         内容: {preview}")
-        
-        # 如果有特殊元数据，也记录
-        if 'dept' in meta:
-            detail_logger.info(f"         科室: {meta['dept']}")
-        if 'type' in meta:
-            detail_logger.info(f"         类型: {meta['type']}")
-    
-    # 如果检索结果超过3条，显示统计
-    if len(chunks) > 3:
-        detail_logger.info(f"     ... 及其他 {len(chunks) - 3} 条结果")
+    # 根据show_full_content决定展示多少内容
+    if show_full_content:
+        # 展示所有结果的完整内容（用于重要的流程指导）
+        detail_logger.info(f"  📝 完整内容展示:")
+        detail_logger.info(f"  {'-'*76}")
+        for i, chunk in enumerate(chunks, 1):
+            score = chunk.get('score', 0.0)
+            text = chunk.get('text', '')
+            meta = chunk.get('meta', {})
+
+            relevance = "高" if score > 0.75 else "中" if score > 0.5 else "低"
+            detail_logger.info(f"  【{i}】相关度: {relevance} ({score:.3f})")
+
+            source = meta.get('source', '')
+            if source:
+                detail_logger.info(f"      来源: {db_name_map.get(source, source)}")
+
+            detail_logger.info(f"      内容:")
+            for line in text.split('\n'):
+                detail_logger.info(f"      {line}")
+            detail_logger.info(f"  {'-'*76}")
+    else:
+        # 展示所有结果的预览
+        detail_logger.info(f"  📝 检索结果（共{len(chunks)}条）:")
+        for i, chunk in enumerate(chunks, 1):
+            score = chunk.get('score', 0.0)
+            text = chunk.get('text', '')
+            meta = chunk.get('meta', {})
+
+            # 显示完整内容
+            preview = text.replace('\n', ' ').strip()
+
+            # 相关度：基于实际分数范围做三档划分
+            # 向量余弦相似度通常在 0.2~0.9 之间，> 0.75 视为高
+            relevance = "高" if score > 0.75 else "中" if score > 0.5 else "低"
+
+            detail_logger.info(f"     [{i}] 相关度: {relevance} ({score:.3f})")
+
+            # 显示来源：source 可能是知识库名或文件名
+            source = meta.get('source', '')
+            if source:
+                display_src = db_name_map.get(source, source)
+                detail_logger.info(f"         来源: {display_src}")
+
+            # 显示内容类型
+            doc_type = meta.get('type') or meta.get('doc_type')
+            if doc_type:
+                detail_logger.info(f"         类型: {doc_type}")
+
+            detail_logger.info(f"         内容: {preview}")
 
 
 def _infer_target_databases(filters: dict[str, Any] | None, state: BaseState) -> list[str]:

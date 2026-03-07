@@ -42,17 +42,9 @@ class MedicalRecordIntegration:
         Returns:
             病例号
         """
-        # 检查是否已有病例
-        existing_record = self.mrs.get_record(patient_id)
-        if existing_record:
-            # 已有病例，更新位置
-            self.mrs.update_location(patient_id, "lobby")
-            # 确保在物理环境中
-            if self.world and patient_id not in self.world.agents:
-                self.world.add_agent(patient_id, agent_type="patient", initial_location="lobby")
-            return existing_record.record_id
-        
-        # 创建新病例
+        # 每次就诊都走创建流程：
+        # - 数据库层会生成新的门诊号（日期+流水号）
+        # - 病历号按 patient+case_id 规则复用（稳定）
         record = self.mrs.create_record(patient_id, patient_profile)
         
         # 同步到物理环境
@@ -172,6 +164,33 @@ class MedicalRecordIntegration:
                 exam_findings=state.exam_findings,
                 location=state.dept
             )
+            # 同步写入 interaction_state，格式与 case_qa_records 表字段完全一致：
+            # [{"role": "doctor/patient", "content": "...", "round_index": 1}, ...]
+            interaction_records: list[dict] = []
+            round_idx = 1
+            i = 0
+            while i < len(conversation):
+                msg = conversation[i]
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "doctor":
+                    interaction_records.append({"role": "doctor", "content": content, "round_index": round_idx})
+                    if i + 1 < len(conversation):
+                        p_msg = conversation[i + 1]
+                        interaction_records.append({
+                            "role": "patient",
+                            "content": p_msg.get("content", ""),
+                            "round_index": round_idx,
+                        })
+                        i += 2
+                    else:
+                        i += 1
+                    round_idx += 1
+                else:
+                    interaction_records.append({"role": role or "patient", "content": content, "round_index": round_idx})
+                    i += 1
+                    round_idx += 1
+            state.interaction_state = interaction_records
         else:
             # 提供更详细的调试信息
             logger.warning(f"[{patient_display}] ⚠️ [Integration] 患者 {patient_display} 问诊对话为空，跳过保存")

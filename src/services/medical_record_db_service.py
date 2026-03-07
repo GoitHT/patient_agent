@@ -1,6 +1,7 @@
 """
-基于数据库的医疗记录服务 - 3表结构（门诊号为主线）
-Database-backed Medical Record Service - 3-table structure based on outpatient_no
+基于数据库的医疗记录服务 - 6表结构
+Database-backed Medical Record Service - 6-table structure
+  patients / visits / medical_cases / examinations / exam_items / case_qa_records
 """
 from __future__ import annotations
 
@@ -36,8 +37,10 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         self.dao = MedicalRecordDAO(connection_string)
         self.backup_to_file = backup_to_file
         
-        # 门诊号映射 (patient_id -> outpatient_no)
-        self._outpatient_map: Dict[str, str] = {}
+        # 就诊流水号缓存（键：patient_id:YYYYMMDD）
+        self._visit_daily_seq_cache: Dict[str, int] = {}
+        # 当前就诊 visit_id 缓存（键：patient_id）
+        self._current_visit_id: Dict[str, str] = {}
         
         # 不显示初始化提示，由initializer统一管理
     
@@ -48,42 +51,163 @@ class DatabaseMedicalRecordService(MedicalRecordService):
             super()._save_record(record)
         # 如果不备份，则什么都不做（数据已在数据库中）
     
-    def _get_outpatient_no(self, patient_id: str) -> str:
-        """生成或获取门诊号"""
-        if patient_id not in self._outpatient_map:
-            # 生成门诊号：格式 OPD_患者ID_日期时间
-            timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-            self._outpatient_map[patient_id] = f"OPD_{patient_id}_{timestamp}"
-        return self._outpatient_map[patient_id]
+    def _get_visit_id_and_outpatient_no(self, patient_id: str) -> tuple:
+        """生成就诊 visit_id 与门诊号（每次就诊唯一）
+
+        visit_id      格式：VISIT-{patient_id}-{YYYYMMDD}-{NNN}
+        outpatient_no 格式：OPD-{patient_id}-{YYYYMMDD}-{NNN}
+        """
+        date_str = datetime.now().strftime('%Y%m%d')
+        cache_key = f"{patient_id}:{date_str}"
+
+        if cache_key not in self._visit_daily_seq_cache:
+            next_seq = self.dao.get_next_visit_sequence(patient_id, date_str)
+            self._visit_daily_seq_cache[cache_key] = next_seq
+        else:
+            self._visit_daily_seq_cache[cache_key] += 1
+
+        seq = self._visit_daily_seq_cache[cache_key]
+        visit_id = f"VISIT-{patient_id}-{date_str}-{seq:03d}"
+        outpatient_no = f"OPD-{patient_id}-{date_str}-{seq:03d}"
+        return visit_id, outpatient_no
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        """安全转换为 int，失败返回 None"""
+        if value is None:
+            return None
+        try:
+            text = str(value).replace("岁", "").strip()
+            return int(text) if text else None
+        except Exception:
+            return None
+
+    def _build_structured_case_payload(self, patient_profile: Dict[str, Any]) -> Dict[str, Any]:
+        """将 known_case/case_data 字段映射为数据库 MedicalCase 列。"""
+        case_data = patient_profile.get("case_data", {}) or {}
+
+        def _pick(*keys: str, default: str = "") -> Any:
+            for key in keys:
+                if key in case_data and case_data.get(key) not in (None, ""):
+                    return case_data.get(key)
+                if key in patient_profile and patient_profile.get(key) not in (None, ""):
+                    return patient_profile.get(key)
+            return default
+
+        payload: Dict[str, Any] = {
+            "history_narrator": _pick("病史陈述者"),
+
+            "chief_complaint": _pick("主诉"),
+            "present_illness_detail": _pick("现病史_详细描述"),
+            "present_illness_onset": _pick("现病史_起病情况"),
+            "present_illness_course": _pick("现病史_病程"),
+            "present_illness_progression": _pick("现病史_病情发展"),
+
+            "past_history_disease": _pick("既往史_疾病史"),
+            "past_history_surgery": _pick("既往史_手术史"),
+            "past_history_allergy": _pick("既往史_过敏史"),
+            "past_history_vaccination": _pick("既往史_预防接种史"),
+            "past_history_trauma": _pick("既往史_外伤史"),
+
+            "personal_history": _pick("个人史"),
+            "alcohol_history": _pick("个人史_饮酒史"),
+            "smoking_history": _pick("个人史_抽烟史"),
+            "menstrual_history": _pick("个人史_月经史"),
+            "marital_fertility_history": _pick("婚育史"),
+
+            "family_history_father": _pick("家族史_父亲"),
+            "family_history_mother": _pick("家族史_母亲"),
+            "family_history_siblings": _pick("家族史_兄弟姐妹"),
+            "family_history_disease": _pick("家族史_疾病"),
+
+            "pe_vital_signs": _pick("体格检查_生命体征"),
+            "pe_skin_mucosa": _pick("体格检查_皮肤黏膜"),
+            "pe_superficial_lymph_nodes": _pick("体格检查_浅表淋巴结"),
+            "pe_head_neck": _pick("体格检查_头颈部"),
+            "pe_cardiopulmonary_vascular": _pick("体格检查_心肺血管"),
+            "pe_abdomen": _pick("体格检查_腹部"),
+            "pe_spine_limbs": _pick("体格检查_脊柱四肢"),
+            "pe_nervous_system": _pick("体格检查_神经系统"),
+
+            "auxiliary_examination": _pick("辅助检查"),
+            "preliminary_diagnosis": _pick("初步诊断"),
+            "diagnosis_basis": _pick("诊断依据"),
+            "treatment_principle": _pick("治疗原则"),
+            "doctor_patient_qa_ref_question": _pick("医患问答参考_问"),
+            "doctor_patient_qa_ref_answer": _pick("医患问答参考_答"),
+
+            # 预留字段（仅初始化）
+            "std_record_chief_complaint": "",
+            "std_record_present_illness": "",
+            "std_record_past_history": "",
+            "std_record_physical_exam": "",
+            "std_record_aux_exam": "",
+            "std_record_diagnosis_result": "",
+            "advanced_question": "",
+            "advanced_answer": "",
+            "exam_question": "",
+            "exam_answer": "",
+        }
+        return payload
     
     def create_record(self, patient_id: str, patient_profile: Dict[str, Any]) -> MedicalRecord:
         """创建病历（写入数据库 + 可选文件备份）"""
-        # 调用父类方法创建内存对象
-        record = super().create_record(patient_id, patient_profile)
+        # 复诊场景：若已有病例对象则复用，避免重置历史记录
+        existing_record = super().get_record(patient_id)
+        if existing_record:
+            record = existing_record
+            record.patient_profile.update(patient_profile)
+            record.last_updated = now_iso()
+            self._add_entry(
+                record=record,
+                entry_type="visit_started",
+                location="lobby",
+                operator="system",
+                content={"patient_profile": patient_profile},
+                notes="患者复诊，创建新门诊号"
+            )
+            self._save_record(record)
+        else:
+            # 首诊场景：创建新病例对象
+            record = super().create_record(patient_id, patient_profile)
         
         try:
-            # 生成门诊号
-            outpatient_no = self._get_outpatient_no(patient_id)
+            # 生成就诊 visit_id 与门诊号
+            visit_id, outpatient_no = self._get_visit_id_and_outpatient_no(patient_id)
+            self._current_visit_id[patient_id] = visit_id
             
-            # 创建患者记录
+            # 创建/更新患者记录（patient_id 为主键）
             self.dao.create_patient({
-                "outpatient_no": outpatient_no,
                 "patient_id": patient_id,
                 "name": patient_profile.get("name"),
-                "age": patient_profile.get("age"),
+                "age": self._safe_int(patient_profile.get("age")),
                 "gender": patient_profile.get("gender"),
+                "ethnicity": patient_profile.get("case_data", {}).get("民族", ""),
+                "occupation": patient_profile.get("case_data", {}).get("职业", ""),
                 "phone": patient_profile.get("phone"),
             })
+
+            # 创建就诊记录
+            self.dao.create_visit({
+                "visit_id": visit_id,
+                "patient_id": patient_id,
+                "outpatient_no": outpatient_no,
+                "visit_date": datetime.now(),
+                "status": "ongoing",
+            })
+
+            # 保存当前就诊 visit_id 到病例对象
+            record.patient_profile["visit_id"] = visit_id
+            record.patient_profile["outpatient_no"] = outpatient_no
+            self._save_record(record)
             
-            # 创建病例记录
+            # 创建病历记录
+            structured_case_payload = self._build_structured_case_payload(patient_profile)
             actual_case_id = self.dao.create_medical_case({
                 "case_id": record.record_id,
-                "outpatient_no": outpatient_no,
-                "visit_date": date.today(),
-                "dataset_id": patient_profile.get("dataset_id"),
-                "original_case_id": patient_profile.get("case_id"),
-                "run_id": patient_profile.get("run_id"),
-                "status": "ongoing",
+                "visit_id": visit_id,
+                "status": "draft",
+                **structured_case_payload,
             })
             
             # 如果返回的case_id与record.record_id不同（已存在情况）
@@ -91,6 +215,8 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                 logger.warning(f"⚠️  [数据库] 病例已存在，使用已有case_id: {actual_case_id}")
                 # 更新record的record_id以匹配数据库
                 record.record_id = actual_case_id
+            else:
+                logger.info(f"创建病历号: {actual_case_id}")
             
         except Exception as e:
             logger.error(f"❌ [数据库] 写入数据库失败: {e}，已保留文件备份")
@@ -127,24 +253,18 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                 if record.chief_complaints:
                     latest_complaint = record.chief_complaints[-1].get('complaint', chief_complaint)
                 
-                # 分诊时将患者描述保存到present_illness，chief_complaint留给医生总结
-                self.dao.update_medical_case(record.record_id, {
-                    "dept": dept,
-                    "present_illness": latest_complaint,  # 患者的详细口语化描述
-                    "triage_nurse_id": nurse_id,
-                    "triage_nurse_name": nurse_name,
-                })
-                
-                # 记录分诊日志到case_logs
-                self.dao.add_case_log(record.record_id, {
-                    "log_type": "triage",
-                    "entity_id": nurse_id,
-                    "entity_type": "nurse",
-                    "log_data": {
+                # 更新就诊记录中的科室和分诊护士信息
+                visit_id = self._current_visit_id.get(patient_id, "")
+                if visit_id:
+                    self.dao.update_visit(visit_id, {
                         "dept": dept,
-                        "present_illness": latest_complaint,  # 使用present_illness而不是chief_complaint
-                        "location": location,
-                    }
+                        "triage_nurse_id": nurse_id,
+                        "triage_nurse_name": nurse_name,
+                    })
+
+                # 更新病历中的现病史描述
+                self.dao.update_medical_case(record.record_id, {
+                    "present_illness_detail": latest_complaint,
                 })
                 
         except Exception as e:
@@ -172,43 +292,53 @@ class DatabaseMedicalRecordService(MedicalRecordService):
             record = self._active_records.get(patient_id)
             if record:
                 # conversation格式: [{"role": "doctor", "content": "..."}, {"role": "patient", "content": "..."}]
-                # 需要成对处理
-                qa_pairs = []
-                for i in range(0, len(conversation), 2):
-                    if i + 1 < len(conversation):
-                        doctor_msg = conversation[i]
-                        patient_msg = conversation[i + 1]
-                        qa_pairs.append({
-                            "question": doctor_msg.get("content", ""),
-                            "answer": patient_msg.get("content", "")
+                # 按轮次写入 case_qa_records
+                round_idx = 1
+                i = 0
+                while i < len(conversation):
+                    msg = conversation[i]
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    # 按成对计算轮次（doctor+patient 为一轮）
+                    if role == "doctor":
+                        self.dao.add_case_qa_record({
+                            "case_id": record.record_id,
+                            "role": "doctor",
+                            "content": content,
+                            "round_index": round_idx,
                         })
+                        if i + 1 < len(conversation):
+                            patient_msg = conversation[i + 1]
+                            self.dao.add_case_qa_record({
+                                "case_id": record.record_id,
+                                "role": "patient",
+                                "content": patient_msg.get("content", ""),
+                                "round_index": round_idx,
+                            })
+                            i += 2
+                        else:
+                            i += 1
+                        round_idx += 1
+                    else:
+                        self.dao.add_case_qa_record({
+                            "case_id": record.record_id,
+                            "role": role or "patient",
+                            "content": content,
+                            "round_index": round_idx,
+                        })
+                        i += 1
+                        round_idx += 1
                 
-                # 保存每一轮问答到doctor_qa_records JSON字段
-                # 使用明确的字段顺序：先问题后回答，更符合对话逻辑
-                for i, qa in enumerate(qa_pairs, start=1):
-                    from collections import OrderedDict
-                    qa_record = OrderedDict([
-                        ("question_order", i),
-                        ("question", qa.get("question", "")),
-                        ("answer", qa.get("answer", "")),
-                        ("staff_id", doctor_id),
-                        ("staff_role", "doctor"),
-                        ("asked_at", now_iso()),
-                        ("location", location),
-                    ])
-                    self.dao.add_doctor_qa(record.record_id, qa_record)
-                
-                # 更新现病史和主诉
+                # 更新主诉（如果为空）
                 update_data = {}
-                # 注意：不要覆盖present_illness，它应该保持为护士记录的患者原始描述
-                # history是结构化的症状信息，不应该存入present_illness字段
-                
-                # 从第一轮患者回答中提取主诉（如果chief_complaint为空）
-                if qa_pairs and not record.chief_complaints:
-                    first_answer = qa_pairs[0].get("answer", "")
-                    if first_answer and len(first_answer) > 10:
-                        # 截取前200字符作为主诉
-                        update_data["chief_complaint"] = first_answer[:200]
+                if conversation and not record.chief_complaints:
+                    # 取第一个 patient 回答作为主诉参考
+                    for msg in conversation:
+                        if msg.get("role") == "patient":
+                            first_answer = msg.get("content", "")
+                            if first_answer and len(first_answer) > 10:
+                                update_data["chief_complaint"] = first_answer[:200]
+                            break
                 
                 if update_data:
                     self.dao.update_medical_case(record.record_id, update_data)
@@ -231,7 +361,6 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         
         try:
             record = self._active_records.get(patient_id)
-            outpatient_no = self._get_outpatient_no(patient_id)
             if record:
                 # 生成检查ID
                 import random
@@ -243,32 +372,22 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                 
                 # 验证case_id是否存在于数据库
                 db_case = self.dao.get_medical_case(record.record_id)
-                case_id_to_use = record.record_id if db_case else None
-                
                 if not db_case:
-                    logger.warning(f"⚠️  [数据库] 病例 {record.record_id} 在数据库中不存在，case_id设为NULL")
-                
-                # 更新病例中的检验科医生信息
-                if db_case:
-                    self.dao.update_medical_case(record.record_id, {
-                        "lab_doctor_id": operator,
-                        "lab_doctor_name": operator_name,
-                    })
+                    logger.warning(f"⚠️  [数据库] 病历 {record.record_id} 在数据库中不存在，跳过写入检查记录")
+                    return True
                 
                 self.dao.add_examination({
                     "exam_id": exam_id,
-                    "outpatient_no": outpatient_no,
-                    "case_id": case_id_to_use,
+                    "case_id": record.record_id,
                     "exam_name": test_name,
                     "exam_type": "lab",
+                    "lab_doctor_id": operator,
+                    "lab_doctor_name": operator_name,
                     "result_text": json.dumps(test_results, ensure_ascii=False),
                     "summary": test_results.get("summary", ""),
                     "is_abnormal": test_results.get("abnormal", False),
-                    "key_findings": test_results.get("key_findings", test_results.get("findings", [])),
                     "status": "completed",
                     "reported_at": datetime.now(),
-                    "lab_doctor_id": operator,
-                    "lab_doctor_name": operator_name,
                 })
                 
         except Exception as e:
@@ -288,7 +407,6 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         
         try:
             record = self._active_records.get(patient_id)
-            outpatient_no = self._get_outpatient_no(patient_id)
             if record:
                 # 生成检查ID
                 import random
@@ -300,21 +418,18 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                 
                 # 验证case_id是否存在于数据库
                 db_case = self.dao.get_medical_case(record.record_id)
-                case_id_to_use = record.record_id if db_case else None
-                
                 if not db_case:
-                    logger.warning(f"⚠️  [数据库] 病例 {record.record_id} 在数据库中不存在，case_id设为NULL")
+                    logger.warning(f"⚠️  [数据库] 病历 {record.record_id} 在数据库中不存在，跳过写入影像记录")
+                    return True
                 
                 self.dao.add_examination({
                     "exam_id": exam_id,
-                    "outpatient_no": outpatient_no,
-                    "case_id": case_id_to_use,
+                    "case_id": record.record_id,
                     "exam_name": imaging_type,
                     "exam_type": "imaging",
                     "result_text": json.dumps(imaging_results, ensure_ascii=False),
                     "summary": imaging_results.get("summary", ""),
                     "is_abnormal": imaging_results.get("abnormal", False),
-                    "key_findings": imaging_results.get("key_findings", imaging_results.get("findings", [])),
                     "status": "completed",
                     "reported_at": datetime.now(),
                 })
@@ -331,7 +446,8 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                      doctor_name: str = "主治医生") -> bool:
         """添加诊断记录（数据库 + 文件）
         
-        方案一优化：将完整诊断信息存储为JSON格式到diagnosis_reason字段
+        将诊断名写入 preliminary_diagnosis，诊断依据/推理写入 diagnosis_basis（JSON），
+        并更新 visits 表中的主治医生信息。
         """
         success = super().add_diagnosis(patient_id, doctor_id, diagnosis, location)
         
@@ -341,21 +457,14 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         try:
             record = self._active_records.get(patient_id)
             if record:
-                # 【方案一】构建完整诊断信息JSON
-                diagnosis_full_info = {
-                    "reasoning": diagnosis.get("reasoning", ""),
-                    "evidence": diagnosis.get("evidence", []),
-                    "rule_out": diagnosis.get("rule_out", []),
-                    "uncertainty": diagnosis.get("uncertainty", "unknown"),
-                    "disclaimer": diagnosis.get("disclaimer", ""),
-                }
-                
                 update_data = {
-                    "diagnosis_name": diagnosis.get("name"),
-                    # 存储完整诊断信息（JSON字符串）
-                    "diagnosis_reason": json.dumps(diagnosis_full_info, ensure_ascii=False),
-                    "attending_doctor_id": doctor_id,
-                    "attending_doctor_name": doctor_name,
+                    "preliminary_diagnosis": diagnosis.get("name"),
+                    "diagnosis_basis": json.dumps({
+                        "reasoning": diagnosis.get("reasoning", ""),
+                        "evidence": diagnosis.get("evidence", []),
+                        "rule_out": diagnosis.get("rule_out", []),
+                        "uncertainty": diagnosis.get("uncertainty", "unknown"),
+                    }, ensure_ascii=False),
                 }
                 
                 # 如果诊断中包含治疗计划，一并保存
@@ -369,18 +478,14 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                     update_data["medical_advice"] = diagnosis.get("medical_advice")
                 
                 self.dao.update_medical_case(record.record_id, update_data)
-                
-                # 记录诊断日志到case_logs
-                self.dao.add_case_log(record.record_id, {
-                    "log_type": "diagnosis",
-                    "entity_id": doctor_id,
-                    "entity_type": "doctor",
-                    "log_data": {
-                        "location": location,
-                        "diagnosis_name": diagnosis.get("name"),
-                        "timestamp": now_iso(),
-                    }
-                })
+
+                # 更新就诊记录中的主治医生信息
+                visit_id = self._current_visit_id.get(patient_id, "")
+                if visit_id:
+                    self.dao.update_visit(visit_id, {
+                        "attending_doctor_id": doctor_id,
+                        "attending_doctor_name": doctor_name,
+                    })
                 
         except Exception as e:
             logger.error(f"❌ [数据库] 诊断记录写入失败: {e}")
@@ -421,7 +526,7 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                 treatment_plan = "药物治疗：\n" + "\n".join([f"{i+1}. {d}" for i, d in enumerate(med_details)])
                 
                 self.dao.update_medical_case(record.record_id, {
-                    "medications": medications,
+                    "medications": json.dumps(medications, ensure_ascii=False),
                     "treatment_plan": treatment_plan,
                 })
                 
@@ -436,7 +541,7 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                          doctor_id: str = "doctor_001") -> bool:
         """患者出院（数据库 + 文件）
         
-        方案一优化：出院文档完整存储到case_logs的log_data字段
+        更新病历状态为 final，就诊状态为 completed。
         """
         success = super().discharge_patient(patient_id, discharge_docs, doctor_id)
         
@@ -446,24 +551,17 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         try:
             record = self._active_records.get(patient_id)
             if record:
-                # 更新病例状态
+                # 更新病历状态为 final
                 self.dao.update_medical_case(record.record_id, {
-                    "status": "completed",
-                    "outcome": "discharged",
+                    "status": "final",
                 })
                 
-                # 【方案一】将完整出院文档存入case_logs
-                self.dao.add_case_log(record.record_id, {
-                    "log_type": "discharge",
-                    "entity_id": patient_id,
-                    "entity_type": "patient",
-                    "log_data": {
-                        "doctor_id": doctor_id,
-                        "discharge_docs": discharge_docs,  # 完整的出院文档数组
-                        "total_entries": len(record.entries),
-                        "discharge_time": now_iso(),
-                    }
-                })
+                # 更新就诊状态为 completed
+                visit_id = self._current_visit_id.get(patient_id, "")
+                if visit_id:
+                    self.dao.update_visit(visit_id, {
+                        "status": "completed",
+                    })
                 
         except Exception as e:
             logger.error(f"出院信息写入数据库失败: {e}")
@@ -490,18 +588,6 @@ class DatabaseMedicalRecordService(MedicalRecordService):
                     "treatment_plan": treatment_plan,
                 })
                 
-                # 记录治疗日志
-                self.dao.add_case_log(record.record_id, {
-                    "log_type": "treatment",
-                    "entity_id": operator,
-                    "entity_type": "staff",
-                    "log_data": {
-                        "treatment_type": treatment_type,
-                        "details": treatment_details,
-                        "location": location,
-                    }
-                })
-                
         except Exception as e:
             logger.error(f"❌ [数据库] 治疗记录写入失败: {e}")
             import traceback
@@ -518,16 +604,6 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         try:
             self.dao.update_medical_case(record.record_id, {
                 "medical_advice": advice,
-            })
-            
-            # 记录日志
-            self.dao.add_case_log(record.record_id, {
-                "log_type": "medical_advice",
-                "entity_id": doctor_id,
-                "entity_type": "doctor",
-                "log_data": {
-                    "advice": advice,
-                }
             })
             return True
             
@@ -546,28 +622,7 @@ class DatabaseMedicalRecordService(MedicalRecordService):
         
         try:
             update_data = {"followup_plan": followup_plan}
-            if followup_date:
-                # 解析日期字符串为date对象
-                from datetime import datetime
-                if isinstance(followup_date, str):
-                    try:
-                        followup_date_obj = datetime.fromisoformat(followup_date.replace('Z', '+00:00')).date()
-                        update_data["followup_date"] = followup_date_obj
-                    except:
-                        pass
-            
             self.dao.update_medical_case(record.record_id, update_data)
-            
-            # 记录日志
-            self.dao.add_case_log(record.record_id, {
-                "log_type": "followup",
-                "entity_id": doctor_id,
-                "entity_type": "doctor",
-                "log_data": {
-                    "followup_plan": followup_plan,
-                    "followup_date": followup_date,
-                }
-            })
             return True
             
         except Exception as e:

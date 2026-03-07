@@ -523,6 +523,7 @@ class DialogueQualityEvaluator:
             db = Chroma(
                 persist_directory=str(db_path),
                 embedding_function=self._embeddings,
+                collection_name="HighQualityQA",
                 collection_metadata={"hnsw:space": "cosine"}
             )
             

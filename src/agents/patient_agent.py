@@ -13,19 +13,56 @@ class PatientAgent:
     def __init__(self, known_case: dict[str, Any], llm: LLMClient, chief_complaint: str = ""):
         """
         Args:
-            known_case: 患者可见的病例信息（仅 Case Information）
+            known_case: 患者可见的结构化病例信息
             llm: 语言模型客户端（必需，用于生成真实回答）
-            chief_complaint: 从病例中提取的主诉（患者会基于此向护士/医生描述）
+            chief_complaint: 从病例中提取的主诉（若为空则自动从结构化字段中读取）
         """
         if not known_case:
             raise ValueError("known_case不能为空")
         
-        self._known_case = known_case  # 私有：完整病例信息
-        self.case_info = known_case.get("Case Information", "")  # 公开：供外部访问
-        self._chief_complaint = chief_complaint  # 私有：患者自己的主诉
+        self._known_case = known_case  # 私有：完整病例信息（含结构化字段）
+
+        # ── 判断病史陈述者身份 ──────────────────────────────────────
+        narrator_raw: str = known_case.get("病史陈述者", "").strip()
+        # 认定为患者本人的关键词
+        _SELF_KEYWORDS = ("患者本人", "本人", "自述", "患者自述")
+        self._is_patient_self: bool = (
+            not narrator_raw  # 空字段默认视为本人
+            or any(kw in narrator_raw for kw in _SELF_KEYWORDS)
+        )
+        # 陈述者描述（用于提示词，如 "患者母亲"、"患者家属" 等）
+        self._narrator_role: str = narrator_raw if narrator_raw else "患者本人"
+        # 患者性别代词，供家属代述时以第三人称引用
+        patient_gender: str = known_case.get("性别", "")
+        self._he_she: str = "她" if "女" in patient_gender else "他"
+        patient_name: str = known_case.get("姓名", "患者")
+        self._patient_ref: str = patient_name if patient_name else "患者"
+        # ────────────────────────────────────────────────────────────
+
+        # 从结构化字段拼接病情文本
+        parts: list[str] = []
+        for label, key in [("姓名", "姓名"), ("性别", "性别"), ("年龄", "年龄")]:
+            val = known_case.get(key, "")
+            if val:
+                parts.append(f"{label}：{val}")
+        chief = known_case.get("主诉", "")
+        if chief:
+            parts.append(f"主诉：{chief}")
+        present = known_case.get("现病史_详细描述", "")
+        if present:
+            parts.append(f"现病史：{present}")
+        case_info = "，".join(parts) if parts else ""
+        
+        self.case_info = case_info  # 公开：供外部访问
+        
+        # 主诉优先级：传入参数 > 结构化字段 "主诉" > 空字符串
+        if chief_complaint:
+            self._chief_complaint = chief_complaint
+        else:
+            self._chief_complaint = known_case.get("主诉", "")
         
         if not self.case_info:
-            raise ValueError("Case Information为空，无法创建患者智能体")
+            raise ValueError("结构化病例字段为空，无法创建患者智能体")
         
         self.llm = llm
         self._recent_context: list[dict[str, str]] = []  # 仅保留最近5轮用于生成自然回答
@@ -41,25 +78,45 @@ class PatientAgent:
         self._recent_context = []
     
     def describe_to_nurse(self) -> str:
-        """患者向护士描述自己的症状（基于主诉，用自然语言）
-        
-        Returns:
-            患者的症状描述（口语化表达）
-        """
-        system_prompt = f"""你是一位感到不适的患者，刚来到医院分诊台。
+        """向护士描述患者症状（基于主诉，用自然语言）
 
-【你的病情】
+        若病史陈述者为患者本人，以第一人称描述；
+        否则以家属/陪同人身份、用第三人称描述患者症状。
+
+        Returns:
+            症状描述（口语化表达）
+        """
+        if self._is_patient_self:
+            identity_line = "你是一位感到不适的患者，刚来到医院分诊台。"
+            narrator_note = '用第一人称（"我"）描述自身症状'
+            extra_rule = ""
+        else:
+            identity_line = (
+                f"你是{self._narrator_role}，陪同患者{self._patient_ref}来到医院分诊台。"
+            )
+            narrator_note = (
+                f'以{self._narrator_role}的口吻、用"{self._he_she}"或'
+                f'"{self._patient_ref}"（第三人称）描述患者的症状，不要说"我的症状"'
+            )
+            extra_rule = (
+                f'\n   - 以家属视角描述，可以说"他/她跟我说..."或"我看到他/她..."'
+                f'\n   - 不要用"我感觉..."描述患者的主观感受'
+            )
+
+        system_prompt = f"""{identity_line}
+
+【患者病情】
 {self.case_info}
 
-【你的主诉】
+【主诉】
 {self._chief_complaint}
 
 【角色要求】
 1. **核心信息优先**：必须包含主诉中的关键医疗信息
    - 如果有具体体温，要说出来（比如"烧到38度多"）
-   - 如果有重要既往病史，要提及（比如"我之前得过XX病"、"我正在化疗"）
+   - 如果有重要既往病史，要提及（比如"之前得过XX病"、"正在化疗"）
    - 如果有明确的病程时长，要说清楚（比如"已经10天了"）
-   - 如果有特殊用药史，可以提及（比如"我在吃XX药"）
+   - 如果有特殊用药史，可以提及{extra_rule}
 
 2. **语言表达自然**：用普通人的口语，避免医学术语
    - "发烧"而不是"发热"
@@ -74,25 +131,14 @@ class PatientAgent:
    - 控制在3-5句话内
 
 4. **情绪真实自然**：
-   - 有严重病史的患者会更担心复发或并发症
+   - 有严重病史时会更担心复发或并发症
    - 可以表达焦虑："不知道是不是和XX有关"
-   - 可以表达期待："希望医生帮我看看"
-
-【示例风格】
-好的示例1（有既往史）：
-"我这几天一直发烧，烧到38度多，脖子和胸前还起了很多红疙瘩，又疼又痒。我之前有骨髓瘤，上个月刚做完一次化疗，不知道是不是有关系，挺担心的。"
-
-好的示例2（症状明确）：
-"我肚子疼得厉害，右下腹这块，疼了两天了，还发烧到38.5度，吐了好几次，走路都疼得直不起腰。"
-
-不好的示例（信息不完整）：
-"我最近一直发烧，身上还起了好多疙瘩，挺难受的。"（缺少体温、病程、既往史等关键信息）
 
 ⚠️ 注意：直接描述症状即可，不要加"医生"、"护士"等称呼。
 """
-        
-        user_prompt = "请描述你的症状（3-5句话，必须包含主诉中的关键信息如体温、病程、既往病史等，不要加称呼语）："
-        
+
+        user_prompt = f"请{narrator_note}（3-5句话，必须包含主诉中的关键信息如体温、病程、既往病史等，不要加称呼语）："
+
         try:
             description = self.llm.generate_text(
                 system_prompt=system_prompt,
