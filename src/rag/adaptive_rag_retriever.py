@@ -6,9 +6,11 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 import logging
+from logging_utils import log_retrieval_latency, log_recall_at_k
 
 # 强制使用离线模式（在导入 HuggingFace 库之前设置）
 os.environ['HF_HUB_OFFLINE'] = '1'
@@ -183,6 +185,7 @@ class AdaptiveRAGRetriever:
             统一格式的检索结果: [{doc_id, chunk_id, score, text, meta}, ...]
         """
         filters = filters or {}
+        start_perf = time.perf_counter()
         patient_id = filters.get("patient_id")
         dept = filters.get("dept")
         scenario = filters.get("scenario")
@@ -204,7 +207,16 @@ class AdaptiveRAGRetriever:
                 results = method(query, k=k)
             else:
                 self._logger.warning(f"⚠️  未知的数据库名称: {db_name}")
-            return results[:k]  # 强制返回，不走后续逻辑
+            final_results = results[:k]
+            self._log_rag_metrics(
+                query=query,
+                filters=filters,
+                k=k,
+                results=final_results,
+                elapsed_ms=(time.perf_counter() - start_perf) * 1000.0,
+                db_name=db_name,
+            )
+            return final_results  # 强制返回，不走后续逻辑
         
         # 根据场景选择检索策略
         if scenario == "patient_history":
@@ -221,7 +233,7 @@ class AdaptiveRAGRetriever:
             results.extend(case_results)
         
         elif scenario == "quality_qa":
-            # 专注于高质量问答（S4）- 只查询高质量问答库
+            # 专注于高质量问答（S1）- 只查询高质量问答库
             qa_results = self._retrieve_high_quality_qa(query, k=k)
             results.extend(qa_results)
         
@@ -254,7 +266,76 @@ class AdaptiveRAGRetriever:
         unique_results = self._deduplicate_and_sort(results)
         
         # 限制返回数量
-        return unique_results[:k * 2]  # 返回最多 2k 个结果
+        final_results = unique_results[:k * 2]  # 返回最多 2k 个结果
+        self._log_rag_metrics(
+            query=query,
+            filters=filters,
+            k=k,
+            results=final_results,
+            elapsed_ms=(time.perf_counter() - start_perf) * 1000.0,
+            db_name=db_name or scenario or "mixed",
+        )
+        return final_results
+
+    def _log_rag_metrics(
+        self,
+        *,
+        query: str,
+        filters: dict[str, Any],
+        k: int,
+        results: list[dict[str, Any]],
+        elapsed_ms: float,
+        db_name: str,
+    ) -> None:
+        """Write retrieval latency and optional Recall@k metrics."""
+        try:
+            run_id = str(filters.get("run_id", ""))
+            patient_id = str(filters.get("patient_id", ""))
+            case_id = str(filters.get("case_id", ""))
+            node_id = str(filters.get("node_id", ""))
+
+            log_retrieval_latency(
+                query=query,
+                latency_ms=elapsed_ms,
+                result_count=len(results),
+                k=k,
+                db_name=str(db_name or ""),
+                run_id=run_id,
+                patient_id=patient_id,
+                case_id=case_id,
+                node_id=node_id,
+            )
+
+            gold_doc_ids = filters.get("gold_doc_ids")
+            if isinstance(gold_doc_ids, str):
+                gold_ids = [gold_doc_ids]
+            elif isinstance(gold_doc_ids, list):
+                gold_ids = [str(x) for x in gold_doc_ids if str(x)]
+            else:
+                gold_ids = []
+
+            if gold_ids:
+                retrieved_doc_ids = [
+                    str(item.get("doc_id"))
+                    for item in results[:k]
+                    if item.get("doc_id")
+                ]
+                hit = any(doc_id in set(gold_ids) for doc_id in retrieved_doc_ids)
+                recall_val = 1.0 if hit else 0.0
+                log_recall_at_k(
+                    query=query,
+                    k=k,
+                    retrieved_doc_ids=retrieved_doc_ids,
+                    gold_doc_ids=gold_ids,
+                    recall_at_k=recall_val,
+                    hit=hit,
+                    run_id=run_id,
+                    patient_id=patient_id,
+                    case_id=case_id,
+                    node_id=node_id,
+                )
+        except Exception as e:
+            self._logger.debug(f"RAG metrics logging skipped: {e}")
     
     def _retrieve_history(
         self,

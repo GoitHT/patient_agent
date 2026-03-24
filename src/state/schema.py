@@ -116,6 +116,8 @@ class BaseState(BaseModel):
     patient_agent: Optional[Any] = Field(default=None, exclude=True)  # 患者Agent实例
     assigned_doctor_id: str = ""  # 分配的医生ID（可序列化）
     assigned_doctor_name: str = ""  # 分配的医生姓名（可序列化）
+    node_log_time: str = ""  # 节点意图时间戳：在 advance_time 后、LLM 调用前写入，
+                             # processor.py 优先读取此值以避免 LLM I/O 期间共享时钟污染
     
     @property
     def world(self) -> Optional[Any]:
@@ -203,7 +205,7 @@ class BaseState(BaseModel):
         
         # 推进时间
         if duration_minutes > 0:
-            self.world_context.advance_time(duration_minutes)
+            self.world_context.advance_time(duration_minutes, patient_id=self.patient_id)
         
         # 更新物理状态
         if self.patient_id in self.world_context.physical_states:

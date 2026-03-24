@@ -138,15 +138,15 @@ def build_common_specialty_subgraph(
     # 注意：不在这里判断 use_agents，而是在节点执行时动态判断
     # 因为 doctor_agent 是在 C4 节点中动态分配到 state 的
 
-    def s4_specialty_interview(state: BaseState) -> BaseState:
-        """S4: 通用专科问诊节点"""
+    def s1_specialty_interview(state: BaseState) -> BaseState:
+        """S1: 通用专科问诊节点"""
         dept = state.dept
         dept_config = DEPT_CONFIG.get(dept, DEPT_CONFIG.get("internal_medicine", {}))
         dept_name = dept_config.get("name", "通用科室")
         
         # 终端简洁输出
-        if should_log(1, "specialty_subgraph", "S4"):
-            logger.info(f"🏫 S4: {dept_name}专科问诊")
+        if should_log(1, "specialty_subgraph", "S1"):
+            logger.info(f"🏫 S1: {dept_name}专科问诊")
         
         # 详细日志记录
         detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
@@ -157,7 +157,7 @@ def build_common_specialty_subgraph(
         doctor_agent = getattr(state, 'doctor_agent', None)
         patient_agent = getattr(state, 'patient_agent', None)
         if doctor_agent is None or patient_agent is None:
-            raise RuntimeError("S4 节点缺少 DoctorAgent 或 PatientAgent，请检查 C4 节点是否正确分配医生")
+            raise RuntimeError("S1 节点缺少 DoctorAgent 或 PatientAgent，请检查 C4 节点是否正确分配医生")
         
         use_agents = True
         if hasattr(state, 'assigned_doctor_name'):
@@ -172,13 +172,13 @@ def build_common_specialty_subgraph(
         
         # 检索该科室的专科知识
         # 注意：此时chief_complaint还未设置（医生尚未从患者处获得），使用科室信息检索
-        _log_detail(f"🔍 检索{dept_name}专科知识库...", state, 2, "S4")
+        _log_detail(f"🔍 检索{dept_name}专科知识库...", state, 2, "S1")
         
         # 使用关键词生成器构建节点上下文（优先使用医生主诉，回退到原始主诉）
         keyword_generator = RAGKeywordGenerator()
         complaint_seed = state.chief_complaint or state.original_chief_complaint
         node_ctx = NodeContext(
-            node_id="S4",
+            node_id="S1",
             node_name="专科问诊",
             dept=dept,
             dept_name=dept_name,
@@ -193,7 +193,7 @@ def build_common_specialty_subgraph(
         chunks = retriever.retrieve(query, filters={"db_name": "MedicalGuide_db"}, k=4)
         state.add_retrieved_chunks(chunks)
         from graphs.log_helpers import _log_rag_retrieval
-        _log_rag_retrieval(query, chunks, state, filters={"db_name": "MedicalGuide_db"}, node_name="S4", purpose=f"{dept_name}专科知识[医学指南库]")
+        _log_rag_retrieval(query, chunks, state, filters={"db_name": "MedicalGuide_db"}, node_name="S1", purpose=f"{dept_name}专科知识[医学指南库]")
         
         # 【增强RAG】2. 检索高质量问诊库（使用关键词生成器）
         # 【单一数据库检索】只查询高质量问诊库(HighQualityQA_db) - 检索推荐的问诊问题
@@ -205,7 +205,7 @@ def build_common_specialty_subgraph(
         )
         # 无论是否有结果，都记录检索日志
         from graphs.log_helpers import _log_rag_retrieval
-        _log_rag_retrieval(qa_query, qa_chunks, state, filters={"db_name": "HighQualityQA_db"}, node_name="S4", purpose="高质量问诊参考[高质量问诊库]")
+        _log_rag_retrieval(qa_query, qa_chunks, state, filters={"db_name": "HighQualityQA_db"}, node_name="S1", purpose="高质量问诊参考[高质量问诊库]")
         if qa_chunks:
             state.add_retrieved_chunks(qa_chunks)
         
@@ -220,7 +220,7 @@ def build_common_specialty_subgraph(
             )
             # 无论是否有结果，都记录检索日志
             from graphs.log_helpers import _log_rag_retrieval
-            _log_rag_retrieval(case_query, case_chunks, state, filters={"db_name": "ClinicalCase_db"}, node_name="S4", purpose="临床案例参考[临床案例库]")
+            _log_rag_retrieval(case_query, case_chunks, state, filters={"db_name": "ClinicalCase_db"}, node_name="S1", purpose="临床案例参考[临床案例库]")
             if case_chunks:
                 state.add_retrieved_chunks(case_chunks)
 
@@ -231,7 +231,7 @@ def build_common_specialty_subgraph(
         interview_keys = dept_config.get("interview_keys", ["symptoms_detail"])
 
         # 获取节点专属计数器
-        node_key = f"s4_{dept}"
+        node_key = f"s1_{dept}"
         
         # Agent模式：逐步一问一答，然后从doctor_agent收集结构化信息
         if use_agents:
@@ -328,7 +328,7 @@ def build_common_specialty_subgraph(
             
             for i in range(remaining_questions):
                 # 终端只显示简洁信息
-                if should_log(1, "specialty_subgraph", "S4"):
+                if should_log(1, "specialty_subgraph", "S1"):
                     logger.info(f"  💬 问诊第 {questions_asked_this_node + i + 1} 轮")
                 
                 # 医生基于当前信息生成一个问题
@@ -351,7 +351,7 @@ def build_common_specialty_subgraph(
                     )
                 
                 if not question:
-                    if should_log(1, "specialty_subgraph", "S4"):
+                    if should_log(1, "specialty_subgraph", "S1"):
                         logger.info("  ℹ️  医生提前结束问诊")
                     if detail_logger:
                         detail_logger.info("医生判断信息已充足，提前结束问诊")
@@ -425,7 +425,7 @@ def build_common_specialty_subgraph(
                                 high_quality_count += 1
                         
                         # 详细日志（仅在debug级别显示）
-                        if should_log(3, "specialty_subgraph", "S4"):
+                        if should_log(3, "specialty_subgraph", "S1"):
                             logger.debug(
                                 f"  📊 Q{i+1} 质量评分: "
                                 f"医生={dialogue_score.doctor_metrics.quality:.2f}, "
@@ -445,20 +445,20 @@ def build_common_specialty_subgraph(
             if state.world_context:
                 qa_count = len([qa for qa in qa_list if qa.get('stage') == f"{dept}_specialty"])
                 if qa_count > 0:
-                    duration = qa_count * 3  # 每轮约3分钟
+                    duration = qa_count * 1  # 每轮约3分钟
                     energy_cost = 0.5 * qa_count  # 每轮消耗0.5体力
                     
                     logger.info(f"\n{'─'*60}")
                     logger.info(f"🌍 物理环境模拟 - 问诊过程")
                     logger.info(f"{'─'*60}")
-                    start_time = state.world_context.current_time.strftime('%H:%M')
+                    start_time = state.world_context.patient_current_time(state.patient_id).strftime('%H:%M')
                     
                     result = state.update_physical_world(
                         action="consult",
                         duration_minutes=duration,
                         energy_cost=energy_cost
                     )
-                    end_time = state.world_context.current_time.strftime('%H:%M')
+                    end_time = state.world_context.patient_current_time(state.patient_id).strftime('%H:%M')
                     
                     logger.info(f"💬 问诊轮数: {qa_count}轮")
                     logger.info(f"⏱️  总耗时: {duration}分钟")
@@ -608,7 +608,7 @@ def build_common_specialty_subgraph(
             if detail_logger:
                 detail_logger.warning(f"⚠️  发现警报症状: {', '.join(str(a) for a in alarm_list)}")
             # 终端输出（需要output level >= 2）
-            if should_log(2, "specialty_subgraph", "S4"):
+            if should_log(2, "specialty_subgraph", "S1"):
                 logger.warning(f"  ⚠️  发现警报症状: {', '.join(str(a) for a in alarm_list)}")
 
         # 记录节点问答轮数
@@ -620,7 +620,7 @@ def build_common_specialty_subgraph(
         
         state.add_audit(
             make_audit_entry(
-                node_name=f"S4 {dept_name} Specialty Interview",
+                node_name=f"S1 {dept_name} Specialty Interview",
                 inputs_summary={"chief_complaint": state.chief_complaint, "use_agents": use_agents, "dept": dept, "max_questions": max_questions},
                 outputs_summary={"alarm_symptoms": alarm_list, "node_qa_turns": node_qa_turns},
                 decision=f"完成{dept_name}专科问诊（本节点{node_qa_turns}轮）（Agent模式）",
@@ -632,7 +632,7 @@ def build_common_specialty_subgraph(
         # 详细日志输出节点执行摘要
         if detail_logger:
             detail_logger.info("")
-            detail_logger.info("📤 S4 专科问诊输出:")
+            detail_logger.info("📤 S1 专科问诊输出:")
             detail_logger.info(f"  • 问诊轮数: {node_qa_turns}轮")
             if alarm_list:
                 detail_logger.info(f"  • 危险症状: {', '.join(alarm_list)}")
@@ -642,18 +642,18 @@ def build_common_specialty_subgraph(
                     detail_logger.info(f"  • 主诉: {collected['chief_complaint']}")
                 if collected.get('history', {}).get('duration'):
                     detail_logger.info(f"  • 病程: {collected['history']['duration']}")
-            detail_logger.info(f"✅ S4 专科问诊完成")
+            detail_logger.info(f"✅ S1 专科问诊完成")
             detail_logger.info("")
         
-        if should_log(1, "specialty_subgraph", "S4"):
-            logger.info(f"  ✅ S4完成\n")
-        # 记录 S4 完成时的模拟时钟（供就诊时间线使用）
+        if should_log(1, "specialty_subgraph", "S1"):
+            logger.info(f"  ✅ S1完成\n")
+        # 记录 S1 完成时的模拟时钟（供就诊时间线使用）
         if state.world_context and isinstance(state.appointment, dict):
-            state.appointment["_s4_end_time"] = state.world_context.current_time.strftime('%H:%M')
+            state.appointment["_s1_end_time"] = state.world_context.patient_current_time(state.patient_id).strftime('%H:%M')
         return state
 
-    def s5_physical_exam(state: BaseState) -> BaseState:
-        """S5: 通用体检节点"""
+    def s2_physical_exam(state: BaseState) -> BaseState:
+        """S2: 通用体检节点"""
         dept = state.dept
         dept_config = DEPT_CONFIG.get(dept, DEPT_CONFIG.get("internal_medicine", {}))
         dept_name = dept_config.get("name", "通用")
@@ -663,8 +663,8 @@ def build_common_specialty_subgraph(
         # 获取详细日志记录器
         detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
         
-        if should_log(1, "specialty_subgraph", "S5"):
-            logger.info(f"� S5: {dept_name}体格检查")
+        if should_log(1, "specialty_subgraph", "S2"):
+            logger.info(f"� S2: {dept_name}体格检查")
         
         if detail_logger:
             detail_logger.section(f"{dept_name}体格检查")
@@ -744,10 +744,10 @@ def build_common_specialty_subgraph(
         
         # 推进时间（体格检查约5分钟）- 在LLM调用前推进，避免并发时钟漂移影响时间戳
         if state.world_context:
-            state.world_context.advance_time(minutes=5)
+            state.world_context.advance_time(minutes=5, patient_id=state.patient_id)
             state.sync_physical_state()
             if isinstance(state.appointment, dict):
-                state.appointment["_s5_end_time"] = state.world_context.current_time.strftime('%H:%M')
+                state.appointment["_s2_end_time"] = state.world_context.patient_current_time(state.patient_id).strftime('%H:%M')
 
         used_fallback = False
         if has_structured_exam:
@@ -824,7 +824,7 @@ def build_common_specialty_subgraph(
 
         state.add_audit(
             make_audit_entry(
-                node_name=f"S5 {dept_name} Physical Exam",
+                node_name=f"S2 {dept_name} Physical Exam",
                 inputs_summary={"exam_area": exam_area, "dept": dept, "has_real_data": bool(real_physical_exam)},
                 outputs_summary={"exam_completed": True, "data_source": exam.get("source", "unknown")},
                 decision=f"完成{dept_name}体格检查记录" + ("（使用数据集真实数据）" if real_physical_exam else "（LLM生成）"),
@@ -835,14 +835,14 @@ def build_common_specialty_subgraph(
         
         # 患者日志总结
         if detail_logger:
-            detail_logger.info(f"✅ S5 {dept_name}体格检查完成")
+            detail_logger.info(f"✅ S2 {dept_name}体格检查完成")
             detail_logger.info("")
         
-        logger.info("✅ S5节点完成\n")
+        logger.info("✅ S2节点完成\n")
         return state
 
-    def s6_preliminary_judgment(state: BaseState) -> BaseState:
-        """S6: 通用初步判断与开单节点"""
+    def s3_preliminary_judgment(state: BaseState) -> BaseState:
+        """S3: 通用初步判断与开单节点"""
         dept = state.dept
         dept_config = DEPT_CONFIG.get(dept, DEPT_CONFIG.get("internal_medicine", {}))
         dept_name = dept_config.get("name", "通用")
@@ -851,18 +851,18 @@ def build_common_specialty_subgraph(
                 # 获取详细日志记录器
         detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
         logger.info("\n" + "="*60)
-        logger.info(f"📊 S6: {dept_name}初步判断")
+        logger.info(f"📊 S3: {dept_name}初步判断")
         logger.info("="*60)
         
-        # 【增强RAG】S6: 检索医学指南库 + 临床案例库（使用关键词生成器）
-        # S6节点用途：综合患者信息和医学指南和相关案例得出是否需要辅助检查
+        # 【增强RAG】S3: 检索医学指南库 + 临床案例库（使用关键词生成器）
+        # S3节点用途：综合患者信息和医学指南和相关案例得出是否需要辅助检查
         # 使用：医学指南库(MedicalGuide_db) - 检索专科诊疗指南、检查指征、适应症
         #      临床案例库(ClinicalCase_db) - 检索相似案例
         
         # 使用关键词生成器
         keyword_generator = RAGKeywordGenerator()
         node_ctx = NodeContext(
-            node_id="S6",
+            node_id="S3",
             node_name="初步判断",
             dept=dept,
             dept_name=dept_name,
@@ -875,7 +875,7 @@ def build_common_specialty_subgraph(
         # 1. 检索医学指南库（使用关键词生成器）
         query = keyword_generator.generate_keywords(node_ctx, "MedicalGuide_db")
         logger.info(f"🔍 检索{dept_name}检查指南...")
-        _log_detail(f"\n🔍 检索{dept_name}诊疗指南与检查指征[医学指南库]...", state, 2, "S6")
+        _log_detail(f"\n🔍 检索{dept_name}诊疗指南与检查指征[医学指南库]...", state, 2, "S3")
         
         # 【单一数据库检索】只查询医学指南库
         chunks_guide = retriever.retrieve(query, filters={"db_name": "MedicalGuide_db"}, k=4)
@@ -885,12 +885,12 @@ def build_common_specialty_subgraph(
         from graphs.log_helpers import _log_rag_retrieval
         _log_rag_retrieval(query, chunks_guide, state, 
                          filters={"db_name": "MedicalGuide_db"}, 
-                         node_name="S6", 
+                         node_name="S3", 
                          purpose=f"{dept_name}诊疗指南与检查指征[医学指南库]")
         
         # 2. 检索临床案例库（使用关键词生成器）
         case_query = keyword_generator.generate_keywords(node_ctx, "ClinicalCase_db")
-        _log_detail(f"\n🔍 检索相似临床案例[临床案例库]...", state, 2, "S6")
+        _log_detail(f"\n🔍 检索相似临床案例[临床案例库]...", state, 2, "S3")
         
         # 【单一数据库检索】只查询临床案例库
         chunks_cases = retriever.retrieve(
@@ -902,12 +902,12 @@ def build_common_specialty_subgraph(
         
         _log_rag_retrieval(case_query, chunks_cases, state, 
                          filters={"db_name": "ClinicalCase_db"}, 
-                         node_name="S6", 
+                         node_name="S3", 
                          purpose=f"相似临床案例[临床案例库]")
         
         # 合并所有检索结果
         chunks = chunks_guide + chunks_cases
-        _log_detail(f"  ✅ 共检索到 {len(chunks)} 个知识片段", state, 2, "S6")
+        _log_detail(f"  ✅ 共检索到 {len(chunks)} 个知识片段", state, 2, "S3")
 
         cc = state.chief_complaint
         
@@ -990,10 +990,10 @@ def build_common_specialty_subgraph(
         
         # 推进时间（医生初步判断与开单约5分钟）- 在LLM调用前推进，避免并发时钟漂移影响时间戳
         if state.world_context:
-            state.world_context.advance_time(minutes=5)
+            state.world_context.advance_time(minutes=5, patient_id=state.patient_id)
             state.sync_physical_state()
             if isinstance(state.appointment, dict):
-                state.appointment["_s6_end_time"] = state.world_context.current_time.strftime('%H:%M')
+                state.appointment["_s3_end_time"] = state.world_context.patient_current_time(state.patient_id).strftime('%H:%M')
 
         # 优化fallback为保守策略
         obj, used_fallback, _raw = llm.generate_json(
@@ -1039,9 +1039,9 @@ def build_common_specialty_subgraph(
         state.ordered_tests = ordered
         state.specialty_summary = summary
 
-        # ── S6 评估：对照 medical_data["辅助检查"] 评估开单的数量与准确率 ──
+        # ── S3 评估：对照 medical_data["辅助检查"] 评估开单的数量与准确率 ──
         ref_aux_exam = str(state.medical_data.get("辅助检查", "")).strip() if state.medical_data else ""
-        s6_eval: dict[str, Any] = {}
+        s3_eval: dict[str, Any] = {}
         if enable_eval and ref_aux_exam:
             import re as _re
             # 按常见中英文分隔符拆分参考检查项，过滤掉长描述文本（保留检查名称关键词）
@@ -1069,7 +1069,7 @@ def build_common_specialty_subgraph(
             # 精准率：已开单中与参考匹配的比例（防过度开单）
             precision_rate = round(hit_count / ordered_count, 4) if ordered_count > 0 else 0.0
 
-            s6_eval = {
+            s3_eval = {
                 "ref_aux_exam_text": ref_aux_exam,
                 "ref_items": ref_items,
                 "ref_count": ref_count,
@@ -1081,7 +1081,7 @@ def build_common_specialty_subgraph(
                 "precision_rate": precision_rate,
             }
 
-            logger.info(f"\n📊 S6 开单评估（对照参考辅助检查）:")
+            logger.info(f"\n📊 S3 开单评估（对照参考辅助检查）:")
             logger.info(f"  参考检查项数: {ref_count}  |  实际开单: {ordered_count}  |  命中: {hit_count}")
             logger.info(f"  覆盖率: {coverage_rate:.0%}  |  精准率: {precision_rate:.0%}")
             if hit_list:
@@ -1090,7 +1090,7 @@ def build_common_specialty_subgraph(
                 logger.info(f"  ❌ 遗漏: {', '.join(miss_list)}")
             if detail_logger:
                 detail_logger.info("")
-                detail_logger.info("📊 S6 开单评估（对照参考辅助检查）:")
+                detail_logger.info("📊 S3 开单评估（对照参考辅助检查）:")
                 detail_logger.info(f"  • 参考检查项数: {ref_count}  |  实际开单: {ordered_count}  |  命中: {hit_count}")
                 detail_logger.info(f"  • 覆盖率(召回率): {coverage_rate:.0%}  |  精准率: {precision_rate:.0%}")
                 if hit_list:
@@ -1111,25 +1111,25 @@ def build_common_specialty_subgraph(
             "need_aux_tests": state.need_aux_tests,
             "ordered_tests_count": len(ordered),
         }
-        if s6_eval:
-            state.dept_payload[dept]["s6_eval"] = s6_eval
+        if s3_eval:
+            state.dept_payload[dept]["s3_eval"] = s3_eval
 
         state.add_audit(
             make_audit_entry(
-                node_name=f"S6 {dept_name} Preliminary Judgment",
+                node_name=f"S3 {dept_name} Preliminary Judgment",
                 inputs_summary={"chief_complaint": state.chief_complaint, "dept": dept},
                 outputs_summary={
                     "need_aux_tests": state.need_aux_tests,
                     "ordered_tests": [t["name"] for t in ordered],
                     **(
                         {
-                            "s6_eval_ordered_count": s6_eval["ordered_count"],
-                            "s6_eval_ref_count": s6_eval["ref_count"],
-                            "s6_eval_hit_count": s6_eval["hit_count"],
-                            "s6_eval_coverage_rate": s6_eval["coverage_rate"],
-                            "s6_eval_precision_rate": s6_eval["precision_rate"],
+                            "s3_eval_ordered_count": s3_eval["ordered_count"],
+                            "s3_eval_ref_count": s3_eval["ref_count"],
+                            "s3_eval_hit_count": s3_eval["hit_count"],
+                            "s3_eval_coverage_rate": s3_eval["coverage_rate"],
+                            "s3_eval_precision_rate": s3_eval["precision_rate"],
                         }
-                        if s6_eval else {}
+                        if s3_eval else {}
                     ),
                 },
                 decision=decision,
@@ -1141,7 +1141,7 @@ def build_common_specialty_subgraph(
         # 详细日志输出节点执行摘要
         if detail_logger:
             detail_logger.info("")
-            detail_logger.info("📤 S6 初步判断输出:")
+            detail_logger.info("📤 S3 初步判断输出:")
             detail_logger.info(f"  • 需要辅助检查: {'是' if need_aux_tests else '否'}")
             if ordered:
                 detail_logger.info(f"  • 开具检查: {len(ordered)}项")
@@ -1154,26 +1154,26 @@ def build_common_specialty_subgraph(
                     detail_logger.info(f"  • 问题列表: {', '.join(summary['problem_list'][:3])}")
                 if summary.get('assessment'):
                     detail_logger.info(f"  • 评估: {summary['assessment'][:80]}...")
-            if s6_eval:
+            if s3_eval:
                 detail_logger.info(
-                    f"  • 开单评估: 覆盖率 {s6_eval['coverage_rate']:.0%}"
-                    f" | 精准率 {s6_eval['precision_rate']:.0%}"
-                    f" | 命中 {s6_eval['hit_count']}/{s6_eval['ref_count']}"
+                    f"  • 开单评估: 覆盖率 {s3_eval['coverage_rate']:.0%}"
+                    f" | 精准率 {s3_eval['precision_rate']:.0%}"
+                    f" | 命中 {s3_eval['hit_count']}/{s3_eval['ref_count']}"
                 )
-            detail_logger.info(f"✅ S6 初步判断完成")
+            detail_logger.info(f"✅ S3 初步判断完成")
             detail_logger.info("")
         
-        logger.info("✅ S6节点完成\n")
+        logger.info("✅ S3节点完成\n")
         return state
 
     # 构建图结构
-    graph.add_node("S4", s4_specialty_interview)
-    graph.add_node("S5", s5_physical_exam)
-    graph.add_node("S6", s6_preliminary_judgment)
+    graph.add_node("S1", s1_specialty_interview)
+    graph.add_node("S2", s2_physical_exam)
+    graph.add_node("S3", s3_preliminary_judgment)
 
-    graph.set_entry_point("S4")
-    graph.add_edge("S4", "S5")
-    graph.add_edge("S5", "S6")
-    graph.add_edge("S6", END)
+    graph.set_entry_point("S1")
+    graph.add_edge("S1", "S2")
+    graph.add_edge("S2", "S3")
+    graph.add_edge("S3", END)
     
     return graph.compile()

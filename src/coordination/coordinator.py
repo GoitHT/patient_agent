@@ -59,6 +59,7 @@ class DoctorResource:
     consultation_requests: List[str] = field(default_factory=list)  # 会诊请求队列
     total_patients_today: int = 0       # 今日接诊患者数
     average_consultation_time: float = 15.0  # 平均就诊时间（分钟）
+    returning_patients: List[str] = field(default_factory=list)  # 去做检查后返回、等待复诊的患者队列（优先于普通等待队列）
     
     def is_available(self) -> bool:
         """是否可接诊"""
@@ -467,28 +468,144 @@ class HospitalCoordinator:
     def release_doctor(self, doctor_id: str):
         """
         释放医生（就诊结束）
+        优先将复诊（去做检查后返回）的患者分配给该医生，再从普通等待队列分配。
         
         Args:
             doctor_id: 医生ID
         """
+        dept = None
+        assigned_returning = False
+
         with self._lock:
             doctor = self.doctors.get(doctor_id)
             if not doctor:
                 return
-            
+
             # 记录就诊结束时间
             if doctor.current_patient:
                 session = self.patients.get(doctor.current_patient)
                 if session:
                     session.consultation_end_time = now_iso()
-            
+
             dept = doctor.dept
             doctor.end_consultation()
-            
             self.stats["total_consultations"] += 1
-        
-        # 尝试分配下一位患者
-        self._try_assign_doctor(dept)
+
+            # ━━ 优先处理复诊等待患者（返回检查结果复诊，优先于普通等待队列） ━━
+            while doctor.returning_patients:
+                returning_patient_id = doctor.returning_patients.pop(0)
+                returning_session = self.patients.get(returning_patient_id)
+                if returning_session and returning_session.status == PatientStatus.RETURNING:
+                    returning_session.status = PatientStatus.CONSULTING
+                    returning_session.consultation_start_time = now_iso()
+                    doctor.start_consultation(returning_patient_id)
+
+                    case_id = returning_session.patient_data.get("case_id")
+                    patient_display = f"P{case_id}" if case_id is not None else returning_patient_id
+                    logger.info(
+                        f"[{patient_display}] ✅ 复诊优先: 医生 {doctor.name} 接诊返回患者 {patient_display}"
+                    )
+                    assigned_returning = True
+                    break  # 只分配一个复诊患者，其余继续等
+
+        # 若无复诊患者等待，则从普通等待队列分配
+        if not assigned_returning and dept:
+            self._try_assign_doctor(dept)
+
+    def temporarily_release_doctor_for_exam(self, patient_id: str):
+        """
+        患者离开诊室去做检查时，临时释放医生资源。
+        不计入接诊完成统计，保留 session.assigned_doctor 以备患者检查完毕后复诊。
+        释放后立即触发等待队列调度，让空出的医生接诊下一位普通等待患者。
+
+        Args:
+            patient_id: 离开诊室去做检查的患者ID
+        """
+        dept = None
+        with self._lock:
+            session = self.patients.get(patient_id)
+            if not session or not session.assigned_doctor:
+                return
+
+            doctor_id = session.assigned_doctor
+            doctor = self.doctors.get(doctor_id)
+            if not doctor:
+                return
+
+            if doctor.current_patient != patient_id:
+                return  # 医生当前接诊的不是本患者，无需操作
+
+            dept = doctor.dept
+            # 临时释放：仅清空 current_patient 并将状态改为 AVAILABLE
+            # 不调用 doctor.end_consultation()，不计入接诊统计
+            # 不清空 session.assigned_doctor，保留分配关系
+            doctor.current_patient = None
+            doctor.status = ResourceStatus.AVAILABLE
+
+            case_id = session.patient_data.get("case_id")
+            patient_display = f"P{case_id}" if case_id is not None else patient_id
+            logger.info(
+                f"[{patient_display}] 🔓 患者 {patient_display} 离开诊室去做检查，"
+                f"医生 {doctor.name} 暂时空闲（分配关系保留，复诊时优先接诊）"
+            )
+
+        # 医生空出后，尝试从普通等待队列调度下一位患者
+        if dept:
+            self._try_assign_doctor(dept)
+
+    def return_from_exam(self, patient_id: str):
+        """
+        患者检查完毕返回，等待或立即重新分配回原医生。
+        - 若原医生空闲：直接重新开始接诊。
+        - 若原医生正忙：加入该医生的复诊等待队列（优先于普通等待队列）。
+        - 若无原分配医生：以较高优先级加入科室普通等待队列（兜底）。
+
+        Args:
+            patient_id: 检查完毕返回的患者ID
+        """
+        with self._lock:
+            session = self.patients.get(patient_id)
+            if not session:
+                return
+
+            case_id = session.patient_data.get("case_id")
+            patient_display = f"P{case_id}" if case_id is not None else patient_id
+
+            if not session.assigned_doctor:
+                # 无原分配医生，以较高优先级加入科室普通等待队列
+                logger.info(f"[{patient_display}] 🔄 复诊: 无原分配医生，加入普通等待队列（优先级提升）")
+                session.status = PatientStatus.WAITING
+                session.queue_entry_time = time.time()
+                session.effective_priority = min(PRIORITY_MAX, session.priority + 3)
+                self.waiting_queues[session.dept].put(session)
+                return
+
+            doctor = self.doctors.get(session.assigned_doctor)
+            if not doctor:
+                logger.warning(f"[{patient_display}] ⚠️ 复诊: 原分配医生 {session.assigned_doctor} 不存在，加入普通等待队列")
+                session.status = PatientStatus.WAITING
+                session.queue_entry_time = time.time()
+                session.effective_priority = min(PRIORITY_MAX, session.priority + 3)
+                self.waiting_queues[session.dept].put(session)
+                return
+
+            if doctor.is_available():
+                # 医生空闲，直接重新开始接诊
+                session.status = PatientStatus.CONSULTING
+                session.consultation_start_time = now_iso()
+                doctor.start_consultation(patient_id)
+                logger.info(
+                    f"[{patient_display}] ✅ 复诊: 医生 {doctor.name} 空闲，{patient_display} 直接开始复诊"
+                )
+            else:
+                # 医生正在接诊其他患者，加入该医生的复诊等待队列
+                session.status = PatientStatus.RETURNING
+                if patient_id not in doctor.returning_patients:
+                    doctor.returning_patients.append(patient_id)
+                logger.info(
+                    f"[{patient_display}] ⏳ 复诊: 医生 {doctor.name} 正在接诊其他患者，"
+                    f"{patient_display} 等待问诊完毕后复诊（位置: 第{len(doctor.returning_patients)}位）"
+                )
     
     # ========== 会诊调度 ==========
     
@@ -623,28 +740,30 @@ class HospitalCoordinator:
                 logger.info(f"📷 患者 {patient_id} 前往影像科")
     
     def complete_lab_test(self, patient_id: str):
-        """完成检验"""
+        """完成检验，通知患者返回并优先分配回原医生"""
         with self._lock:
             session = self.patients.get(patient_id)
             if session:
                 session.lab_results_ready = True
-                session.status = PatientStatus.RETURNING
-                logger.info(f"✅ 患者 {patient_id} 检验完成，返回就诊科室")
-                
-                # 重新加入等候队列（复诊）
-                self.enqueue_patient(patient_id)
-    
+                case_id = session.patient_data.get("case_id")
+                patient_display = f"P{case_id}" if case_id is not None else patient_id
+                logger.info(f"[{patient_display}] ✅ 检验完成，等待返回诊室复诊")
+
+        # 尝试复诊分配（优先回原医生）
+        self.return_from_exam(patient_id)
+
     def complete_imaging(self, patient_id: str):
-        """完成影像检查"""
+        """完成影像检查，通知患者返回并优先分配回原医生"""
         with self._lock:
             session = self.patients.get(patient_id)
             if session:
                 session.imaging_results_ready = True
-                session.status = PatientStatus.RETURNING
-                logger.info(f"✅ 患者 {patient_id} 影像检查完成，返回就诊科室")
-                
-                # 重新加入等候队列（复诊）
-                self.enqueue_patient(patient_id)
+                case_id = session.patient_data.get("case_id")
+                patient_display = f"P{case_id}" if case_id is not None else patient_id
+                logger.info(f"[{patient_display}] ✅ 影像检查完成，等待返回诊室复诊")
+
+        # 尝试复诊分配（优先回原医生）
+        self.return_from_exam(patient_id)
     
     # ========== 离院管理 ==========
     

@@ -27,6 +27,7 @@ from services.billing import BillingService
 from services.llm_client import LLMClient
 from state.schema import BaseState, make_audit_entry
 from logging_utils import should_log, get_output_level, OutputFilter, SUPPRESS_UNCHECKED_LOGS
+from logging_utils import compute_groundedness_similarity, log_groundedness
 from utils import (
     parse_json_with_retry,
     get_logger,
@@ -259,9 +260,11 @@ class CommonOPDGraph:
         from_name = self._get_location_name(from_loc) if from_loc else "未知"
         to_name = self._get_location_name(to_loc) if to_loc else "未知"
         
-        # 获取当前时间
+        # 获取当前时间（时间线显示使用患者时间轴，避免并发患者污染）
         time_str = ""
-        if self.world:
+        if self.world and state.patient_id:
+            time_str = self.world.patient_current_time(state.patient_id).strftime('%H:%M')
+        elif self.world:
             time_str = self.world.current_time.strftime('%H:%M')
         
         # 记录移动
@@ -297,8 +300,12 @@ class CommonOPDGraph:
                 raise ValueError(f"State validation failed: missing {missing_fields}")
             
             # 2. 记录流程开始时间（使用物理世界时间，保证一致性）
-            if self.world:
-                # 使用物理世界的时间系统
+            if self.world and state.patient_id:
+                # 为该患者注册/重置个人就诊时钟，保证多患者并发时各自独立计时
+                self.world.register_patient_visit(state.patient_id)
+                # 使用患者个人时钟的起始时间作为 visit_start_time
+                start_timestamp = self.world.patient_current_time(state.patient_id).isoformat()
+            elif self.world:
                 start_timestamp = self.world.current_time.isoformat()
             else:
                 # 如果没有启用物理世界，使用系统时间
@@ -311,7 +318,7 @@ class CommonOPDGraph:
             if self.world and state.patient_id:
                 # 记录起始位置
                 initial_loc = state.current_location or "lobby"
-                time_str = self.world.current_time.strftime('%H:%M')
+                time_str = self.world.patient_current_time(state.patient_id).strftime('%H:%M')
                 state.movement_history.append({
                     "from": "入院",
                     "to": self._get_location_name(initial_loc),
@@ -351,7 +358,7 @@ class CommonOPDGraph:
             
             # 8. 推进时间（患者入院到挂号处需要约2分钟）
             if self.world:
-                self.world.advance_time(minutes=2)
+                self.world.advance_time(minutes=2, patient_id=state.patient_id)
                 state.sync_physical_state()
             
             state.add_audit(
@@ -395,7 +402,7 @@ class CommonOPDGraph:
                     _log_detail(f"  🚶 移动: 门诊大厅 → 挂号处", state, 2, "C2")
                     state.current_location = "registration"
                     state.sync_physical_state()
-                    self.world.advance_time(minutes=1)
+                    self.world.advance_time(minutes=1, patient_id=state.patient_id)
             
             # 显示物理环境状态
             _log_physical_state(state, "C2", level=2)
@@ -417,7 +424,7 @@ class CommonOPDGraph:
             
             # 推进时间（挂号约需3分钟）
             if self.world:
-                self.world.advance_time(minutes=3)
+                self.world.advance_time(minutes=3, patient_id=state.patient_id)
                 state.sync_physical_state()
             
             if detail_logger:
@@ -453,7 +460,7 @@ class CommonOPDGraph:
                     _log_detail(f"  🚶 移动: 挂号处 → 候诊区", state, 2, "C3")
                     state.current_location = "waiting_area"
                     state.sync_physical_state()
-                    self.world.advance_time(minutes=2)
+                    self.world.advance_time(minutes=2, patient_id=state.patient_id)
             
             # 显示物理环境状态
             _log_physical_state(state, "C3", level=2)
@@ -606,7 +613,7 @@ class CommonOPDGraph:
                     state.sync_physical_state()
                     
                     # 推进时间（叫号和入诊大约2分钟）
-                    self.world.advance_time(minutes=2)
+                    self.world.advance_time(minutes=2, patient_id=state.patient_id)
                     
                 else:
                     _log_detail(f"⚠️  患者移动失败: {msg}", state, 2, "C4")
@@ -661,6 +668,14 @@ class CommonOPDGraph:
                 dept_name=state.dept_name if hasattr(state, "dept_name") else None,
                 chief_complaint=state.chief_complaint,
             )
+            # 推进时间（医生准备问诊约需2分钟），并在 LLM 调用前记录意图时间戳：
+            # processor.py 优先使用此值，避免其他并发患者线程在 LLM I/O 期间
+            # 推进共享时钟导致本节点耗时虚高
+            if self.world:
+                self.world.advance_time(minutes=2, patient_id=state.patient_id)
+                state.sync_physical_state()
+                state.node_log_time = self.world.patient_current_time(state.patient_id).strftime('%H:%M')
+
             query = self.keyword_generator.generate_keywords(node_ctx, "HospitalProcess_db")
             # 【单一数据库检索】只查询规则流程库
             chunks = self.retriever.retrieve(
@@ -673,11 +688,6 @@ class CommonOPDGraph:
 
             # 初始化问诊对话记录（实际问诊在C6专科子图中进行）
             state.agent_interactions["doctor_patient_qa"] = []
-            
-            # 推进时间（医生准备问诊约需2分钟）
-            if self.world:
-                self.world.advance_time(minutes=2)
-                state.sync_physical_state()
             
             state.add_audit(
                 make_audit_entry(
@@ -727,6 +737,7 @@ class CommonOPDGraph:
             注：此节点目前仅做简单判断，未来可扩展为更复杂的决策逻辑（如急诊分流、转诊判断等）
             """
             state.world_context = self.world
+            state.node_log_time = ""  # 清除 C5 遗留的时间戳，避免时间线耗时虚高
             _log_node_start("C7", "路径决策", state)
             
             # 显示物理环境状态
@@ -742,7 +753,7 @@ class CommonOPDGraph:
             
             # 推进时间（医生决策思考约需1分钟）
             if self.world:
-                self.world.advance_time(minutes=1)
+                self.world.advance_time(minutes=1, patient_id=state.patient_id)
                 state.sync_physical_state()
             
             state.add_audit(
@@ -766,6 +777,7 @@ class CommonOPDGraph:
             3. 生成完整的检查准备说明（不包含具体预约信息）
             """
             state.world_context = self.world
+            state.node_log_time = ""  # 清除继承的旧时间戳
             _log_node_start("C8", "开单与准备说明", state)
             detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
             
@@ -874,7 +886,7 @@ class CommonOPDGraph:
             
             # 推进时间（医生开单并解释约需5分钟）
             if self.world:
-                self.world.advance_time(minutes=5)
+                self.world.advance_time(minutes=5, patient_id=state.patient_id)
                 state.sync_physical_state()
 
             all_chunks = hospital_chunks + dept_chunks
@@ -916,7 +928,12 @@ class CommonOPDGraph:
                     _log_detail(f"  🚶 移动: 诊室 → 收费处", state, 2, "C9")
                     state.current_location = "cashier"
                     state.sync_physical_state()
-                    self.world.advance_time(minutes=2)
+                    self.world.advance_time(minutes=2, patient_id=state.patient_id)
+
+            # 【医生释放】患者离开诊室去做检查，临时释放医生，让医生为其他等待患者问诊
+            if hasattr(state, 'coordinator') and state.coordinator and state.patient_id:
+                state.coordinator.temporarily_release_doctor_for_exam(state.patient_id)
+                _log_detail("  🔓 患者离开诊室，医生已释放（可接诊其他等待患者）", state, 2, "C9")
 
             # 显示物理环境状态
             _log_physical_state(state, "C9", level=2)
@@ -1143,7 +1160,7 @@ class CommonOPDGraph:
                             _log_detail(f"    🚶 移动: {self._get_location_name(from_loc)} → {location_name}", state, 2, "C10")
                             state.current_location = target_location
                             state.sync_physical_state()
-                            self.world.advance_time(minutes=2)
+                            self.world.advance_time(minutes=2, patient_id=state.patient_id)
 
                     # ── 请求设备（获取真实等待时间）──
                     case_id = state.case_data.get("id") if state.case_data else None
@@ -1514,8 +1531,71 @@ class CommonOPDGraph:
                         _log_detail(f"  🚶 移动: {current_loc_name} → {dept_display_name}", state, 2, "C11")
                         state.current_location = target_clinic
                         state.sync_physical_state()
-                        self.world.advance_time(minutes=2)
-            
+                        self.world.advance_time(minutes=2, patient_id=state.patient_id)
+
+            # 【复诊等待逻辑】通知协调器患者已返回，严格等待初诊医生（同一医生）完成当前问诊后复诊
+            if hasattr(state, 'coordinator') and state.coordinator and state.patient_id:
+                coordinator = state.coordinator
+
+                # 使用 C4 节点设定的初诊医生 ID 作为权威来源，确保复诊与初诊为同一医生
+                initial_doctor_id = getattr(state, 'assigned_doctor_id', None)
+                session = coordinator.get_patient(state.patient_id)
+
+                if initial_doctor_id and session:
+                    # 通知 coordinator 患者已返回，优先分配回初诊医生
+                    coordinator.return_from_exam(state.patient_id)
+
+                    initial_doctor = coordinator.get_doctor(initial_doctor_id)
+                    initial_doctor_name = initial_doctor.name if initial_doctor else initial_doctor_id
+
+                    max_wait_seconds = 1200  # 最长等待 20 分钟
+                    start_wait = time.time()
+                    wait_logged = False
+
+                    while time.time() - start_wait < max_wait_seconds:
+                        doctor = coordinator.get_doctor(initial_doctor_id)
+
+                        if not doctor:
+                            _log_detail(f"  ⚠️ 初诊医生 {initial_doctor_id} 不存在，终止等待", state, 2, "C11")
+                            break
+
+                        # 检查初诊医生是否已在接诊本患者（复诊开始条件）
+                        if doctor.current_patient == state.patient_id:
+                            if wait_logged:
+                                elapsed = time.time() - start_wait
+                                _log_detail(
+                                    f"  ✅ 初诊医生 {doctor.name} 已完成当前患者问诊，开始复诊"
+                                    f"（等待 {elapsed:.0f}秒）",
+                                    state, 2, "C11"
+                                )
+                            else:
+                                _log_detail(
+                                    f"  ✅ 初诊医生 {doctor.name} 空闲，立即开始复诊",
+                                    state, 2, "C11"
+                                )
+                            break
+
+                        # 初诊医生正忙，等待
+                        if not wait_logged:
+                            if doctor.current_patient:
+                                _log_detail(
+                                    f"  ⏳ 初诊医生 {doctor.name} 正在为其他患者问诊，"
+                                    f"等待问诊完毕后复诊...",
+                                    state, 2, "C11"
+                                )
+                            wait_logged = True
+
+                        time.sleep(0.3)
+
+                    # 验证复诊医生确实是初诊医生，并更新 state 中的医生信息
+                    doctor = coordinator.get_doctor(initial_doctor_id)
+                    if doctor and doctor.current_patient == state.patient_id:
+                        # 同一医生确认，state 无需改变（已在 C4 设定）
+                        _log_detail(
+                            f"  🩺 复诊医生确认: {doctor.name}（与初诊医生一致）",
+                            state, 2, "C11"
+                        )
+
             # 显示物理环境状态
             _log_physical_state(state, "C11", level=2)
             
@@ -1792,6 +1872,7 @@ class CommonOPDGraph:
 
         def c12_final_synthesis(state: BaseState) -> BaseState:
             state.world_context = self.world
+            state.node_log_time = ""  # 清除继承的旧时间戳
             _log_node_start("C12", "综合分析与诊断", state)
             detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
             
@@ -1885,6 +1966,13 @@ class CommonOPDGraph:
                 }
 
             used_fallback = False
+            # 在 LLM 调用前推进模拟时间并记录意图时间戳：
+            # 多患者并发时，其他线程在 LLM I/O 期间会推进共享时钟，
+            # processor.py 优先使用此值，避免 C12 耗时虚高
+            if self.world:
+                self.world.advance_time(minutes=10, patient_id=state.patient_id)
+                state.sync_physical_state()
+                state.node_log_time = self.world.patient_current_time(state.patient_id).strftime('%H:%M')
             if self.llm is not None:
                 _log_detail("\n🤖 使用LLM生成诊断与方案...", state, 1, "C12")
                 system_prompt = load_prompt("common_system.txt")
@@ -2153,6 +2241,42 @@ class CommonOPDGraph:
                         _log_detail(f"    [{i}] {ev if isinstance(ev, str) else str(ev)[:50]}", state, 1, "C12")
                 else:
                     _log_detail("  ⚠️  缺少证据引用", state, 1, "C12")
+
+                # RAG 指标：Groundedness（回答与引用证据的一致性）
+                try:
+                    diagnosis_name = str(state.diagnosis.get("name", "")).strip()
+                    diagnosis_reasoning = str(state.diagnosis.get("reasoning", "")).strip()
+                    evidence_text = " ".join(
+                        str(x).strip() for x in evidence_list if str(x).strip()
+                    )
+                    answer_text = " ".join(
+                        text for text in [diagnosis_name, diagnosis_reasoning, evidence_text] if text
+                    )
+
+                    citation_texts = [
+                        str(chunk.get("text", "")).strip()
+                        for chunk in all_chunks
+                        if str(chunk.get("text", "")).strip()
+                    ]
+                    citation_doc_ids = [
+                        str(chunk.get("doc_id"))
+                        for chunk in all_chunks
+                        if chunk.get("doc_id")
+                    ]
+
+                    grounded_score = compute_groundedness_similarity(answer_text, citation_texts)
+                    log_groundedness(
+                        answer_text=answer_text,
+                        citation_doc_ids=citation_doc_ids,
+                        semantic_similarity=grounded_score,
+                        run_id=str(state.run_id),
+                        patient_id=str(state.patient_id),
+                        case_id=str(state.case_data.get("id", "")) if isinstance(state.case_data, dict) else "",
+                        node_id="C12",
+                    )
+                    _log_detail(f"  • Groundedness: {grounded_score:.3f}", state, 1, "C12")
+                except Exception as e:
+                    logger.debug(f"Groundedness logging skipped: {e}")
                 
                 # 显示鉴别诊断
                 rule_out = state.diagnosis.get('rule_out', [])
@@ -2244,15 +2368,12 @@ class CommonOPDGraph:
                     else (["LLM_USED"] if self.llm else []),
                 )
             )
-            # 推进时间（医生综合分析与诊断约需10分钟）
-            if self.world:
-                self.world.advance_time(minutes=10)
-                state.sync_physical_state()
             _log_node_end("C12", state)
             return state
 
         def c13_disposition(state: BaseState) -> BaseState:
             state.world_context = self.world
+            state.node_log_time = ""  # 清除继承的旧时间戳
             _log_node_start("C13", "处置决策", state)
             
             # 显示物理环境状态
@@ -2369,7 +2490,7 @@ class CommonOPDGraph:
             
             # 推进时间（医生处置决策约需4分钟）
             if self.world:
-                self.world.advance_time(minutes=4)
+                self.world.advance_time(minutes=4, patient_id=state.patient_id)
                 state.sync_physical_state()
             
             state.add_audit(
@@ -2387,6 +2508,7 @@ class CommonOPDGraph:
         def c14_documents(state: BaseState) -> BaseState:
             """C14: 使用LLM生成门诊医疗文书"""
             state.world_context = self.world
+            state.node_log_time = ""  # 清除继承的旧时间戳
             _log_node_start("C14", "生成文书", state)
             detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
             
@@ -2467,6 +2589,12 @@ class CommonOPDGraph:
             
             docs = []
             doc_types = ["门诊病历", "诊断证明", "病假条", "宣教单"]
+            
+            # 在 LLM 调用前推进模拟时间并记录意图时间戳
+            if self.world:
+                self.world.advance_time(minutes=3, patient_id=state.patient_id)
+                state.sync_physical_state()
+                state.node_log_time = self.world.patient_current_time(state.patient_id).strftime('%H:%M')
             
             logger.info("\n🤖 使用LLM生成专业医疗文书...")
             
@@ -2611,11 +2739,6 @@ class CommonOPDGraph:
             
             _log_detail("\n" + "="*80, state, 1, "C14")
             
-            # 推进时间（生成和打印文书约需3分钟）
-            if self.world:
-                self.world.advance_time(minutes=3)
-                state.sync_physical_state()
-            
             state.add_audit(
                 make_audit_entry(
                     node_name="C14 Documents",
@@ -2634,6 +2757,7 @@ class CommonOPDGraph:
 
         def c15_education_followup(state: BaseState) -> BaseState:
             state.world_context = self.world
+            state.node_log_time = ""  # 清除继承的旧时间戳
             _log_node_start("C15", "宣教与随访", state)
             detail_logger = state.patient_detail_logger if hasattr(state, 'patient_detail_logger') else None
             
@@ -2684,6 +2808,11 @@ class CommonOPDGraph:
             ]
 
             used_fallback = False
+            # 在 LLM 调用前推进模拟时间并记录意图时间戳
+            if self.world:
+                self.world.advance_time(minutes=8, patient_id=state.patient_id)
+                state.sync_physical_state()
+                state.node_log_time = self.world.patient_current_time(state.patient_id).strftime('%H:%M')
             if self.llm is not None:
                 logger.info("\n🤖 使用LLM生成宣教内容...")
                 system_prompt = load_prompt("common_system.txt")
@@ -2929,11 +3058,6 @@ class CommonOPDGraph:
             if disclaimer:
                 logger.info(f"  • 免责声明: {disclaimer[:50]}...")
             
-            # 推进时间（医生宣教随访约8分钟）
-            if self.world:
-                self.world.advance_time(minutes=8)
-                state.sync_physical_state()
-            
             state.add_audit(
                 make_audit_entry(
                     node_name="C15 Education & Follow-up",
@@ -2958,7 +3082,12 @@ class CommonOPDGraph:
             _log_physical_state(state, "C16", level=2)
             
             # 记录流程结束时间和统计信息
-            end_timestamp = datetime.datetime.now().isoformat()
+            if self.world and state.patient_id:
+                end_timestamp = self.world.patient_current_time(state.patient_id).isoformat()
+            elif self.world:
+                end_timestamp = self.world.current_time.isoformat()
+            else:
+                end_timestamp = datetime.datetime.now().isoformat()
             state.appointment["visit_end_time"] = end_timestamp
             state.appointment["status"] = "visit_completed"
             
@@ -2989,7 +3118,7 @@ class CommonOPDGraph:
             # 记录出院移动到轨迹
             if self.world and state.patient_id and hasattr(state, 'movement_history'):
                 current_loc = state.current_location or "neuro"
-                time_str = self.world.current_time.strftime('%H:%M')
+                time_str = self.world.patient_current_time(state.patient_id).strftime('%H:%M')
                 state.movement_history.append({
                     "from": self._get_location_name(current_loc),
                     "to": "出院",
@@ -3020,16 +3149,22 @@ class CommonOPDGraph:
                     logger.info(f"  检验次数: {summary['lab_tests_count']}")
                     logger.info(f"  处方次数: {summary['prescriptions_count']}")
             
-            # 计算就诊总时长（基于物理世界时钟）
-            visit_start_str = state.appointment.get("visit_start_time")
-            if visit_start_str and self.world:
-                import datetime as _dt
-                visit_start = _dt.datetime.fromisoformat(visit_start_str)
-                duration = (self.world.current_time - visit_start).total_seconds() / 60
+            # 计算就诊总时长
+            # 优先使用患者个人时钟（多患者并发时不受其他患者影响），
+            # 回退到 visit_start_time 与全局时钟之差（单患者场景兼容）
+            case_id = state.case_data.get("id") if state.case_data else None
+            patient_display = f"P{case_id}" if case_id is not None else state.patient_id
+            if self.world and state.patient_id:
+                duration = self.world.get_patient_elapsed_minutes(state.patient_id)
+                if duration <= 0:
+                    # 回退：用全局时钟差（兼容未注册个人时钟的情况）
+                    visit_start_str = state.appointment.get("visit_start_time")
+                    if visit_start_str:
+                        import datetime as _dt
+                        visit_start = _dt.datetime.fromisoformat(visit_start_str)
+                        duration = (self.world.current_time - visit_start).total_seconds() / 60
                 state.appointment["simulated_duration_minutes"] = duration
-                case_id = state.case_data.get("id") if state.case_data else None
-                patient_display = f"P{case_id}" if case_id is not None else state.patient_id
-                logger.info(f"\n⏱️  {patient_display} 就诊总时长: {duration:.0f} 分钟")
+                logger.info(f"\n⏱️  {patient_display} 有效就诊时长: {duration:.0f} 分钟（个人计时）")
             
             # 评估诊断准确性
             if state.ground_truth:

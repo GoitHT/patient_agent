@@ -4,6 +4,7 @@
 from .hospital_world import HospitalWorld, Location, Equipment, PhysicalState
 from .command_system import CommandParser, InteractiveSession
 from .staff_tracker import StaffTracker
+from .simulation_clock import SimulationClock
 
 __all__ = [
     'HospitalWorld',
@@ -13,4 +14,5 @@ __all__ = [
     'CommandParser',
     'InteractiveSession',
     'StaffTracker',
+    'SimulationClock',
 ]

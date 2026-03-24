@@ -11,9 +11,10 @@ from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 from collections.abc import Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import QueuePool
+from sqlalchemy.schema import CreateColumn
 
 from .db_models import Base, Patient, Visit, MedicalCase, Examination, ExamItem, CaseQARecord
 from utils import get_logger, now_iso
@@ -50,6 +51,44 @@ class MedicalRecordDAO:
         )
 
         Base.metadata.create_all(self.engine)
+        self._sync_schema()
+
+    def _compile_column_definition(self, column) -> str:
+        """编译 SQLAlchemy 列定义为方言兼容 SQL 片段。"""
+        return str(CreateColumn(column).compile(dialect=self.engine.dialect))
+
+    def _sync_schema(self) -> None:
+        """轻量 schema 同步：仅补齐缺失列和索引，不做破坏性变更。"""
+        inspector = inspect(self.engine)
+        dialect = self.engine.dialect
+        preparer = dialect.identifier_preparer
+
+        with self.engine.begin() as conn:
+            for table in Base.metadata.sorted_tables:
+                if not inspector.has_table(table.name):
+                    continue
+
+                existing_cols = {col['name'] for col in inspector.get_columns(table.name)}
+
+                for column in table.columns:
+                    if column.name in existing_cols:
+                        continue
+
+                    table_name = preparer.quote(table.name)
+                    column_sql = self._compile_column_definition(column)
+                    ddl = f"ALTER TABLE {table_name} ADD COLUMN {column_sql}"
+                    logger.info(f"检测到缺失列，执行同步: {table.name}.{column.name}")
+                    conn.execute(text(ddl))
+
+                existing_indexes = {
+                    idx.get('name')
+                    for idx in inspector.get_indexes(table.name)
+                    if idx.get('name')
+                }
+                for index in table.indexes:
+                    if index.name and index.name not in existing_indexes:
+                        logger.info(f"检测到缺失索引，执行同步: {index.name}")
+                        index.create(bind=conn, checkfirst=True)
 
     @contextmanager
     def get_session(self) -> Iterator[Session]:

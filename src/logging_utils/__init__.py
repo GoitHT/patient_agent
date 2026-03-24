@@ -22,6 +22,26 @@ from .output_config import (
     MODULE_OUTPUT_LEVELS,
 )
 
+from .metrics_logger import (
+    create_run_metrics_logs,
+    get_current_metrics_log_paths,
+    log_retrieval_latency,
+    log_recall_at_k,
+    compute_groundedness_similarity,
+    log_groundedness,
+    log_treatment_duration,
+    log_treatment_duration_summary,
+    log_throughput,
+    log_consultation_quality,
+    log_effective_rounds,
+    log_avg_rounds,
+    log_effective_rounds_summary,
+    log_diagnosis_accuracy,
+    log_diagnosis_accuracy_summary,
+    log_avg_rounds_summary,
+    flush_rag_metric_summaries,
+)
+
 __all__ = [
     # detail_logger
     'PatientDetailLogger',
@@ -38,4 +58,22 @@ __all__ = [
     'DEFAULT_OUTPUT_LEVEL',
     'NODE_OUTPUT_LEVELS',
     'MODULE_OUTPUT_LEVELS',
+    # metrics_logger
+    'create_run_metrics_logs',
+    'get_current_metrics_log_paths',
+    'log_retrieval_latency',
+    'log_recall_at_k',
+    'compute_groundedness_similarity',
+    'log_groundedness',
+    'log_treatment_duration',
+    'log_treatment_duration_summary',
+    'log_throughput',
+    'log_consultation_quality',
+    'log_effective_rounds',
+    'log_avg_rounds',
+    'log_effective_rounds_summary',
+    'log_diagnosis_accuracy',
+    'log_diagnosis_accuracy_summary',
+    'log_avg_rounds_summary',
+    'flush_rag_metric_summaries',
 ]

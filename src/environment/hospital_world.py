@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
+from .simulation_clock import SimulationClock
+
 
 
 
@@ -631,8 +633,11 @@ class HospitalWorld:
         """初始化医院世界"""
         # ===== 线程安全：添加可重入锁保护共享状态 =====
         self._lock = threading.RLock()
-        
-        self.current_time = start_time or datetime.now().replace(hour=8, minute=0, second=0, microsecond=0)
+
+        # ===== Tick-based 模拟时钟（取代裸 datetime 字段）=====
+        # 全局时钟驱动共享资源调度；个人时钟独立统计每位患者的有效就诊时长。
+        _start = start_time or datetime.now().replace(hour=8, minute=0, second=0, microsecond=0)
+        self.sim_clock = SimulationClock(start_time=_start)
         
         # 定义医院房间（简化版 - 字典结构）
         self.locations = {
@@ -713,7 +718,37 @@ class HospitalWorld:
         
         # 初始化医院环境
         self._build_hospital()
-    
+
+    # ─── current_time 兼容属性（外部代码无需改动读）─────────────────────────────
+    @property
+    def current_time(self) -> datetime:
+        """全局模拟时间（向后兼容只读属性，内部写操作已由 sim_clock 管理）。"""
+        return self.sim_clock.current_datetime
+
+    @property
+    def resource_time(self) -> datetime:
+        """资源调度时间（设备/队列/预约等）。"""
+        return self.sim_clock.resource_datetime
+
+    # ─── 患者个人时钟辅助方法 ──────────────────────────────────────────────────
+    def register_patient_visit(self, patient_id: str) -> datetime:
+        """
+        就诊开始时为患者注册/重置个人时钟。
+        返回该患者的个人起始时间（即全局当前时间）。
+        """
+        return self.sim_clock.register_patient(patient_id)
+
+    def get_patient_elapsed_minutes(self, patient_id: str) -> float:
+        """
+        获取患者的有效就诊时长（分钟）。
+        只统计该患者自身动作消耗的时间，不受其他并发患者影响。
+        """
+        return self.sim_clock.patient_elapsed_minutes(patient_id)
+
+    def patient_current_time(self, patient_id: str) -> datetime:
+        """获取患者的个人当前时刻（就诊起始 + 个人累计时长）。"""
+        return self.sim_clock.patient_current_datetime(patient_id)
+
     def _build_hospital(self):
         """构建医院物理结构 - 神经内科专科配置
         
@@ -969,11 +1004,35 @@ class HospitalWorld:
         # 工作时间
         return self.working_hours['start'] <= hour < self.working_hours['end']
     
-    def advance_time(self, minutes: int = 1):
-        """推进时间并更新所有状态"""
+    def advance_time(
+        self,
+        minutes: float = 1,
+        patient_id: Optional[str] = None,
+        *,
+        affect_resource: Optional[bool] = None,
+        affect_system: bool = False,
+    ):
+        """
+        推进模拟时钟并更新所有状态。
+
+        Args:
+            minutes:    本次动作持续的模拟分钟数。
+            patient_id:      若非 None，同时累计该患者个人就诊时长。
+            affect_resource: 是否推进资源调度时钟。默认：patient_id 存在时为 True。
+            affect_system:   是否推进系统时钟。
+        """
+        if affect_resource is None:
+            affect_resource = patient_id is not None
+
         with self._lock:
             old_time = self.current_time
-            self.current_time += timedelta(minutes=minutes)
+            self.sim_clock.advance(
+                minutes=minutes,
+                patient_id=patient_id,
+                affect_resource=bool(affect_resource),
+                affect_system=affect_system,
+                resource_actor_id=patient_id,
+            )
             
             # 检查是否跨天
             if old_time.date() != self.current_time.date():
@@ -983,34 +1042,34 @@ class HospitalWorld:
         for equipment in self.equipment.values():
             # 检查并更新维护状态
             if equipment.status == "maintenance":
-                if equipment.maintenance_until and self.current_time >= equipment.maintenance_until:
+                if equipment.maintenance_until and self.resource_time >= equipment.maintenance_until:
                     equipment.status = "available"
                     equipment.maintenance_until = None
                     self._log_event("maintenance_complete", {
                         "equipment": equipment.name,
-                        "time": self.current_time.strftime("%H:%M")
+                        "time": self.resource_time.strftime("%H:%M")
                     })
             
-            finished_patient = equipment.finish_exam(self.current_time)
+            finished_patient = equipment.finish_exam(self.resource_time)
             
             if finished_patient:
                 # 记录检查完成
                 self._log_event("exam_complete", {
                     "patient_id": finished_patient,
                     "equipment": equipment.name,
-                    "time": self.current_time.strftime("%H:%M")
+                    "time": self.resource_time.strftime("%H:%M")
                 })
                 
                 # 自动开始下一个检查（如果有排队）
                 next_patient = equipment.get_next_patient()
-                if next_patient and equipment.can_use(self.current_time):
+                if next_patient and equipment.can_use(self.resource_time):
                     # 检查患者是否还在该位置
                     if self.agents.get(next_patient) == equipment.location_id:
-                        equipment.start_exam(next_patient, self.current_time)
+                        equipment.start_exam(next_patient, self.resource_time)
                         self._log_event("exam_auto_start", {
                             "patient_id": next_patient,
                             "equipment": equipment.name,
-                            "time": self.current_time.strftime("%H:%M")
+                            "time": self.resource_time.strftime("%H:%M")
                         })
         
         # 更新患者生理状态
@@ -1136,8 +1195,8 @@ class HospitalWorld:
             self.agents[agent_id] = next_loc
             
             # 推进时间（每步30秒 = 0.5分钟）
-            self.advance_time(minutes=0.5)
-            
+            self.advance_time(minutes=0.5, patient_id=agent_id)
+
             # 消耗体力（每步0.2）
             if agent_id in self.physical_states:
                 state = self.physical_states[agent_id]
@@ -1241,8 +1300,8 @@ class HospitalWorld:
         time_cost_seconds = device_time_map.get(device_name, 30)  # 默认30秒
         time_cost_minutes = time_cost_seconds / 60  # 转换为分钟
         
-        # 推进时间（以分钟为单位）
-        self.advance_time(minutes=time_cost_minutes)
+        # 推进时间（以分钟为单位，记入使用设备的 agent 个人就诊时长）
+        self.advance_time(minutes=time_cost_minutes, patient_id=agent_id)
         
         # 记录使用日志（带日志限制）
         if not hasattr(self, 'device_usage_log'):
@@ -1307,9 +1366,9 @@ class HospitalWorld:
         current_loc = self.agents.get(agent_id)
         location_name = self.get_location_name(current_loc)
         
-        # 推进时间
-        self.advance_time(minutes=duration_minutes)
-        
+        # 推进时间（记入等待 agent 的个人就诊时长）
+        self.advance_time(minutes=duration_minutes, patient_id=agent_id)
+
         # 特殊处理：候诊区等待恢复体力
         if current_loc == "waiting_area" and agent_id in self.physical_states:
             ps = self.physical_states[agent_id]
@@ -1390,9 +1449,9 @@ class HospitalWorld:
         if len(self.conversation_log) > self._log_cleanup_threshold:
             self.conversation_log = self.conversation_log[-self._max_log_entries:]
         
-        # 推进时间（根据消息长度）
+        # 推进时间（根据消息长度，记入发言方个人就诊时长）
         time_cost_seconds = max(10, len(message) // 10)  # 最少10秒
-        self.advance_time(minutes=time_cost_seconds / 60)
+        self.advance_time(minutes=time_cost_seconds / 60, patient_id=from_agent)
         
         # 记录到事件日志
         self._log_event("conversation", {
@@ -1428,12 +1487,12 @@ class HospitalWorld:
             return False, f"当前位置没有 {exam_type} 设备，请移动到相应科室"
         
         # 查找空闲设备
-        available_equipment = [eq for eq in all_equipment if eq.can_use(self.current_time)]
+        available_equipment = [eq for eq in all_equipment if eq.can_use(self.resource_time)]
         
         if available_equipment:
             # 有空闲设备，直接使用（按优先级选择最空闲的）
             equipment = min(available_equipment, key=lambda eq: eq.daily_usage_count)
-            equipment.start_exam(patient_id, self.current_time, priority)
+            equipment.start_exam(patient_id, self.resource_time, priority)
             
             # 显示资源竞争状态
             total_equipment = len(all_equipment)
@@ -1444,7 +1503,7 @@ class HospitalWorld:
                 "equipment": equipment.name,
                 "exam_type": exam_type,
                 "priority": priority,
-                "start_time": self.current_time.strftime("%H:%M"),
+                "start_time": self.resource_time.strftime("%H:%M"),
                 "estimated_end": equipment.occupied_until.strftime("%H:%M") if equipment.occupied_until else "unknown",
                 "resource_status": f"{busy_equipment}/{total_equipment}设备使用中"
             })
@@ -1453,8 +1512,8 @@ class HospitalWorld:
         else:
             # 所有设备都在使用中，加入排队
             equipment = all_equipment[0]  # 选择第一个设备的队列
-            equipment.add_to_queue(patient_id, priority, self.current_time)
-            wait_time = equipment.get_wait_time(self.current_time, patient_id)
+            equipment.add_to_queue(patient_id, priority, self.resource_time)
+            wait_time = equipment.get_wait_time(self.resource_time, patient_id)
             queue_position = next((i+1 for i, entry in enumerate(equipment.queue) if entry.patient_id == patient_id), 0)
             
             # 显示所有设备队列情况
@@ -2136,7 +2195,7 @@ class HospitalWorld:
             min_wait_time = float('inf')
             
             for eq in available_equipment:
-                wait_time = eq.get_wait_time(self.current_time, patient_id)
+                wait_time = eq.get_wait_time(self.resource_time, patient_id)
                 if wait_time < min_wait_time:
                     min_wait_time = wait_time
                     best_equipment = eq
@@ -2156,8 +2215,8 @@ class HospitalWorld:
                 return best_equipment.id, 0
             
             # 如果设备空闲，直接分配
-            if best_equipment.can_use(self.current_time):
-                best_equipment.start_exam(patient_id, self.current_time, priority)
+            if best_equipment.can_use(self.resource_time):
+                best_equipment.start_exam(patient_id, self.resource_time, priority)
                 
                 # 添加日志（显示占用时长和预计完成时间）
                 import logging
@@ -2177,7 +2236,7 @@ class HospitalWorld:
                 return best_equipment.id, 0
             
             # 设备忙碌，加入队列
-            best_equipment.add_to_queue(patient_id, priority, self.current_time)
+            best_equipment.add_to_queue(patient_id, priority, self.resource_time)
             
             # 添加日志
             import logging
@@ -2204,7 +2263,7 @@ class HospitalWorld:
                 return False
             
             eq = self.equipment[equipment_id]
-            finished_patient = eq.finish_exam(self.current_time)
+            finished_patient = eq.finish_exam(self.resource_time)
             
             if not finished_patient:
                 return False
@@ -2222,7 +2281,7 @@ class HospitalWorld:
             next_patient = eq.get_next_patient()
             if next_patient:
                 # 自动分配给下一个患者
-                eq.start_exam(next_patient, self.current_time)
+                eq.start_exam(next_patient, self.resource_time)
                 
                 # 使用dataset_id或完整patient_id
                 next_dataset_id = self.patient_dataset_map.get(next_patient)

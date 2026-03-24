@@ -29,8 +29,8 @@ rag:
 # 运行模式配置
 mode:
   multi_patient: true            # 多患者多医生模式（推荐，num_patients=1时等同于单体模式）
-  num_patients: 2               # 患者数量（1=单患者模式，>1=多患者并发模式）
-  patient_interval: 30            # 患者进入间隔时间（秒，单患者时可设为0）
+  num_patients: 5               # 患者数量（1=单患者模式，>1=多患者并发模式）
+  patient_interval: 10            # 患者进入间隔时间（秒，单患者时可设为0）
 
 # 物理环境配置
 physical:
@@ -39,9 +39,9 @@ physical:
 # 数据库配置
 database:
   enabled: true                                     # 是否启用数据库（false则使用文件存储）
-  connection_string: "mysql+pymysql://root:cufe2026@bj-cdb-bdka53ky.sql.tencentcdb.com:27415/agent?charset=utf8mb4"
+  # connection_string: "mysql+pymysql://root:cufe2026@bj-cdb-bdka53ky.sql.tencentcdb.com:27415/agent?charset=utf8mb4"
   # 备用连接
-  # connection_string: "mysql+pymysql://root:123456@10.11.169.21:3306/agent?charset=utf8mb4"
+  connection_string: "mysql+pymysql://root:123456@10.11.169.21:3306/agent?charset=utf8mb4"
   # connection_string: "mysql+pymysql://root:123456@101.42.36.8:3306/agent?charset=utf8mb4"
   backup_to_file: false                               # 数据库模式下是否同时备份到文件
 

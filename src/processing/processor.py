@@ -22,6 +22,8 @@ from graphs.router import build_common_graph, build_dept_subgraphs, build_servic
 from coordination import HospitalCoordinator, PatientStatus
 from loaders import load_diagnosis_arena_case, _build_case_info_text
 from logging_utils import create_patient_detail_logger, close_patient_detail_logger, get_patient_detail_logger
+from logging_utils import log_treatment_duration
+from logging_utils import log_consultation_quality, log_effective_rounds, log_diagnosis_accuracy, log_avg_rounds
 from rag import AdaptiveRAGRetriever
 from services.llm_client import LLMClient
 from services.medical_record import MedicalRecordService
@@ -30,6 +32,82 @@ from state.schema import BaseState
 from utils import get_logger, make_run_id
 
 logger = get_logger("hospital_agent.langgraph_multi_patient")
+
+
+def _normalize_diagnosis_text(text: str) -> str:
+    t = (text or "").lower().strip()
+    for ch in [" ", "\t", "\n", "，", ",", "。", ".", "；", ";", "、", "(", ")", "（", "）", ":", "：", "-", "_"]:
+        t = t.replace(ch, "")
+    return t
+
+
+def _is_diagnosis_match(predicted: str, ground_truth: str) -> bool:
+    p_norm = _normalize_diagnosis_text(predicted)
+    g_norm = _normalize_diagnosis_text(ground_truth)
+    if not p_norm or not g_norm:
+        return False
+    if p_norm in g_norm or g_norm in p_norm:
+        return True
+    raw_parts = [x.strip() for x in str(ground_truth).replace("；", ",").replace("、", ",").replace("/", ",").split(",")]
+    parts = [_normalize_diagnosis_text(x) for x in raw_parts if x.strip()]
+    return any(part and (part in p_norm or p_norm in part) for part in parts)
+
+
+def _compute_doctor_information_coverage(
+    *,
+    questions: list[str],
+    history: dict[str, Any],
+    chief_complaint: str,
+) -> float:
+    """Doctor-side information coverage.
+
+    Coverage targets:
+    1) key symptoms
+    2) medical history
+    3) risk factors
+    """
+    q_blob = " ".join(str(q) for q in questions if q).lower()
+    h_keys = " ".join(str(k).lower() for k in history.keys()) if isinstance(history, dict) else ""
+    h_values = " ".join(str(v).lower() for v in history.values()) if isinstance(history, dict) else ""
+    cc = str(chief_complaint or "").lower()
+
+    symptom_keywords = ["症状", "哪里不舒服", "部位", "性质", "伴随", "麻木", "无力", "头痛", "恶心"]
+    history_keywords = ["既往", "病史", "过敏", "手术", "家族史", "用药", "慢性病", "高血压", "糖尿病"]
+    risk_keywords = ["吸烟", "抽烟", "饮酒", "喝酒", "职业", "接触", "暴露", "危险因素", "肥胖", "高脂"]
+
+    has_key_symptoms = bool(cc) or any(k in q_blob for k in symptom_keywords) or ("associated_symptoms" in h_keys)
+    has_history = any(k in q_blob for k in history_keywords) or any(k in h_keys for k in ["history", "past", "allergy", "family", "medication"]) or any(k in h_values for k in ["既往", "过敏", "家族", "手术"])
+    has_risk = any(k in q_blob for k in risk_keywords) or any(k in h_values for k in ["吸烟", "饮酒", "职业", "暴露", "高血压", "糖尿病"])
+
+    covered = int(has_key_symptoms) + int(has_history) + int(has_risk)
+    return covered / 3.0
+
+
+def _compute_patient_information_completeness(
+    *,
+    answers: list[str],
+    history: dict[str, Any],
+) -> float:
+    """Patient-side information completeness.
+
+    Completeness targets:
+    1) symptom details
+    2) duration
+    3) severity
+    """
+    a_blob = " ".join(str(a) for a in answers if a).lower()
+    h = history if isinstance(history, dict) else {}
+
+    has_symptom_detail = (
+        any(k in a_blob for k in ["部位", "性质", "伴随", "放射", "具体", "哪个", "什么样", "头", "胸", "腹", "肢体"]) 
+        or bool(h.get("associated_symptoms"))
+        or bool(h.get("symptom_detail"))
+    )
+    has_duration = bool(h.get("duration")) or any(k in a_blob for k in ["天", "周", "月", "年", "多久", "起病", "开始"])
+    has_severity = bool(h.get("severity")) or any(k in a_blob for k in ["轻", "中", "重", "严重", "剧烈", "几分", "无法", "明显", "加重"])
+
+    covered = int(has_symptom_detail) + int(has_duration) + int(has_severity)
+    return covered / 3.0
 
 
 # ANSI颜色代码 - 用于区分不同患者的输出
@@ -599,8 +677,22 @@ class LangGraphPatientExecutor:
                     node_names.append(node_name)
                     out = chunk[node_name]
                     # 记录该节点完成时的模拟时钟（节点内部已推进完毕）
+                    # 若节点设置了 node_log_time（在 advance_time 后、LLM 调用前写入），
+                    # 优先使用该意图时间戳，避免并发患者线程在 LLM I/O 期间推进共享时钟
+                    # 导致本节点耗时虚高
                     if self.world:
-                        node_time_map[node_name] = self.world.current_time.strftime('%H:%M')
+                        _intended = getattr(out, 'node_log_time', '') if isinstance(out, BaseState) else \
+                                    (out.get('node_log_time', '') if isinstance(out, dict) else '')
+                        if _intended:
+                            node_time_map[node_name] = _intended
+                        else:
+                            try:
+                                node_time_map[node_name] = self.world.patient_current_time(self.patient_id).strftime('%H:%M')
+                            except Exception:
+                                node_time_map[node_name] = self.world.current_time.strftime('%H:%M')
+                        # 消费后清空，防止被下一节点继承
+                        if _intended and isinstance(out, BaseState):
+                            out.node_log_time = ""
                     
                     # 更新最终状态（接受BaseState或字典类型）
                     if isinstance(out, BaseState):
@@ -683,8 +775,18 @@ class LangGraphPatientExecutor:
             import time
             program_execution_time = time.time() - start_time if 'start_time' in locals() else 0
             
-            # 获取患者就诊时间（优先使用循环中追踪到的最新值，防止被后续节点覆盖丢失）
-            simulated_minutes = last_simulated_minutes
+            # 获取患者就诊时间
+            # 优先使用 world 的患者个人计时（多患者并发下不会被其他患者动作污染）
+            simulated_minutes = None
+            if self.world is not None and self.patient_id:
+                try:
+                    simulated_minutes = self.world.get_patient_elapsed_minutes(self.patient_id)
+                except Exception:
+                    simulated_minutes = None
+
+            # 次优先：使用循环中追踪到的最新值（防止被后续节点覆盖丢失）
+            if simulated_minutes is None or simulated_minutes <= 0:
+                simulated_minutes = last_simulated_minutes
             if simulated_minutes is None and final_state and hasattr(final_state, 'appointment'):
                 simulated_minutes = final_state.appointment.get('simulated_duration_minutes')
             # 兜底：直接通过物理世界时钟和预约开始时间计算
@@ -762,7 +864,156 @@ class LangGraphPatientExecutor:
                 "node_names": node_names,  # 添加节点名称列表
                 "record_id": record_id,
                 "detail_log_file": self.detail_logger.get_log_file_path() if hasattr(self, 'detail_logger') and self.detail_logger else "",  # 添加详细日志路径
+                "simulated_duration_minutes": simulated_minutes,
+                "wall_time_seconds": program_execution_time,
+                "visit_start_time": (final_state.appointment.get("visit_start_time") if final_state and hasattr(final_state, "appointment") and isinstance(final_state.appointment, dict) else ""),
+                "visit_end_time": (final_state.appointment.get("visit_end_time") if final_state and hasattr(final_state, "appointment") and isinstance(final_state.appointment, dict) else ""),
+                "run_id": (final_state.run_id if final_state and hasattr(final_state, "run_id") else ""),
+                "completion_timestamp": time.time(),
             }
+
+            # 系统性能与流程效率指标：记录患者诊疗时长
+            log_treatment_duration(
+                visit_start_time=str(result.get("visit_start_time", "")),
+                visit_end_time=str(result.get("visit_end_time", "")),
+                visit_duration_minutes=(float(simulated_minutes) if simulated_minutes is not None else None),
+                simulated_duration_minutes=(float(simulated_minutes) if simulated_minutes is not None else None),
+                wall_time_seconds=float(program_execution_time),
+                run_id=str(result.get("run_id", "")),
+                patient_id=str(self.patient_id),
+                case_id=str(self.case_id),
+            )
+
+            # 问诊与诊断效果指标：问诊质量（Consultation Quality）
+            qa_quality = {}
+            interview_quality = {}
+            if final_state and hasattr(final_state, "agent_interactions") and isinstance(final_state.agent_interactions, dict):
+                qa_quality = final_state.agent_interactions.get("qa_quality_scores", {}) or {}
+                interview_quality = final_state.agent_interactions.get("interview_quality", {}) or {}
+
+            detailed_scores = qa_quality.get("detailed_scores", []) if isinstance(qa_quality, dict) else []
+
+            def _avg_metric(path: tuple[str, ...], default: float = 0.0) -> float:
+                if not detailed_scores:
+                    return default
+                vals = []
+                for item in detailed_scores:
+                    cur = item
+                    ok = True
+                    for key in path:
+                        if isinstance(cur, dict) and key in cur:
+                            cur = cur[key]
+                        else:
+                            ok = False
+                            break
+                    if ok and isinstance(cur, (int, float)):
+                        vals.append(float(cur))
+                if not vals:
+                    return default
+                return sum(vals) / len(vals)
+
+            doctor_specificity = _avg_metric(("doctor_metrics", "specificity"), float(qa_quality.get("avg_doctor_quality", 0.0) or 0.0))
+            doctor_purposefulness = _avg_metric(("doctor_metrics", "targetedness"), float(qa_quality.get("avg_doctor_quality", 0.0) or 0.0))
+            doctor_professionalism = _avg_metric(("doctor_metrics", "professionalism"), float(qa_quality.get("avg_doctor_quality", 0.0) or 0.0))
+
+            patient_relevance = _avg_metric(("patient_metrics", "relevance"), float(qa_quality.get("avg_patient_ability", 0.0) or 0.0))
+            patient_faithfulness = _avg_metric(("patient_metrics", "faithfulness"), float(qa_quality.get("avg_patient_ability", 0.0) or 0.0))
+            patient_consistency_robustness = _avg_metric(("patient_metrics", "robustness"), float(qa_quality.get("avg_patient_ability", 0.0) or 0.0))
+
+            qa_pairs = []
+            if final_state and hasattr(final_state, "agent_interactions") and isinstance(final_state.agent_interactions, dict):
+                raw_pairs = final_state.agent_interactions.get("doctor_patient_qa", [])
+                if isinstance(raw_pairs, list):
+                    qa_pairs = [p for p in raw_pairs if isinstance(p, dict)]
+
+            questions = [str(p.get("question", "")) for p in qa_pairs if p.get("question")]
+            answers = [str(p.get("answer", "")) for p in qa_pairs if p.get("answer")]
+            state_history = final_state.history if final_state and hasattr(final_state, "history") and isinstance(final_state.history, dict) else {}
+            state_cc = final_state.chief_complaint if final_state and hasattr(final_state, "chief_complaint") else ""
+
+            # 医生信息覆盖度：关键症状、病史、危险因素
+            doctor_information_coverage = _compute_doctor_information_coverage(
+                questions=questions,
+                history=state_history,
+                chief_complaint=str(state_cc),
+            )
+
+            # 患者信息完整性：症状细节、持续时间、程度
+            patient_information_completeness = _compute_patient_information_completeness(
+                answers=answers,
+                history=state_history,
+            )
+
+            # 兜底：避免极端空数据导致全零
+            if doctor_information_coverage <= 0:
+                doctor_information_coverage = float(interview_quality.get("completeness_score", 0.0) or 0.0) / 100.0
+            if patient_information_completeness <= 0:
+                patient_information_completeness = float(interview_quality.get("depth_score", 0.0) or 0.0) / 100.0
+
+            doctor_quality = (doctor_specificity + doctor_purposefulness + doctor_professionalism + doctor_information_coverage) / 4.0
+            patient_quality = (patient_relevance + patient_faithfulness + patient_information_completeness + patient_consistency_robustness) / 4.0
+            consultation_quality_score = (doctor_quality + patient_quality) / 2.0
+
+            log_consultation_quality(
+                doctor_specificity=doctor_specificity,
+                doctor_purposefulness=doctor_purposefulness,
+                doctor_professionalism=doctor_professionalism,
+                doctor_information_coverage=doctor_information_coverage,
+                patient_relevance=patient_relevance,
+                patient_faithfulness=patient_faithfulness,
+                patient_information_completeness=patient_information_completeness,
+                patient_consistency_robustness=patient_consistency_robustness,
+                consultation_quality_score=consultation_quality_score,
+                run_id=str(result.get("run_id", "")),
+                patient_id=str(self.patient_id),
+                case_id=str(self.case_id),
+            )
+
+            # 问诊与诊断效果指标：平均有效问诊轮次（按高质量阈值判定单轮是否有效）
+            total_rounds = int(final_state.node_qa_counts.get("global_total", 0)) if final_state and hasattr(final_state, "node_qa_counts") else 0
+            effective_rounds = 0
+            if detailed_scores:
+                effective_rounds = sum(1 for item in detailed_scores if isinstance(item, dict) and float(item.get("overall_score", 0.0) or 0.0) >= 0.7)
+            if total_rounds == 0 and isinstance(qa_quality.get("total_rounds"), int):
+                total_rounds = int(qa_quality.get("total_rounds", 0))
+            avg_effective_rounds = float(effective_rounds)
+
+            log_effective_rounds(
+                total_rounds=total_rounds,
+                effective_rounds=effective_rounds,
+                avg_effective_rounds=avg_effective_rounds,
+                run_id=str(result.get("run_id", "")),
+                patient_id=str(self.patient_id),
+                case_id=str(self.case_id),
+            )
+
+            # 问诊与诊断效果指标：AvgRounds（每病例总问诊轮次）
+            if total_rounds >= 0:
+                log_avg_rounds(
+                    rounds=total_rounds,
+                    run_id=str(result.get("run_id", "")),
+                    patient_id=str(self.patient_id),
+                    case_id=str(self.case_id),
+                )
+
+            # 问诊与诊断效果指标：诊断准确率（单病例）
+            gt_text = ""
+            if final_state and hasattr(final_state, "ground_truth") and isinstance(final_state.ground_truth, dict):
+                gt_text = str(final_state.ground_truth.get("初步诊断") or final_state.ground_truth.get("diagnosis") or "")
+            is_correct = _is_diagnosis_match(final_diagnosis, gt_text)
+            log_diagnosis_accuracy(
+                predicted_diagnosis=final_diagnosis,
+                ground_truth_diagnosis=gt_text,
+                is_correct=is_correct,
+                run_id=str(result.get("run_id", "")),
+                patient_id=str(self.patient_id),
+                case_id=str(self.case_id),
+            )
+
+            result["consultation_quality_score"] = consultation_quality_score
+            result["effective_rounds"] = effective_rounds
+            result["total_rounds"] = total_rounds
+            result["diagnosis_correct"] = is_correct
             
             self.logger.info(f"{fg_color}└ {patient_tag} 诊断→{final_diagnosis} ({total_time_seconds/60:.0f}min){Colors.RESET}")
             
@@ -868,7 +1119,7 @@ class LangGraphPatientExecutor:
                 "C13": "制定方案", "C14": "开具文书", "C15": "健康教育",
                 "C16": "完成就诊",
                 # 专科子图节点（通过C6调用，一般不直接出现）
-                "S4": "专科问诊", "S5": "体格检查", "S6": "初步判断",
+                "S1": "专科问诊", "S2": "体格检查", "S3": "初步判断",
             }
             _node_desc = {
                 "C1": "患者入院，初始化就诊流程",
@@ -911,6 +1162,49 @@ class LangGraphPatientExecutor:
                 except Exception:
                     return None
 
+            def _normalize_event_minutes(events: list[dict]) -> list[Optional[int]]:
+                """
+                将事件 HH:MM 时间归一化为单调不减的绝对分钟序列。
+
+                目标：
+                - 允许跨天（23:xx -> 00:xx）
+                - 对同次就诊中的异常回跳（并发/旧时间戳污染）进行钳制，
+                  避免出现 1369min 这类取模异常耗时。
+                """
+                abs_list: list[Optional[int]] = []
+                prev_abs: Optional[int] = None
+                day_offset = 0
+
+                for ev in events:
+                    cur = _hhmm_to_min(ev.get('time', ''))
+                    if cur is None:
+                        abs_list.append(None)
+                        continue
+
+                    cand = cur + day_offset * 1440
+                    if prev_abs is not None and cand < prev_abs:
+                        prev_clock = prev_abs % 1440
+                        # 典型跨天场景：前一时刻接近午夜，当前时刻在凌晨
+                        if prev_clock >= 1320 and cur <= 180:
+                            day_offset += 1
+                            cand = cur + day_offset * 1440
+                        else:
+                            # 非跨天的回跳，视为时间戳异常，钳制为不回退
+                            cand = prev_abs
+
+                    abs_list.append(cand)
+                    prev_abs = cand
+
+                return abs_list
+
+            def _abs_min_to_hhmm(abs_min: Optional[int]) -> str:
+                if abs_min is None:
+                    return '--:--'
+                clock = abs_min % 1440
+                h = clock // 60
+                m = clock % 60
+                return f"{h:02d}:{m:02d}"
+
             # 构建 node -> movement list 映射
             _move_by_node: dict = {}
             for _mv in _movements:
@@ -927,24 +1221,24 @@ class LangGraphPatientExecutor:
                 else {}
             )
             _subgraph_times = {
-                'S4': _appt_times.get('_s4_end_time'),
-                'S5': _appt_times.get('_s5_end_time'),
-                'S6': _appt_times.get('_s6_end_time'),
+                'S1': _appt_times.get('_s1_end_time'),
+                'S2': _appt_times.get('_s2_end_time'),
+                'S3': _appt_times.get('_s3_end_time'),
             }
-            # S4/S5/S6 节点描述
+            # S1/S2/S3 节点描述
             _subgraph_meta = {
-                'S4': ('专科问诊', '多轮医患对话，问诊+质量评估'),
-                'S5': ('体格检查', '体征采集，生命体征+专科查体'),
-                'S6': ('初步判断', '综合分析，决定是否需要辅助检查'),
+                'S1': ('专科问诊', '多轮医患对话，问诊+质量评估'),
+                'S2': ('体格检查', '体征采集，生命体征+专科查体'),
+                'S3': ('初步判断', '综合分析，决定是否需要辅助检查'),
             }
             for _nd in node_names:
                 _lbl  = _node_zh.get(_nd, _nd)
                 _desc = _node_desc.get(_nd, '')
                 _mvs  = _move_by_node.get(_nd, [])
-                # C6 是专科子图入口，展开为 S4/S5/S6 子事件
+                # C6 是专科子图入口，展开为 S1/S2/S3 子事件
                 if _nd == 'C6':
                     _sub_expanded = False
-                    for _snd in ('S4', 'S5', 'S6'):
+                    for _snd in ('S1', 'S2', 'S3'):
                         _st = _subgraph_times.get(_snd)
                         if _st:
                             _slbl, _sdesc = _subgraph_meta[_snd]
@@ -986,22 +1280,30 @@ class LangGraphPatientExecutor:
                 _sep = f"  {'─'*5}  {'─'*7}  {'─'*5}  {'─'*14}  {'─'*30}"
                 self.detail_logger.info(_hdr)
                 self.detail_logger.info(_sep)
+                _abs_minutes = _normalize_event_minutes(_timeline_events)
+                # 累计时间以时间线首个有效事件为基准，保证 C1 从 +0min 开始。
+                # 说明：此前公式会把 HH:MM 的分钟值错误叠加，出现 +544min 之类异常。
+                _base_abs: Optional[int] = next((x for x in _abs_minutes if x is not None), None)
+                _last_abs: Optional[int] = None
                 for _i, _ev in enumerate(_timeline_events):
-                    _t   = _ev['time']
+                    _t_raw = _ev['time']
                     _nd  = _ev['node']
-                    _tc  = _hhmm_to_min(_t)
+                    _tc_abs = _abs_minutes[_i] if _i < len(_abs_minutes) else None
+                    if _tc_abs is not None:
+                        _last_abs = _tc_abs
+                    _t = _abs_min_to_hhmm(_tc_abs) if _tc_abs is not None else _t_raw
                     # 累计（相对就诊基准）
                     _elap_s = ''
-                    if _base_min is not None and _tc is not None:
-                        _e = (_tc - _base_min) % 1440
+                    if _base_abs is not None and _tc_abs is not None:
+                        _e = max(0, _tc_abs - _base_abs)
                         _elap_s = f'+{_e}min'
                     # 耗时 = 本节点完成时刻 − 上一事件完成时刻（本节点自己占用的模拟时间）
                     _dur_s = ''
-                    if _i > 0:
+                    if _i > 0 and _tc_abs is not None:
                         for _j in range(_i - 1, -1, -1):
-                            _tp = _hhmm_to_min(_timeline_events[_j]['time'])
-                            if _tp is not None and _tc is not None:
-                                _d = (_tc - _tp) % 1440
+                            _tp_abs = _abs_minutes[_j] if _j < len(_abs_minutes) else None
+                            if _tp_abs is not None:
+                                _d = max(0, _tc_abs - _tp_abs)
                                 _dur_s = f'{_d}min'
                                 break
                     # 位置/说明文本
@@ -1014,7 +1316,21 @@ class LangGraphPatientExecutor:
                         f"  {_t:^5}  {_elap_s:^7}  {_dur_s:^5}  {_nd_lbl:<14}  {_loc_s}"
                     )
                 self.detail_logger.info(f"  {'─'*65}")
-                if simulated_minutes is not None:
+                # 时间线总时长使用同口径（首末事件差值），保证与节点耗时列一致
+                timeline_total: Optional[int] = None
+                if _base_abs is not None and _last_abs is not None:
+                    timeline_total = max(0, _last_abs - _base_abs)
+
+                if timeline_total is not None:
+                    self.detail_logger.info(f"  总就诊时长: {timeline_total} 分钟")
+                    if simulated_minutes is not None:
+                        _delta = int(round(simulated_minutes - timeline_total))
+                        if _delta != 0:
+                            self.detail_logger.info(
+                                f"  口径差异说明: 患者总时长={simulated_minutes:.0f} 分钟，"
+                                f"时间线统计={timeline_total} 分钟，差值={_delta} 分钟"
+                            )
+                elif simulated_minutes is not None:
                     self.detail_logger.info(f"  总就诊时长: {simulated_minutes:.0f} 分钟")
             else:
                 self.detail_logger.info("  （无执行记录）")

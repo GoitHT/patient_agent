@@ -32,7 +32,7 @@ from dataclasses import dataclass
 @dataclass
 class NodeContext:
     """节点上下文信息"""
-    node_id: str  # 节点编号（如 C5, S4）
+    node_id: str  # 节点编号（如 C5, S1）
     node_name: str  # 节点名称（如 "准备问诊"）
     dept: str | None = None  # 科室代码
     dept_name: str | None = None  # 科室名称
@@ -89,11 +89,11 @@ class RAGKeywordGenerator:
             "dbs": ["HospitalProcess_db"],
         },
         # 专科子图节点
-        "S4": {
+        "S1": {
             "goal": "获取专科知识、问诊参考、相似症状案例",
             "dbs": ["MedicalGuide_db", "HighQualityQA_db", "ClinicalCase_db"],
         },
-        "S6": {
+        "S3": {
             "goal": "获取诊断标准、鉴别诊断依据、辅助检查建议",
             "dbs": ["MedicalGuide_db"],
         },
@@ -455,10 +455,10 @@ class RAGKeywordGenerator:
         keywords.extend(["健康宣教流程", "随访计划", "注意事项", "红旗症状", "患者教育"])
         return " ".join(keywords)
     
-    # ==================== S4: 专科问诊 ====================
+    # ==================== S1: 专科问诊 ====================
     
-    def _generate_s4_guide(self, ctx: NodeContext) -> str:
-        """S4 - 医学指南库：专科诊断标准、问诊要点
+    def _generate_s1_guide(self, ctx: NodeContext) -> str:
+        """S1 - 医学指南库：专科诊断标准、问诊要点
         
         遵循标准：根据患者主诉、当前流程节点目标（专科问诊），
         检索专科诊断标准、问诊决策依据的权威指南内容。
@@ -486,8 +486,8 @@ class RAGKeywordGenerator:
         keywords.extend(["专科诊断标准", "问诊要点", "Red Flags", "鉴别诊断要点", "临床决策"])
         return " ".join(keywords)
     
-    def _generate_s4_qa(self, ctx: NodeContext) -> str:
-        """S4 - 高质量对话库：结构化医患问诊示例
+    def _generate_s1_qa(self, ctx: NodeContext) -> str:
+        """S1 - 高质量对话库：结构化医患问诊示例
         
         遵循标准：根据患者主诉及当前问诊阶段（专科问诊），
         检索结构化医患问诊示例对话。
@@ -515,8 +515,8 @@ class RAGKeywordGenerator:
         keywords.extend(["结构化问诊", "医患问诊示例", "专科问诊对话", "沟通技巧"])
         return " ".join(keywords)
     
-    def _generate_s4_case(self, ctx: NodeContext) -> str:
-        """S4 - 临床案例库：典型病例、诊疗决策参考
+    def _generate_s1_case(self, ctx: NodeContext) -> str:
+        """S1 - 临床案例库：典型病例、诊疗决策参考
         
         遵循标准：根据患者主诉、关键症状，
         检索典型病例、诊疗决策路径相关内容。
@@ -547,10 +547,10 @@ class RAGKeywordGenerator:
         keywords.extend(["典型病例", "诊疗决策参考", "临床案例"])
         return " ".join(keywords)
     
-    # ==================== S6: 初步判断 ====================
+    # ==================== S3: 初步判断 ====================
     
-    def _generate_s6_guide(self, ctx: NodeContext) -> str:
-        """S6 - 医学指南库：诊断标准、辅助检查决策依据
+    def _generate_s3_guide(self, ctx: NodeContext) -> str:
+        """S3 - 医学指南库：诊断标准、辅助检查决策依据
         
         遵循标准：根据患者主诉、关键症状及当前流程节点目标（初步判断），
         检索诊断标准、鉴别诊断、是否需要辅助检查的决策依据。

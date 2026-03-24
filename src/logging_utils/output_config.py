@@ -44,7 +44,7 @@ _ALL_NODES = [
     "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8",
     "C9", "C10", "C11", "C12", "C13", "C14", "C15", "C16",
     # 专科节点
-    "S4", "S5", "S6", "S7",
+    "S1", "S2", "S3", "S7",
 ]
 NODE_OUTPUT_LEVELS: dict[str, int] = dict.fromkeys(_ALL_NODES, LEVEL_BRIEF)
 

@@ -3,6 +3,7 @@
 import random
 import threading
 import time
+from datetime import datetime
 from typing import List, Dict, Any
 
 from utils import get_logger
@@ -10,6 +11,9 @@ from loaders import load_diagnosis_arena_case, _get_dataset_size
 from processing import LangGraphMultiPatientProcessor
 from display import format_patient_log, get_patient_color
 from config import Config
+from logging_utils import log_throughput, log_treatment_duration_summary
+from logging_utils import log_effective_rounds_summary, log_diagnosis_accuracy_summary
+from logging_utils import log_avg_rounds_summary, flush_rag_metric_summaries
 
 
 logger = get_logger("hospital_agent.workflow")
@@ -35,6 +39,10 @@ class MultiPatientWorkflow:
         self.medical_record_service = medical_record_service
         self.processor = None
         self.monitoring_active = threading.Event()
+        self.workflow_run_id = datetime.now().strftime("workflow_%Y%m%d_%H%M%S")
+        self._throughput_start_ts = 0.0
+        self._throughput_start_iso = ""
+        self._total_requests = 0
     
     def register_doctors(self, num_doctors: int = 3) -> None:
         """注册医生到协调器
@@ -190,6 +198,9 @@ class MultiPatientWorkflow:
             interval: 患者间隔时间（秒）
         """
         total_patients = len(case_ids)
+        self._total_requests = total_patients
+        self._throughput_start_ts = time.time()
+        self._throughput_start_iso = datetime.now().isoformat()
         timers = []
         
         for i, case_id in enumerate(case_ids):
@@ -280,8 +291,89 @@ class MultiPatientWorkflow:
         """
         if timeout is None:
             timeout = max(600, num_patients * 600)
-        
-        return self.processor.wait_all(timeout=timeout)
+
+        results = self.processor.wait_all(timeout=timeout)
+
+        # 系统性能与流程效率指标：并发吞吐量
+        if self._throughput_start_ts > 0:
+            test_end_ts = time.time()
+            duration_seconds = max(0.001, test_end_ts - self._throughput_start_ts)
+            completed_requests = len(results)
+            throughput = completed_requests / duration_seconds
+
+            # 计算峰值吞吐：按每秒完成数分箱取最大值
+            peak_throughput = throughput
+            completion_times = [
+                item.get("completion_timestamp")
+                for item in results
+                if isinstance(item.get("completion_timestamp"), (int, float))
+            ]
+            if completion_times:
+                sec_bins: dict[int, int] = {}
+                for ts in completion_times:
+                    sec = int(max(0.0, float(ts) - self._throughput_start_ts))
+                    sec_bins[sec] = sec_bins.get(sec, 0) + 1
+                if sec_bins:
+                    peak_throughput = float(max(sec_bins.values()))
+
+            log_throughput(
+                test_start=self._throughput_start_iso,
+                test_end=datetime.now().isoformat(),
+                total_requests=int(self._total_requests or num_patients),
+                completed_requests=int(completed_requests),
+                test_duration_seconds=float(duration_seconds),
+                throughput_req_per_sec=float(throughput),
+                peak_throughput_req_per_sec=float(peak_throughput),
+                run_id=self.workflow_run_id,
+            )
+
+        # 系统性能与流程效率指标：平均诊疗时长（按患者）
+        durations = []
+        for item in results:
+            value = item.get("simulated_duration_minutes")
+            if isinstance(value, (int, float)):
+                durations.append(float(value))
+        if durations:
+            avg_duration = sum(durations) / len(durations)
+            log_treatment_duration_summary(
+                avg_duration_minutes=float(avg_duration),
+                patient_count=len(durations),
+                run_id=self.workflow_run_id,
+            )
+
+        # 问诊与诊断效果：平均有效问诊轮次（运行级）
+        effective_rounds_list = [
+            float(item.get("effective_rounds", 0.0))
+            for item in results
+            if isinstance(item.get("effective_rounds", 0), (int, float))
+        ]
+        if effective_rounds_list:
+            avg_effective_rounds = sum(effective_rounds_list) / len(effective_rounds_list)
+            log_effective_rounds_summary(
+                patient_count=len(effective_rounds_list),
+                avg_effective_rounds=float(avg_effective_rounds),
+                run_id=self.workflow_run_id,
+            )
+
+        # 问诊与诊断效果：AvgRounds（总问诊轮次均值）
+        log_avg_rounds_summary(run_id=self.workflow_run_id)
+
+        # 问诊与诊断效果：诊断准确率（运行级）
+        total_cases = len([r for r in results if r.get("status") == "completed"])
+        if total_cases > 0:
+            correct_cases = sum(1 for r in results if bool(r.get("diagnosis_correct", False)))
+            accuracy = correct_cases / total_cases
+            log_diagnosis_accuracy_summary(
+                total_cases=total_cases,
+                correct_cases=correct_cases,
+                accuracy=float(accuracy),
+                run_id=self.workflow_run_id,
+            )
+
+        # RAG指标：运行级汇总（Recall@k / Groundedness / Latency）
+        flush_rag_metric_summaries(run_id=self.workflow_run_id)
+
+        return results
     
     def shutdown(self) -> None:
         """关闭处理器"""

@@ -25,6 +25,7 @@ class SystemInitializer:
     def initialize_logging(self) -> None:
         """初始化日志系统"""
         from utils import setup_console_logging
+        from logging_utils import create_run_metrics_logs
         
         console_level = logging.DEBUG if self.config.system.verbose else logging.INFO
         setup_console_logging(console_level=console_level)
@@ -33,6 +34,11 @@ class SystemInitializer:
         logging.getLogger("urllib3").setLevel(logging.ERROR)
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+        # 每次运行初始化独立的三类指标日志文件
+        metrics_log_paths = create_run_metrics_logs()
+        self.components["metrics_log_paths"] = metrics_log_paths
+        logger.info(f"📊 指标日志目录: {metrics_log_paths['run_dir']}")
     
     def initialize_llm(self) -> Any:
         """初始化大语言模型

@@ -238,7 +238,7 @@ class RAGQueryOptimizer:
             "interview_sop": self._generate_interview_sop_query(context),
             "patient_history": self._generate_patient_history_query(context),
             
-            # S4: 专科问诊
+            # S1: 专科问诊
             "specialty_knowledge": self._generate_specialty_knowledge_query(context),
             "quality_qa": self._generate_quality_qa_query(context),
             "clinical_case": self._generate_clinical_case_query(context),
